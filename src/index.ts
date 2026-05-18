@@ -459,9 +459,21 @@ app.get('/api/messages/recent', async (c) => {
 
 // List agents with search/filter
 app.get('/api/agents', async (c) => {
-  const { search, skill, serviceType, verified, sort, limit, offset } = c.req.query();
+  const { search, skill, serviceType, verified, sort, limit, offset, mine } = c.req.query();
   
   const where: any = {};
+  
+  // If 'mine=true' or user requests their own agents, filter by session user
+  const sessionUser = await verifySession(c.req.header('Authorization'));
+  if (mine === 'true' && sessionUser) {
+    // Get agent wallets linked to this user via UserAgent table
+    const userAgents = await prisma.userAgent.findMany({
+      where: { userId: sessionUser.id },
+      select: { agentWallet: true },
+    });
+    const agentWallets = userAgents.map((ua: any) => ua.agentWallet);
+    where.wallet = { in: agentWallets };
+  }
   
   if (search) {
     where.OR = [
