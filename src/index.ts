@@ -5555,7 +5555,23 @@ app.post('/auth/login-privy', async (c) => {
       });
     }
     
-    // Generate session token (valid for 30 days)
+    // Reuse existing session if still valid (prevents race condition on multiple login calls)
+    if (user.sessionToken && user.sessionExpiry && user.sessionExpiry > new Date()) {
+      return c.json({
+        ok: true,
+        user: {
+          id: user.id,
+          privyId: user.privyId,
+          walletAddress: user.walletAddress,
+          email: user.email,
+          displayName: user.displayName,
+        },
+        sessionToken: user.sessionToken,
+        expiresAt: user.sessionExpiry.toISOString(),
+      });
+    }
+    
+    // Generate new session token (valid for 30 days)
     const sessionToken = generateSessionToken();
     const sessionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
     
@@ -5563,17 +5579,6 @@ app.post('/auth/login-privy', async (c) => {
       where: { id: user.id },
       data: { sessionToken, sessionExpiry }
     });
-    
-    return c.json({
-      ok: true,
-      user: {
-        id: user.id,
-        privyId: user.privyId,
-        walletAddress: user.walletAddress,
-        email: user.email,
-        displayName: user.displayName,
-      },
-      sessionToken,
       expiresAt: sessionExpiry.toISOString(),
     });
   } catch (e: any) {
@@ -5584,9 +5589,12 @@ app.post('/auth/login-privy', async (c) => {
 
 // GET /auth/me
 app.get('/auth/me', async (c) => {
-  const user = await verifySession(c.req.header('Authorization'));
+  const authHeader = c.req.header('Authorization');
+  console.log('[auth/me] Authorization header:', authHeader ? `Bearer ${authHeader.slice(7, 19)}...` : 'NONE');
+  const user = await verifySession(authHeader);
   
   if (!user) {
+    console.log('[auth/me] verifySession returned null — token not found or expired');
     return c.json({ error: 'Unauthorized' }, 401);
   }
   
