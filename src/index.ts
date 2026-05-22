@@ -5579,6 +5579,17 @@ app.post('/auth/login-privy', async (c) => {
       where: { id: user.id },
       data: { sessionToken, sessionExpiry }
     });
+    
+    return c.json({
+      ok: true,
+      user: {
+        id: user.id,
+        privyId: user.privyId,
+        walletAddress: user.walletAddress,
+        email: user.email,
+        displayName: user.displayName,
+      },
+      sessionToken,
       expiresAt: sessionExpiry.toISOString(),
     });
   } catch (e: any) {
