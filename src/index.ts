@@ -2271,6 +2271,8 @@ app.post('/api/platforms/said-hosting/register', async (c) => {
         l2AttestationMethod: 'platform',
       },
       update: {
+        name: name || undefined,
+        description: description || undefined,
         registrationSource: 'said-hosting',
         layer2Verified: true,
         layer2VerifiedAt: new Date(),
