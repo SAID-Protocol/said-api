@@ -524,13 +524,35 @@ model TransactionPolicy {
   
   // Approval thresholds
   requireApprovalAbove  Decimal   @default(50.00) @db.Decimal(10, 2)
-  
+
   // Status
   status                String    @default("active")  // active, suspended
-  
+
   // Timestamps
   createdAt             DateTime  @default(now())
   updatedAt             DateTime  @updatedAt
-  
+
   @@index([agentId])
+}
+
+// One per `submit_anchor` instruction on the SAID program. Each anchor
+// commits a Merkle root over a contiguous range of off-chain receipts
+// [startSeq, endSeq] for a given agent. Continuity is enforced on-chain:
+// anchor #0 starts at seq 1, each subsequent anchor must start at the
+// previous endSeq + 1. Indexed by an off-chain sync worker; never edited
+// after insert.
+model ReceiptAnchor {
+  id          String   @id @default(cuid())
+  pda         String   @unique                // ReceiptAnchor PDA on-chain
+  agentPda    String                          // The agent identity PDA this anchor belongs to
+  index       Int                             // Anchor sequence (0, 1, 2, ...)
+  startSeq    BigInt                          // First receipt seq in this anchor
+  endSeq      BigInt                          // Last receipt seq in this anchor
+  root        String                          // Merkle root, hex-encoded (32 bytes)
+  createdAt   DateTime                        // On-chain created_at (i64 unix ts)
+  syncedAt    DateTime @default(now())        // When the indexer first saw it
+
+  @@unique([agentPda, index])
+  @@index([agentPda])
+  @@index([createdAt])
 }

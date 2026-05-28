@@ -536,7 +536,7 @@ app.get('/api/agents', async (c) => {
 // Get single agent profile
 app.get('/api/agents/:wallet', async (c) => {
   const wallet = c.req.param('wallet');
-  
+
   const agent = await prisma.agent.findUnique({
     where: { wallet },
     include: {
@@ -548,12 +548,25 @@ app.get('/api/agents/:wallet', async (c) => {
       trustScore: true,
     }
   });
-  
+
   if (!agent) {
     return c.json({ error: 'Agent not found' }, 404);
   }
-  
-  return c.json(agent);
+
+  // Overlay a freshly-computed trust score that includes on-chain receipt
+  // anchor stats. The stored AgentScore row doesn't know about anchors yet;
+  // the live compute does. Single-agent endpoint only — directory uses the
+  // bulk endpoint and keeps the stored score for performance.
+  const anchorStats = agent.pda
+    ? await getAnchorStatsByAgent(agent.pda)
+    : { anchorCount: 0, totalReceipts: 0 };
+  const liveTrustScore = computeTrustScore(agent, anchorStats);
+
+  return c.json({
+    ...agent,
+    trustScore: liveTrustScore,
+    anchorStats,
+  });
 });
 
 // Get agent feedback
@@ -4279,7 +4292,10 @@ app.get('/api/stats', async (c) => {
  * Compute detailed trust score with component breakdown
  * Components: identity, activity, economic, ecosystem, longevity (+ fairscale when available)
  */
-function computeTrustScore(agent: any): {
+function computeTrustScore(
+  agent: any,
+  anchorStats?: { anchorCount: number; totalReceipts: number },
+): {
   score: number;
   tier: string;
   badges: string[];
@@ -4295,7 +4311,7 @@ function computeTrustScore(agent: any): {
   const now = new Date();
   const registeredAt = new Date(agent.registeredAt);
   const ageDays = Math.floor((now.getTime() - registeredAt.getTime()) / (1000 * 60 * 60 * 24));
-  
+
   // Identity component (0-10): verification + profile completeness
   let identityScore = 0;
   if (agent.isVerified) identityScore += 4;
@@ -4306,8 +4322,8 @@ function computeTrustScore(agent: any): {
   if (agent.image) identityScore += 1;
   if (agent.layer2Verified) identityScore += 1;
   identityScore = Math.min(10, identityScore);
-  
-  // Activity component (0-10): feedback count + activity count
+
+  // Activity component (0-10): feedback count + activity count + anchored receipts
   const feedbackCount = agent._count?.feedbackReceived || agent.feedbackCount || 0;
   const activityCount = agent.activityCount || 0;
   let activityScore = 0;
@@ -4323,6 +4339,15 @@ function computeTrustScore(agent: any): {
     if (daysSinceActive <= 7) activityScore += 2;
     else if (daysSinceActive <= 30) activityScore += 1;
   }
+  // On-chain anchored receipts. Receipts are the cryptographically verifiable
+  // record of the agent doing something — weighted slightly higher than the
+  // softer activityCount field.
+  const anchorCount = anchorStats?.anchorCount ?? 0;
+  const totalReceipts = anchorStats?.totalReceipts ?? 0;
+  if (totalReceipts >= 100) activityScore += 3;
+  else if (totalReceipts >= 25) activityScore += 2;
+  else if (totalReceipts >= 5) activityScore += 1;
+  if (anchorCount >= 5) activityScore += 1;
   activityScore = Math.min(10, activityScore);
   
   // Economic component (0-10): reputation score + verification
@@ -4381,6 +4406,7 @@ function computeTrustScore(agent: any): {
   // Sources
   const sources = ['said'];
   if (fairscaleScore > 0) sources.push('fairscale');
+  if (anchorCount > 0) sources.push('receipts');
   
   return {
     score: Math.min(100, totalScore),
@@ -5825,10 +5851,126 @@ function parseAgentPDA(data: Buffer): {
     
     const createdAt = Number(data.readBigInt64LE(tsOffset));
     const isVerified = data[tsOffset + 8] === 1;
-    
+
     return { owner, authority, createdAt, isVerified, metadataUri };
   } catch {
     return null;
+  }
+}
+
+// ============ RECEIPT ANCHOR INGESTION ============
+//
+// Each successful `submit_anchor` instruction on the SAID program creates
+// a ReceiptAnchor PDA. Layout (105 bytes total):
+//   bytes 0..8     discriminator           (sha256("account:ReceiptAnchor")[0..8])
+//   bytes 8..40    agent_id (Pubkey)
+//   bytes 40..48   index    (u64 LE)
+//   bytes 48..56   start_seq (u64 LE)
+//   bytes 56..64   end_seq  (u64 LE)
+//   bytes 64..96   root     ([u8; 32])
+//   bytes 96..104  created_at (i64 LE)
+//   byte 104       bump
+//
+// Continuity enforced on-chain: anchor index 0 starts at seq 1, anchor N+1
+// starts at previous end_seq + 1. So end_seq of the latest anchor for an
+// agent equals the cumulative receipt count.
+
+const RECEIPT_ANCHOR_DISCRIMINATOR = Buffer.from([0x15, 0x73, 0xbb, 0x26, 0x52, 0x4c, 0x58, 0xab]);
+const RECEIPT_ANCHOR_SIZE = 105;
+
+interface ParsedReceiptAnchor {
+  agentPda: string;
+  index: number;
+  startSeq: bigint;
+  endSeq: bigint;
+  root: string;        // hex
+  createdAt: number;   // unix seconds
+}
+
+function parseReceiptAnchor(data: Buffer): ParsedReceiptAnchor | null {
+  try {
+    if (data.length !== RECEIPT_ANCHOR_SIZE) return null;
+    if (!data.subarray(0, 8).equals(RECEIPT_ANCHOR_DISCRIMINATOR)) return null;
+    const agentPda = new PublicKey(data.subarray(8, 40)).toString();
+    const index = Number(data.readBigUInt64LE(40));
+    const startSeq = data.readBigUInt64LE(48);
+    const endSeq = data.readBigUInt64LE(56);
+    const root = data.subarray(64, 96).toString('hex');
+    const createdAt = Number(data.readBigInt64LE(96));
+    return { agentPda, index, startSeq, endSeq, root, createdAt };
+  } catch {
+    return null;
+  }
+}
+
+async function syncAnchorsFromChain(): Promise<{ synced: number; inserted: number; skipped: number; errors: number }> {
+  const stats = { synced: 0, inserted: 0, skipped: 0, errors: 0 };
+  try {
+    // Filter by exact data size — agent accounts are 342 bytes, anchors are 105,
+    // so this is a cheap, unambiguous filter. Discriminator check happens in parse.
+    const accounts = await connection.getProgramAccounts(SAID_PROGRAM_ID, {
+      filters: [{ dataSize: RECEIPT_ANCHOR_SIZE }],
+    });
+
+    for (const { pubkey, account } of accounts) {
+      const parsed = parseReceiptAnchor(account.data);
+      if (!parsed) { stats.skipped++; continue; }
+
+      try {
+        const result = await prisma.receiptAnchor.upsert({
+          where: { pda: pubkey.toString() },
+          update: {
+            // Anchors are immutable on-chain — only update if something
+            // unexpectedly differs (forward-compat / repair).
+            agentPda: parsed.agentPda,
+            index: parsed.index,
+            startSeq: parsed.startSeq,
+            endSeq: parsed.endSeq,
+            root: parsed.root,
+            createdAt: new Date(parsed.createdAt * 1000),
+          },
+          create: {
+            pda: pubkey.toString(),
+            agentPda: parsed.agentPda,
+            index: parsed.index,
+            startSeq: parsed.startSeq,
+            endSeq: parsed.endSeq,
+            root: parsed.root,
+            createdAt: new Date(parsed.createdAt * 1000),
+          },
+          select: { syncedAt: true },
+        });
+        // syncedAt only equals "now" on first insert
+        if (Math.abs(Date.now() - result.syncedAt.getTime()) < 5_000) stats.inserted++;
+        stats.synced++;
+      } catch (err) {
+        console.error('[anchor-sync] upsert failed for', pubkey.toString(), err);
+        stats.errors++;
+      }
+    }
+  } catch (err) {
+    console.error('[anchor-sync] error:', err);
+    stats.errors++;
+  }
+  console.log(`[anchor-sync] synced=${stats.synced} new=${stats.inserted} skipped=${stats.skipped} errors=${stats.errors}`);
+  return stats;
+}
+
+// Aggregate per-agent stats from anchors. Used by computeTrustScore to
+// fold receipt activity into the activity subscore.
+async function getAnchorStatsByAgent(agentPda: string): Promise<{ anchorCount: number; totalReceipts: number }> {
+  try {
+    const agg = await prisma.receiptAnchor.aggregate({
+      where: { agentPda },
+      _count: { _all: true },
+      _max: { endSeq: true },
+    });
+    return {
+      anchorCount: agg._count._all ?? 0,
+      totalReceipts: Number(agg._max.endSeq ?? 0n),
+    };
+  } catch {
+    return { anchorCount: 0, totalReceipts: 0 };
   }
 }
 
@@ -7100,6 +7242,8 @@ app.route('/', walletRoutes);
 console.log('✅ Delegated Signing Authority endpoints mounted (/v1/wallet/*, /v1/transaction/*, /v1/apikey/*, /v1/policy/*)');
 
 setInterval(syncAgentsFromChain, 5 * 60 * 1000);
+syncAnchorsFromChain();
+setInterval(syncAnchorsFromChain, 5 * 60 * 1000);
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(`SAID API running on http://localhost:${info.port}`);
