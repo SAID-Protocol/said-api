@@ -39,6 +39,7 @@ import {
   getActivityStatsForWallet,
   getLaunchedTokenStatsForWallet,
 } from './services/wallet-activity.js';
+import { fetchFairScaleScore } from './score-engine.js';
 // Verify a Solana wallet signature
 function verifySignature(message: string, signature: string, walletAddress: string): boolean {
   try {
@@ -564,18 +565,25 @@ app.get('/api/agents/:wallet', async (c) => {
   // computing fresh here means the profile page sees the new signals
   // immediately. Single-agent endpoint only; directory keeps the stored
   // score for performance.
-  const [anchorStats, activityStats, launchedTokens] = await Promise.all([
+  const [anchorStats, activityStats, launchedTokens, fairscaleRaw] = await Promise.all([
     agent.pda
       ? getAnchorStatsByAgent(agent.pda)
       : Promise.resolve({ anchorCount: 0, totalReceipts: 0 }),
     getActivityStatsForWallet(prisma, agent.wallet),
     getLaunchedTokenStatsForWallet(prisma, agent.wallet),
+    fetchFairScaleScore(agent.wallet),
   ]);
+  // Normalize FairScale's raw score/max to our 0-10 subscore band.
+  const fairscaleSubscore =
+    fairscaleRaw && fairscaleRaw.max > 0
+      ? Math.max(0, Math.min(10, (fairscaleRaw.score / fairscaleRaw.max) * 10))
+      : 0;
   const liveTrustScore = computeTrustScore(
     agent,
     anchorStats,
     activityStats ?? undefined,
     launchedTokens,
+    fairscaleSubscore,
   );
 
   return c.json({
@@ -584,6 +592,7 @@ app.get('/api/agents/:wallet', async (c) => {
     anchorStats,
     activityStats,
     launchedTokens,
+    fairscale: fairscaleRaw,
   });
 });
 
@@ -4328,6 +4337,7 @@ function computeTrustScore(
   anchorStats?: { anchorCount: number; totalReceipts: number },
   activityStats?: ActivityStatsInput,
   launchedTokenStats?: LaunchedTokenStatsInput,
+  fairscaleSubscore?: number, // 0-10, externally fetched
 ): {
   score: number;
   tier: string;
@@ -4446,23 +4456,23 @@ function computeTrustScore(
   else if (ageDays >= 7) longevityScore = 2;
   else longevityScore = 1;
   
-  // Fairscale component (0-10): placeholder for external reputation integration
-  // TODO: Integrate with FairScale API when available
-  const fairscaleScore = 0;
-  
-  // Weighted aggregate.
-  // Sum of weights = 10 (so a perfect 10 in every component → 100).
-  // Economic and activity carry the load — those are the "did you actually
-  // do anything valuable" components. Identity is meaningful but capped so
-  // a fully-doxxed agent with no on-chain activity can't be platinum on
-  // identity alone.
+  // FairScale component (0-10): external reputation source. Fetched
+  // upstream of computeTrustScore and passed in. Returns 0 if the API
+  // isn't reachable or the wallet is unknown to FairScale.
+  const fairscaleScore = Math.max(0, Math.min(10, fairscaleSubscore ?? 0));
+
+  // Weighted aggregate. Split is 80% SAID-native components / 20% FairScale.
+  // SAID weights sum to 8, FairScale weight = 2, total = 10, so a perfect
+  // 10 in every component still totals 100.
+  // Within SAID, economic carries the most weight — what an agent actually
+  // did on-chain matters more than its bio.
   const totalScore = Math.round(
     economicScore * 3 +
-    activityScore * 2.5 +
-    identityScore * 1.5 +
+    activityScore * 2 +
+    identityScore * 1 +
     ecosystemScore * 1 +
     longevityScore * 1 +
-    fairscaleScore * 1,
+    fairscaleScore * 2,
   );
 
   // Tier thresholds. Platinum is new — reserved for genuinely high-signal

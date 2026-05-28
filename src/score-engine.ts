@@ -415,7 +415,7 @@ async function getAgentPdas(wallet: string, prisma: PrismaClient): Promise<strin
 
 // ─── FairScale Enrichment (30 pts) ────────────────────────────────
 
-async function fetchFairScaleScore(wallet: string): Promise<{ score: number; max: number } | null> {
+export async function fetchFairScaleScore(wallet: string): Promise<{ score: number; max: number } | null> {
   const apiUrl = process.env.FAIRSCALE_API_URL;
   const apiKey = process.env.FAIRSCALE_API_KEY;
 
