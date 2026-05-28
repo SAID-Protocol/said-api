@@ -43,8 +43,8 @@ const INTER_BATCH_DELAY_MS = 100;
 //
 // Throughput: 200 agents every 5 min ≈ 40/min ≈ full sweep of ~3.7k
 // verified agents in ~90 min, then continuous refresh of the oldest.
-const AGENTS_PER_TICK = 200;
-const PER_AGENT_CONCURRENCY = 4;
+const AGENTS_PER_TICK = 100;
+const PER_AGENT_CONCURRENCY = 2;
 const TICK_INTERVAL_MS = 5 * 60 * 1000;
 const ENRICHMENT_INTERVAL_MS = 30 * 60 * 1000;
 const ENRICHMENT_BATCH = 100;
@@ -102,7 +102,15 @@ function findInitializedMints(
 
 async function fetchActivityAndMints(wallet: string): Promise<ActivityResult | null> {
   const conn = new Connection(RPC_URL, 'confirmed');
-  const pubkey = new PublicKey(wallet);
+  // Some Agent rows have placeholder strings instead of real wallets
+  // ("SAID_PROTOCOL", debug values, etc.). Skip those cleanly instead of
+  // letting the PublicKey constructor throw.
+  let pubkey: PublicKey;
+  try {
+    pubkey = new PublicKey(wallet);
+  } catch {
+    return null;
+  }
   const cutoffSeconds = Math.floor(Date.now() / 1000) - WINDOW_DAYS * 24 * 3600;
 
   let sigs;
