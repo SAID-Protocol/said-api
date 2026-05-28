@@ -34,6 +34,11 @@ import crossChainRoutes from './cross-chain-endpoints.js';
 import { createWalletRoutes } from './wallet-endpoints.js';
 import { setupWebSocket } from './ws-handler.js';
 import { createX402Middleware, getFreeTierInfo, CHAINS, FREE_MESSAGES_PER_DAY, MESSAGE_PRICE, bodyCache } from './x402-config.js';
+import {
+  startWalletActivityWorkers,
+  getActivityStatsForWallet,
+  getLaunchedTokenStatsForWallet,
+} from './services/wallet-activity.js';
 // Verify a Solana wallet signature
 function verifySignature(message: string, signature: string, walletAddress: string): boolean {
   try {
@@ -553,19 +558,32 @@ app.get('/api/agents/:wallet', async (c) => {
     return c.json({ error: 'Agent not found' }, 404);
   }
 
-  // Overlay a freshly-computed trust score that includes on-chain receipt
-  // anchor stats. The stored AgentScore row doesn't know about anchors yet;
-  // the live compute does. Single-agent endpoint only — directory uses the
-  // bulk endpoint and keeps the stored score for performance.
-  const anchorStats = agent.pda
-    ? await getAnchorStatsByAgent(agent.pda)
-    : { anchorCount: 0, totalReceipts: 0 };
-  const liveTrustScore = computeTrustScore(agent, anchorStats);
+  // Overlay a freshly-computed trust score using every enrichment we have:
+  // on-chain receipt anchors, 30-day wallet activity, and launched-token
+  // performance. The cached AgentScore row doesn't know about these yet —
+  // computing fresh here means the profile page sees the new signals
+  // immediately. Single-agent endpoint only; directory keeps the stored
+  // score for performance.
+  const [anchorStats, activityStats, launchedTokens] = await Promise.all([
+    agent.pda
+      ? getAnchorStatsByAgent(agent.pda)
+      : Promise.resolve({ anchorCount: 0, totalReceipts: 0 }),
+    getActivityStatsForWallet(prisma, agent.wallet),
+    getLaunchedTokenStatsForWallet(prisma, agent.wallet),
+  ]);
+  const liveTrustScore = computeTrustScore(
+    agent,
+    anchorStats,
+    activityStats ?? undefined,
+    launchedTokens,
+  );
 
   return c.json({
     ...agent,
     trustScore: liveTrustScore,
     anchorStats,
+    activityStats,
+    launchedTokens,
   });
 });
 
@@ -4292,9 +4310,24 @@ app.get('/api/stats', async (c) => {
  * Compute detailed trust score with component breakdown
  * Components: identity, activity, economic, ecosystem, longevity (+ fairscale when available)
  */
+interface ActivityStatsInput {
+  txCount: number;
+  volumeSol: number;
+  uniqueCounterparties: number;
+  activeDays: number;
+}
+interface LaunchedTokenStatsInput {
+  tokenCount: number;
+  totalMarketCapUsd: number;
+  totalVolume24hUsd: number;
+  topMarketCapUsd: number;
+}
+
 function computeTrustScore(
   agent: any,
   anchorStats?: { anchorCount: number; totalReceipts: number },
+  activityStats?: ActivityStatsInput,
+  launchedTokenStats?: LaunchedTokenStatsInput,
 ): {
   score: number;
   tier: string;
@@ -4323,42 +4356,77 @@ function computeTrustScore(
   if (agent.layer2Verified) identityScore += 1;
   identityScore = Math.min(10, identityScore);
 
-  // Activity component (0-10): feedback count + activity count + anchored receipts
+  // Activity component (0-10): feedback + activity counters + 30d on-chain
+  // tx count / active-day spread + anchored receipts. Logarithmic-ish bands
+  // so a wallet that's been busy on-chain meaningfully outscores a dormant one.
   const feedbackCount = agent._count?.feedbackReceived || agent.feedbackCount || 0;
   const activityCount = agent.activityCount || 0;
+  const txCount30d = activityStats?.txCount ?? 0;
+  const activeDays30d = activityStats?.activeDays ?? 0;
+  const counterparties30d = activityStats?.uniqueCounterparties ?? 0;
+
   let activityScore = 0;
-  if (feedbackCount >= 10) activityScore += 3;
-  else if (feedbackCount >= 5) activityScore += 2;
-  else if (feedbackCount >= 1) activityScore += 1;
-  if (activityCount >= 50) activityScore += 3;
-  else if (activityCount >= 20) activityScore += 2;
-  else if (activityCount >= 5) activityScore += 1;
+  if (feedbackCount >= 10) activityScore += 2;
+  else if (feedbackCount >= 5) activityScore += 1;
+  if (activityCount >= 50) activityScore += 1;
+  else if (activityCount >= 5) activityScore += 0.5;
   if (agent.lastActiveAt) {
     const lastActive = new Date(agent.lastActiveAt);
     const daysSinceActive = Math.floor((now.getTime() - lastActive.getTime()) / (1000 * 60 * 60 * 24));
-    if (daysSinceActive <= 7) activityScore += 2;
-    else if (daysSinceActive <= 30) activityScore += 1;
+    if (daysSinceActive <= 7) activityScore += 1;
+    else if (daysSinceActive <= 30) activityScore += 0.5;
   }
-  // On-chain anchored receipts. Receipts are the cryptographically verifiable
-  // record of the agent doing something — weighted slightly higher than the
-  // softer activityCount field.
+  // 30-day on-chain activity from wallet history (Alchemy ingest)
+  if (txCount30d >= 1000) activityScore += 3;
+  else if (txCount30d >= 200) activityScore += 2.5;
+  else if (txCount30d >= 50) activityScore += 2;
+  else if (txCount30d >= 10) activityScore += 1;
+  if (activeDays30d >= 20) activityScore += 2;
+  else if (activeDays30d >= 7) activityScore += 1;
+  else if (activeDays30d >= 3) activityScore += 0.5;
+  if (counterparties30d >= 100) activityScore += 1;
+  else if (counterparties30d >= 20) activityScore += 0.5;
+  // Receipts: cryptographically anchored activity counts
   const anchorCount = anchorStats?.anchorCount ?? 0;
   const totalReceipts = anchorStats?.totalReceipts ?? 0;
-  if (totalReceipts >= 100) activityScore += 3;
-  else if (totalReceipts >= 25) activityScore += 2;
-  else if (totalReceipts >= 5) activityScore += 1;
-  if (anchorCount >= 5) activityScore += 1;
+  if (totalReceipts >= 1000) activityScore += 2;
+  else if (totalReceipts >= 100) activityScore += 1.5;
+  else if (totalReceipts >= 25) activityScore += 1;
+  else if (totalReceipts >= 5) activityScore += 0.5;
+  if (anchorCount >= 5) activityScore += 0.5;
   activityScore = Math.min(10, activityScore);
   
-  // Economic component (0-10): reputation score + verification
+  // Economic component (0-10): reputation + on-chain volume + launched-token
+  // performance. This is the heaviest signal — actual money moving via the
+  // agent matters more than any profile field.
   let economicScore = 0;
   const repScore = agent.reputationScore || 0;
-  if (repScore >= 80) economicScore += 4;
-  else if (repScore >= 60) economicScore += 3;
-  else if (repScore >= 40) economicScore += 2;
-  else if (repScore >= 20) economicScore += 1;
-  if (agent.isVerified) economicScore += 3;
-  if (agent.passportMint) economicScore += 3;
+  if (repScore >= 80) economicScore += 2;
+  else if (repScore >= 60) economicScore += 1.5;
+  else if (repScore >= 40) economicScore += 1;
+  else if (repScore >= 20) economicScore += 0.5;
+  if (agent.isVerified) economicScore += 1;
+
+  // 30-day SOL volume through the wallet. Bands are roughly logarithmic so
+  // an order-of-magnitude bigger wallet gets ~+1.
+  const volumeSol30d = activityStats?.volumeSol ?? 0;
+  if (volumeSol30d >= 100_000) economicScore += 4;
+  else if (volumeSol30d >= 10_000) economicScore += 3;
+  else if (volumeSol30d >= 1_000) economicScore += 2;
+  else if (volumeSol30d >= 100) economicScore += 1;
+  else if (volumeSol30d >= 10) economicScore += 0.5;
+
+  // Tokens this agent launched. Sum of market caps (USD) across all their
+  // launched tokens, plus a kicker for any single token that did real volume.
+  const launchedMcUsd = launchedTokenStats?.totalMarketCapUsd ?? 0;
+  const launched24hVolUsd = launchedTokenStats?.totalVolume24hUsd ?? 0;
+  if (launchedMcUsd >= 10_000_000) economicScore += 3;
+  else if (launchedMcUsd >= 1_000_000) economicScore += 2;
+  else if (launchedMcUsd >= 100_000) economicScore += 1;
+  else if (launchedMcUsd >= 10_000) economicScore += 0.5;
+  if (launched24hVolUsd >= 1_000_000) economicScore += 1;
+  else if (launched24hVolUsd >= 100_000) economicScore += 0.5;
+
   economicScore = Math.min(10, economicScore);
   
   // Ecosystem component (0-10): endpoints + skills + service types
@@ -4382,31 +4450,45 @@ function computeTrustScore(
   // TODO: Integrate with FairScale API when available
   const fairscaleScore = 0;
   
-  // Calculate total score (0-100)
+  // Weighted aggregate.
+  // Sum of weights = 10 (so a perfect 10 in every component → 100).
+  // Economic and activity carry the load — those are the "did you actually
+  // do anything valuable" components. Identity is meaningful but capped so
+  // a fully-doxxed agent with no on-chain activity can't be platinum on
+  // identity alone.
   const totalScore = Math.round(
-    (identityScore * 3 + activityScore * 2 + economicScore * 2 + ecosystemScore * 1.5 + longevityScore * 1 + fairscaleScore * 0.5)
+    economicScore * 3 +
+    activityScore * 2.5 +
+    identityScore * 1.5 +
+    ecosystemScore * 1 +
+    longevityScore * 1 +
+    fairscaleScore * 1,
   );
-  
-  // Determine tier
-  let tier = 'bronze';
-  if (totalScore >= 70) tier = 'gold';
-  else if (totalScore >= 50) tier = 'silver';
-  else if (totalScore >= 30) tier = 'bronze';
-  else tier = 'unranked';
+
+  // Tier thresholds. Platinum is new — reserved for genuinely high-signal
+  // agents (real on-chain volume / launched a token that traded).
+  let tier = 'unranked';
+  if (totalScore >= 80) tier = 'platinum';
+  else if (totalScore >= 65) tier = 'gold';
+  else if (totalScore >= 45) tier = 'silver';
+  else if (totalScore >= 25) tier = 'bronze';
   
   // Collect badges
   const badges: string[] = [];
   if (agent.isVerified) badges.push('verified');
-  if (agent.passportMint) badges.push('passport');
   if (agent.layer2Verified) badges.push('l2_verified');
   if (repScore >= 80 && feedbackCount >= 10) badges.push('trusted');
-  if (ageDays >= 30 && activityCount >= 50) badges.push('active');
+  if (txCount30d >= 100 || activeDays30d >= 14) badges.push('active');
   if (feedbackCount === 0 && ageDays < 7) badges.push('new');
-  
+  if (launchedTokenStats && launchedTokenStats.tokenCount > 0) badges.push('token_launcher');
+  if (volumeSol30d >= 10_000 || launchedMcUsd >= 1_000_000) badges.push('high_volume');
+
   // Sources
   const sources = ['said'];
   if (fairscaleScore > 0) sources.push('fairscale');
   if (anchorCount > 0) sources.push('receipts');
+  if (txCount30d > 0) sources.push('onchain_activity');
+  if (launchedTokenStats && launchedTokenStats.tokenCount > 0) sources.push('launched_tokens');
   
   return {
     score: Math.min(100, totalScore),
@@ -7244,6 +7326,7 @@ console.log('✅ Delegated Signing Authority endpoints mounted (/v1/wallet/*, /v
 setInterval(syncAgentsFromChain, 5 * 60 * 1000);
 syncAnchorsFromChain();
 setInterval(syncAnchorsFromChain, 5 * 60 * 1000);
+startWalletActivityWorkers(prisma);
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(`SAID API running on http://localhost:${info.port}`);
