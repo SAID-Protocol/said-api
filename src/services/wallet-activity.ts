@@ -31,13 +31,16 @@ const SIG_LIMIT = 1000;
 const TX_BATCH = 100;
 const INTER_BATCH_DELAY_MS = 100;
 
-// How many agents to refresh per worker tick, and how often.
-// At 50 agents × every 10 min = 300/hour. Full sweep of ~3.7k verified
-// agents in ~12 hours. Adjust if Alchemy CU budget allows.
-const AGENTS_PER_TICK = 50;
-const TICK_INTERVAL_MS = 10 * 60 * 1000;
-const ENRICHMENT_INTERVAL_MS = 30 * 60 * 1000;
-const ENRICHMENT_BATCH = 100;
+// How many agents to refresh per worker tick, how concurrently within
+// a tick, and how often the tick fires. Sized for the Alchemy 10k CU/s
+// grant — at PER_AGENT_CONCURRENCY × ~3k CU/agent ≈ 4.5k CU/s peak per
+// pod. With 2 replicas the cluster peaks around ~9k CU/s, still under
+// the limit. Full sweep of ~3.7k verified agents in ~25 min.
+const AGENTS_PER_TICK = 500;
+const PER_AGENT_CONCURRENCY = 15;
+const TICK_INTERVAL_MS = 3 * 60 * 1000;
+const ENRICHMENT_INTERVAL_MS = 10 * 60 * 1000;
+const ENRICHMENT_BATCH = 200;
 const ENRICHMENT_STALE_MS = 6 * 60 * 60 * 1000; // re-enrich a token's DexScreener data every 6h
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -229,7 +232,6 @@ async function processOneAgent(prisma: PrismaClient, wallet: string): Promise<vo
 async function refreshOldestAgents(prisma: PrismaClient): Promise<void> {
   // Pick the AGENTS_PER_TICK agents that are either missing stats entirely
   // or have the oldest computedAt — round-robin coverage.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const candidates: { wallet: string }[] = await prisma.$queryRaw<{ wallet: string }[]>`
     SELECT a.wallet
     FROM "Agent" a
@@ -239,14 +241,31 @@ async function refreshOldestAgents(prisma: PrismaClient): Promise<void> {
     LIMIT ${AGENTS_PER_TICK}
   `;
   if (candidates.length === 0) return;
-  console.log(`[wallet-activity] refreshing ${candidates.length} agents`);
-  for (const c of candidates) {
-    try {
-      await processOneAgent(prisma, c.wallet);
-    } catch (err) {
-      console.error(`[wallet-activity] processOneAgent error for ${c.wallet}:`, err);
-    }
+  const startedAt = Date.now();
+  console.log(
+    `[wallet-activity] refreshing ${candidates.length} agents (concurrency=${PER_AGENT_CONCURRENCY})`,
+  );
+  let completed = 0;
+  let errors = 0;
+  // Process in concurrent chunks. Each chunk runs PER_AGENT_CONCURRENCY
+  // agents in parallel; we wait for the chunk before starting the next so
+  // the in-flight CU draw stays bounded.
+  for (let i = 0; i < candidates.length; i += PER_AGENT_CONCURRENCY) {
+    const chunk = candidates.slice(i, i + PER_AGENT_CONCURRENCY);
+    await Promise.all(
+      chunk.map(async (c) => {
+        try {
+          await processOneAgent(prisma, c.wallet);
+          completed++;
+        } catch (err) {
+          errors++;
+          console.error(`[wallet-activity] processOneAgent error for ${c.wallet}:`, err);
+        }
+      }),
+    );
   }
+  const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+  console.log(`[wallet-activity] tick done: completed=${completed} errors=${errors} in ${seconds}s`);
 }
 
 interface DexScreenerPair {
