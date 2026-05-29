@@ -7393,6 +7393,24 @@ async function backfillReputationScores(): Promise<void> {
 }
 setTimeout(() => backfillReputationScores(), 10_000);
 
+// One-time rename of cached tier values from the old 'unverified' label
+// to the new 'unranked' label. score-engine.ts now emits 'unranked' for
+// sub-25 scores going forward; this rewrites any existing rows that
+// were persisted under the old name. Idempotent.
+async function renameUnverifiedTier(): Promise<void> {
+  try {
+    const result: number = await prisma.$executeRaw`
+      UPDATE "AgentScore" SET tier = 'unranked' WHERE tier = 'unverified'
+    `;
+    if (result > 0) {
+      console.log(`[tier-rename] rewrote ${result} AgentScore rows from 'unverified' to 'unranked'`);
+    }
+  } catch (err) {
+    console.error('[tier-rename] error:', err);
+  }
+}
+setTimeout(() => renameUnverifiedTier(), 12_000);
+
 const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(`SAID API running on http://localhost:${info.port}`);
 });
