@@ -877,10 +877,12 @@ app.get('/api/leaderboard', async (c) => {
       _sum: { weight: true },
     });
     
-    // Get agent details for those with recent feedback
+    // Get agent details for those with recent feedback. Verified-only —
+    // the leaderboard is a trust surface and trust starts with paying the
+    // 0.01 SOL verification fee. Unverified agents don't qualify.
     const wallets = recentFeedback.map(f => f.toWallet);
     const agents = await prisma.agent.findMany({
-      where: { wallet: { in: wallets } },
+      where: { wallet: { in: wallets }, isVerified: true },
       select: {
         wallet: true,
         pda: true,
@@ -915,10 +917,11 @@ app.get('/api/leaderboard', async (c) => {
     });
   }
   
-  // Default: all-time leaderboard
+  // Default: all-time leaderboard. Verified-only (see comment above).
   const agents = await prisma.agent.findMany({
     where: {
-      feedbackCount: { gt: 0 }
+      feedbackCount: { gt: 0 },
+      isVerified: true,
     },
     orderBy: { reputationScore: 'desc' },
     take: Math.min(parseInt(limit || '50'), 2000),
