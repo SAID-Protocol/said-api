@@ -7393,23 +7393,40 @@ async function backfillReputationScores(): Promise<void> {
 }
 setTimeout(() => backfillReputationScores(), 10_000);
 
-// One-time rename of cached tier values from the old 'unverified' label
-// to the new 'unranked' label. score-engine.ts now emits 'unranked' for
-// sub-25 scores going forward; this rewrites any existing rows that
-// were persisted under the old name. Idempotent.
-async function renameUnverifiedTier(): Promise<void> {
+// Re-band every cached AgentScore.tier based on its current score under
+// the new thresholds (platinum ≥80, gold ≥65, silver ≥45, bronze ≥25,
+// else unranked). The previous version only renamed 'unverified' to
+// 'unranked', which missed three other transitions (e.g. an agent at
+// score=62 was stored as 'gold' under the old ≥60 threshold but should
+// now be 'silver' under the new ≥65). Idempotent — re-running just
+// reapplies the same CASE expression.
+async function rebandCachedTiers(): Promise<void> {
   try {
     const result: number = await prisma.$executeRaw`
-      UPDATE "AgentScore" SET tier = 'unranked' WHERE tier = 'unverified'
+      UPDATE "AgentScore"
+      SET tier = CASE
+        WHEN score >= 80 THEN 'platinum'
+        WHEN score >= 65 THEN 'gold'
+        WHEN score >= 45 THEN 'silver'
+        WHEN score >= 25 THEN 'bronze'
+        ELSE 'unranked'
+      END
+      WHERE tier <> CASE
+        WHEN score >= 80 THEN 'platinum'
+        WHEN score >= 65 THEN 'gold'
+        WHEN score >= 45 THEN 'silver'
+        WHEN score >= 25 THEN 'bronze'
+        ELSE 'unranked'
+      END
     `;
     if (result > 0) {
-      console.log(`[tier-rename] rewrote ${result} AgentScore rows from 'unverified' to 'unranked'`);
+      console.log(`[tier-reband] updated ${result} AgentScore rows to match new tier thresholds`);
     }
   } catch (err) {
-    console.error('[tier-rename] error:', err);
+    console.error('[tier-reband] error:', err);
   }
 }
-setTimeout(() => renameUnverifiedTier(), 12_000);
+setTimeout(() => rebandCachedTiers(), 12_000);
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(`SAID API running on http://localhost:${info.port}`);
