@@ -694,16 +694,9 @@ app.post('/api/agents/:wallet/feedback', async (c) => {
     where: { toWallet },
     select: { score: true, weight: true }
   });
-  
-  let totalWeight = 0;
-  let weightedSum = 0;
-  for (const fb of allFeedback) {
-    weightedSum += fb.score * fb.weight;
-    totalWeight += fb.weight;
-  }
-  
-  const weightedScore = totalWeight > 0 ? weightedSum / totalWeight : 0;
-  
+
+  const weightedScore = computeReputationScore(allFeedback);
+
   await prisma.agent.update({
     where: { wallet: toWallet },
     data: {
@@ -813,16 +806,12 @@ app.post('/api/sources/feedback', async (c) => {
       }
     });
     
-    // Recalculate reputation score
+    // Recalculate reputation score using Bayesian prior
     const allFeedback = await prisma.feedback.findMany({
       where: { toWallet: wallet }
     });
-    
-    const totalWeight = allFeedback.reduce((sum, f) => sum + (f.weight || 1), 0);
-    const weightedSum = allFeedback.reduce((sum, f) => sum + f.score * (f.weight || 1), 0);
-    const newScore = totalWeight > 0 ? Math.round(weightedSum / totalWeight) : 0;
-    const clampedScore = Math.max(0, Math.min(100, newScore));
-    
+    const clampedScore = Math.round(computeReputationScore(allFeedback));
+
     // Determine trust tier
     const trustTier = clampedScore >= 70 ? 'high' : clampedScore >= 30 ? 'medium' : 'low';
     
@@ -4332,6 +4321,41 @@ interface LaunchedTokenStatsInput {
   topMarketCapUsd: number;
 }
 
+/**
+ * Compute reputationScore from raw feedback rows using a Bayesian
+ * average against a neutral prior. Stops a single attestation from
+ * pushing an agent to 100; the prior dominates until many real data
+ * points accumulate.
+ *
+ * Formula:  (PRIOR_SCORE × PRIOR_WEIGHT + Σ score_i × weight_i)
+ *           ÷ (PRIOR_WEIGHT + Σ weight_i)
+ *
+ * Worked examples (all attestations at score 100 from verified
+ * agents at weight 2):
+ *
+ *   1 attestation  → ~58
+ *   5 attestations → ~75
+ *   10 attestations → ~83
+ *   25 attestations → ~91
+ *   50+ attestations → ~95+
+ */
+const REPUTATION_PRIOR_SCORE = 50;
+const REPUTATION_PRIOR_WEIGHT = 10;
+
+function computeReputationScore(
+  feedback: { score: number; weight: number | null | undefined }[],
+): number {
+  let sumWeightedScore = REPUTATION_PRIOR_SCORE * REPUTATION_PRIOR_WEIGHT;
+  let sumWeight = REPUTATION_PRIOR_WEIGHT;
+  for (const fb of feedback) {
+    const w = fb.weight ?? 1;
+    sumWeightedScore += fb.score * w;
+    sumWeight += w;
+  }
+  const score = sumWeightedScore / sumWeight;
+  return Math.max(0, Math.min(100, score));
+}
+
 function computeTrustScore(
   agent: any,
   anchorStats?: { anchorCount: number; totalReceipts: number },
@@ -6312,11 +6336,9 @@ app.post('/admin/feedback', async (c) => {
     create: { fromWallet, toWallet, score, comment, weight, signature: `trusted:saidprotocol:${Date.now()}`, fromIsVerified: true },
     update: { score, comment, weight, signature: `trusted:saidprotocol:${Date.now()}` }
   });
-  // Recalculate reputation score
+  // Recalculate reputation score using Bayesian prior
   const allFeedback = await prisma.feedback.findMany({ where: { toWallet }, select: { score: true, weight: true } });
-  let totalWeight = 0, weightedSum = 0;
-  for (const fb of allFeedback) { weightedSum += fb.score * fb.weight; totalWeight += fb.weight; }
-  const newScore = totalWeight > 0 ? weightedSum / totalWeight : 0;
+  const newScore = computeReputationScore(allFeedback);
   await prisma.agent.update({ where: { wallet: toWallet }, data: { reputationScore: newScore } });
   return c.json({ ok: true, feedback, newScore });
 });
@@ -6326,9 +6348,7 @@ app.post('/admin/delete-feedback', async (c) => {
   const { fromWallet, toWallet } = await c.req.json();
   await prisma.feedback.delete({ where: { fromWallet_toWallet: { fromWallet, toWallet } } });
   const allFeedback = await prisma.feedback.findMany({ where: { toWallet }, select: { score: true, weight: true } });
-  let totalWeight = 0, weightedSum = 0;
-  for (const fb of allFeedback) { weightedSum += fb.score * fb.weight; totalWeight += fb.weight; }
-  const newScore = totalWeight > 0 ? weightedSum / totalWeight : 0;
+  const newScore = computeReputationScore(allFeedback);
   await prisma.agent.update({ where: { wallet: toWallet }, data: { reputationScore: newScore } });
   return c.json({ ok: true, newScore });
 });
@@ -7337,6 +7357,38 @@ setInterval(syncAgentsFromChain, 5 * 60 * 1000);
 syncAnchorsFromChain();
 setInterval(syncAnchorsFromChain, 5 * 60 * 1000);
 startWalletActivityWorkers(prisma);
+
+// One-time reputationScore backfill on startup. Existing rows were computed
+// with the old un-prior'd formula (single attestation could give score=100).
+// Recompute every agent that has any feedback using the Bayesian helper.
+// Idempotent — re-running is safe.
+async function backfillReputationScores(): Promise<void> {
+  try {
+    const agents = await prisma.agent.findMany({
+      where: { feedbackCount: { gt: 0 } },
+      select: { wallet: true },
+    });
+    if (agents.length === 0) return;
+    console.log(`[reputation-backfill] recomputing ${agents.length} agents with Bayesian prior`);
+    let updated = 0;
+    for (const a of agents) {
+      const fb = await prisma.feedback.findMany({
+        where: { toWallet: a.wallet },
+        select: { score: true, weight: true },
+      });
+      const newScore = computeReputationScore(fb);
+      await prisma.agent.update({
+        where: { wallet: a.wallet },
+        data: { reputationScore: newScore },
+      });
+      updated++;
+    }
+    console.log(`[reputation-backfill] done: ${updated} agents updated`);
+  } catch (err) {
+    console.error('[reputation-backfill] error:', err);
+  }
+}
+setTimeout(() => backfillReputationScores(), 10_000);
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(`SAID API running on http://localhost:${info.port}`);
