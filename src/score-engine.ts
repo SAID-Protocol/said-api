@@ -28,7 +28,7 @@ export interface ScoreBreakdown {
 export interface ScoreResult {
   wallet: string;
   score: number;
-  tier: 'unverified' | 'bronze' | 'silver' | 'gold' | 'platinum';
+  tier: 'unranked' | 'bronze' | 'silver' | 'gold' | 'platinum';
   breakdown: ScoreBreakdown;
   badges: string[];
   flags: string[];
@@ -111,11 +111,13 @@ function getQueue(): Queue | null {
 // ─── Tier & Badge Logic ───────────────────────────────────────────
 
 function getTier(score: number): ScoreResult['tier'] {
+  // Matches computeTrustScore in src/index.ts so the cached AgentScore
+  // emits the same tier names + thresholds as the live overlay.
   if (score >= 80) return 'platinum';
-  if (score >= 60) return 'gold';
-  if (score >= 40) return 'silver';
-  if (score >= 20) return 'bronze';
-  return 'unverified';
+  if (score >= 65) return 'gold';
+  if (score >= 45) return 'silver';
+  if (score >= 25) return 'bronze';
+  return 'unranked';
 }
 
 interface BadgeContext {
@@ -415,7 +417,7 @@ async function getAgentPdas(wallet: string, prisma: PrismaClient): Promise<strin
 
 // ─── FairScale Enrichment (30 pts) ────────────────────────────────
 
-async function fetchFairScaleScore(wallet: string): Promise<{ score: number; max: number } | null> {
+export async function fetchFairScaleScore(wallet: string): Promise<{ score: number; max: number } | null> {
   const apiUrl = process.env.FAIRSCALE_API_URL;
   const apiKey = process.env.FAIRSCALE_API_KEY;
 

@@ -524,13 +524,79 @@ model TransactionPolicy {
   
   // Approval thresholds
   requireApprovalAbove  Decimal   @default(50.00) @db.Decimal(10, 2)
-  
+
   // Status
   status                String    @default("active")  // active, suspended
-  
+
   // Timestamps
   createdAt             DateTime  @default(now())
   updatedAt             DateTime  @updatedAt
-  
+
   @@index([agentId])
+}
+
+// One per `submit_anchor` instruction on the SAID program. Each anchor
+// commits a Merkle root over a contiguous range of off-chain receipts
+// [startSeq, endSeq] for a given agent. Continuity is enforced on-chain:
+// anchor #0 starts at seq 1, each subsequent anchor must start at the
+// previous endSeq + 1. Indexed by an off-chain sync worker; never edited
+// after insert.
+model ReceiptAnchor {
+  id          String   @id @default(cuid())
+  pda         String   @unique                // ReceiptAnchor PDA on-chain
+  agentPda    String                          // The agent identity PDA this anchor belongs to
+  index       Int                             // Anchor sequence (0, 1, 2, ...)
+  startSeq    BigInt                          // First receipt seq in this anchor
+  endSeq      BigInt                          // Last receipt seq in this anchor
+  root        String                          // Merkle root, hex-encoded (32 bytes)
+  createdAt   DateTime                        // On-chain created_at (i64 unix ts)
+  syncedAt    DateTime @default(now())        // When the indexer first saw it
+
+  @@unique([agentPda, index])
+  @@index([agentPda])
+  @@index([createdAt])
+}
+
+// Rolling 30-day wallet activity snapshot per agent. Updated by a background
+// job that pulls the agent's recent tx history from Alchemy and aggregates.
+// One row per agent wallet; upserted on refresh. Purely a cache of signals
+// we'll fold into the trust score — never the source of truth.
+model AgentActivityStats {
+  id                      String   @id @default(cuid())
+  wallet                  String   @unique             // agent wallet
+  windowDays              Int      @default(30)
+  txCount                 Int      @default(0)         // total signed txs in window
+  volumeSolLamports       BigInt   @default(0)         // gross SOL moved (in + out) in window, lamports
+  uniqueCounterparties    Int      @default(0)
+  activeDays              Int      @default(0)         // distinct days the wallet transacted
+  oldestSeen              DateTime?                    // earliest tx in window we observed
+  latestSeen              DateTime?                    // most recent tx
+  computedAt              DateTime @default(now())
+  source                  String   @default("alchemy") // which RPC fed this snapshot
+
+  @@index([latestSeen])
+}
+
+// One row per SPL Token mint detected to have been initialized by an
+// agent's wallet (i.e. agent.wallet == mint authority at init time).
+// Enriched with DexScreener stats on a slower cadence. Used as a
+// "tokens this agent launched" signal for the economic subscore.
+model LaunchedToken {
+  id                      String   @id @default(cuid())
+  mint                    String   @unique             // SPL mint address
+  agentWallet             String                       // the agent that launched it
+  detectedAt              DateTime @default(now())
+  firstSeenSlot           BigInt?                      // slot of the InitializeMint tx, if known
+
+  // DexScreener-enriched fields (nullable until enriched, refreshed periodically)
+  priceUsd                Float?
+  marketCapUsd            Float?
+  liquidityUsd            Float?
+  volume24hUsd            Float?
+  volumeLifetimeUsd       Float?
+  dexId                   String?                      // 'pumpswap', 'raydium', 'meteora', etc.
+  enrichedAt              DateTime?
+
+  @@index([agentWallet])
+  @@index([enrichedAt])
 }

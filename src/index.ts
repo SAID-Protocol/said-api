@@ -34,6 +34,12 @@ import crossChainRoutes from './cross-chain-endpoints.js';
 import { createWalletRoutes } from './wallet-endpoints.js';
 import { setupWebSocket } from './ws-handler.js';
 import { createX402Middleware, getFreeTierInfo, CHAINS, FREE_MESSAGES_PER_DAY, MESSAGE_PRICE, bodyCache } from './x402-config.js';
+import {
+  startWalletActivityWorkers,
+  getActivityStatsForWallet,
+  getLaunchedTokenStatsForWallet,
+} from './services/wallet-activity.js';
+import { fetchFairScaleScore } from './score-engine.js';
 // Verify a Solana wallet signature
 function verifySignature(message: string, signature: string, walletAddress: string): boolean {
   try {
@@ -459,9 +465,21 @@ app.get('/api/messages/recent', async (c) => {
 
 // List agents with search/filter
 app.get('/api/agents', async (c) => {
-  const { search, skill, serviceType, verified, sort, limit, offset } = c.req.query();
+  const { search, skill, serviceType, verified, sort, limit, offset, mine } = c.req.query();
   
   const where: any = {};
+  
+  // If 'mine=true' or user requests their own agents, filter by session user
+  const sessionUser = await verifySession(c.req.header('Authorization'));
+  if (mine === 'true' && sessionUser) {
+    // Get agent wallets linked to this user via UserAgent table
+    const userAgents = await prisma.userAgent.findMany({
+      where: { userId: sessionUser.id },
+      select: { agentWallet: true },
+    });
+    const agentWallets = userAgents.map((ua: any) => ua.agentWallet);
+    where.wallet = { in: agentWallets };
+  }
   
   if (search) {
     where.OR = [
@@ -524,7 +542,7 @@ app.get('/api/agents', async (c) => {
 // Get single agent profile
 app.get('/api/agents/:wallet', async (c) => {
   const wallet = c.req.param('wallet');
-  
+
   const agent = await prisma.agent.findUnique({
     where: { wallet },
     include: {
@@ -536,12 +554,46 @@ app.get('/api/agents/:wallet', async (c) => {
       trustScore: true,
     }
   });
-  
+
   if (!agent) {
     return c.json({ error: 'Agent not found' }, 404);
   }
-  
-  return c.json(agent);
+
+  // Overlay a freshly-computed trust score using every enrichment we have:
+  // on-chain receipt anchors, 30-day wallet activity, and launched-token
+  // performance. The cached AgentScore row doesn't know about these yet —
+  // computing fresh here means the profile page sees the new signals
+  // immediately. Single-agent endpoint only; directory keeps the stored
+  // score for performance.
+  const [anchorStats, activityStats, launchedTokens, fairscaleRaw] = await Promise.all([
+    agent.pda
+      ? getAnchorStatsByAgent(agent.pda)
+      : Promise.resolve({ anchorCount: 0, totalReceipts: 0 }),
+    getActivityStatsForWallet(prisma, agent.wallet),
+    getLaunchedTokenStatsForWallet(prisma, agent.wallet),
+    fetchFairScaleScore(agent.wallet),
+  ]);
+  // Normalize FairScale's raw score/max to our 0-10 subscore band.
+  const fairscaleSubscore =
+    fairscaleRaw && fairscaleRaw.max > 0
+      ? Math.max(0, Math.min(10, (fairscaleRaw.score / fairscaleRaw.max) * 10))
+      : 0;
+  const liveTrustScore = computeTrustScore(
+    agent,
+    anchorStats,
+    activityStats ?? undefined,
+    launchedTokens,
+    fairscaleSubscore,
+  );
+
+  return c.json({
+    ...agent,
+    trustScore: liveTrustScore,
+    anchorStats,
+    activityStats,
+    launchedTokens,
+    fairscale: fairscaleRaw,
+  });
 });
 
 // Get agent feedback
@@ -642,16 +694,9 @@ app.post('/api/agents/:wallet/feedback', async (c) => {
     where: { toWallet },
     select: { score: true, weight: true }
   });
-  
-  let totalWeight = 0;
-  let weightedSum = 0;
-  for (const fb of allFeedback) {
-    weightedSum += fb.score * fb.weight;
-    totalWeight += fb.weight;
-  }
-  
-  const weightedScore = totalWeight > 0 ? weightedSum / totalWeight : 0;
-  
+
+  const weightedScore = computeReputationScore(allFeedback);
+
   await prisma.agent.update({
     where: { wallet: toWallet },
     data: {
@@ -761,16 +806,12 @@ app.post('/api/sources/feedback', async (c) => {
       }
     });
     
-    // Recalculate reputation score
+    // Recalculate reputation score using Bayesian prior
     const allFeedback = await prisma.feedback.findMany({
       where: { toWallet: wallet }
     });
-    
-    const totalWeight = allFeedback.reduce((sum, f) => sum + (f.weight || 1), 0);
-    const weightedSum = allFeedback.reduce((sum, f) => sum + f.score * (f.weight || 1), 0);
-    const newScore = totalWeight > 0 ? Math.round(weightedSum / totalWeight) : 0;
-    const clampedScore = Math.max(0, Math.min(100, newScore));
-    
+    const clampedScore = Math.round(computeReputationScore(allFeedback));
+
     // Determine trust tier
     const trustTier = clampedScore >= 70 ? 'high' : clampedScore >= 30 ? 'medium' : 'low';
     
@@ -836,10 +877,12 @@ app.get('/api/leaderboard', async (c) => {
       _sum: { weight: true },
     });
     
-    // Get agent details for those with recent feedback
+    // Get agent details for those with recent feedback. Verified-only —
+    // the leaderboard is a trust surface and trust starts with paying the
+    // 0.01 SOL verification fee. Unverified agents don't qualify.
     const wallets = recentFeedback.map(f => f.toWallet);
     const agents = await prisma.agent.findMany({
-      where: { wallet: { in: wallets } },
+      where: { wallet: { in: wallets }, isVerified: true },
       select: {
         wallet: true,
         pda: true,
@@ -874,10 +917,11 @@ app.get('/api/leaderboard', async (c) => {
     });
   }
   
-  // Default: all-time leaderboard
+  // Default: all-time leaderboard. Verified-only (see comment above).
   const agents = await prisma.agent.findMany({
     where: {
-      feedbackCount: { gt: 0 }
+      feedbackCount: { gt: 0 },
+      isVerified: true,
     },
     orderBy: { reputationScore: 'desc' },
     take: Math.min(parseInt(limit || '50'), 2000),
@@ -1025,7 +1069,7 @@ app.post('/api/register/sponsored', async (c) => {
     return c.json({ 
       error: 'Wallet already registered',
       pda: existing.pda,
-      profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`
+      profile: `https://www.saidprotocol.com/agents/${wallet}`
     }, 409);
   }
   
@@ -1126,7 +1170,7 @@ app.post('/api/register/sponsored', async (c) => {
       wallet,
       pda: pda.toString(),
       metadataUri,
-      profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+      profile: `https://www.saidprotocol.com/agents/${wallet}`,
       badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
       slotsRemaining: remainingSlots,
     });
@@ -1209,7 +1253,7 @@ app.post('/api/register/pending', async (c) => {
       wallet,
       pda: existing.pda,
       status: existing.isVerified ? 'VERIFIED' : (existing.sponsored ? 'REGISTERED' : 'PENDING'),
-      profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`
+      profile: `https://www.saidprotocol.com/agents/${wallet}`
     });
   }
   
@@ -1278,7 +1322,7 @@ app.post('/api/register/pending', async (c) => {
       pda: pda.toString(),
       status: 'PENDING',
       metadataUri,
-      profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+      profile: `https://www.saidprotocol.com/agents/${wallet}`,
       badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
       layer2Verified: isFrameworkAttestation,
       l2AttestationMethod: isFrameworkAttestation ? 'framework' : null,
@@ -1417,7 +1461,7 @@ app.post('/api/platforms/spawnr/register', async (c) => {
         pda: pda.toString(),
         name: existing.name || name,
         verified: true,
-        profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+        profile: `https://www.saidprotocol.com/agents/${wallet}`,
         badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
       }
     });
@@ -1666,7 +1710,7 @@ app.post('/api/platforms/spawnr/confirm', async (c) => {
         name: agent.name,
         verified: true,
         onChain: true,
-        profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+        profile: `https://www.saidprotocol.com/agents/${wallet}`,
         badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
         badgeWithScore: `https://api.saidprotocol.com/api/badge/${wallet}.svg?style=score`,
       },
@@ -1738,7 +1782,7 @@ app.post('/api/platforms/spawnr/confirm', async (c) => {
             name: agent.name,
             verified: true,
             onChain: true,
-            profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+            profile: `https://www.saidprotocol.com/agents/${wallet}`,
             badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
           },
         });
@@ -1847,7 +1891,7 @@ app.post('/api/platforms/clawpump/register', async (c) => {
         pda: pda.toString(),
         name: existing.name || name,
         verified: true,
-        profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+        profile: `https://www.saidprotocol.com/agents/${wallet}`,
         badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
       }
     });
@@ -2097,7 +2141,7 @@ app.post('/api/platforms/clawpump/confirm', async (c) => {
         name: agent.name,
         verified: true,
         onChain: true,
-        profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+        profile: `https://www.saidprotocol.com/agents/${wallet}`,
         badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
         badgeWithScore: `https://api.saidprotocol.com/api/badge/${wallet}.svg?style=score`,
       },
@@ -2169,7 +2213,7 @@ app.post('/api/platforms/clawpump/confirm', async (c) => {
             name: agent.name,
             verified: true,
             onChain: true,
-            profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+            profile: `https://www.saidprotocol.com/agents/${wallet}`,
             badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
           },
         });
@@ -2648,8 +2692,9 @@ app.post('/api/platforms/said-hosting/register', async (c) => {
         l2AttestationMethod: 'platform',
       },
       update: {
-        registrationSource,
-        platformId: registrationSource !== 'said-hosting' ? registrationSource : undefined,
+        name: name || undefined,
+        description: description || undefined,
+        registrationSource: 'said-hosting',
         layer2Verified: true,
         layer2VerifiedAt: new Date(),
         l2AttestationMethod: 'platform',
@@ -2669,7 +2714,7 @@ app.post('/api/platforms/said-hosting/register', async (c) => {
         pda: pda.toString(),
         name: existing.name || name,
         verified: true,
-        profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+        profile: `https://www.saidprotocol.com/agents/${wallet}`,
         badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
       }
     });
@@ -2994,7 +3039,7 @@ app.post('/api/platforms/said-hosting/confirm', async (c) => {
         name: agent.name,
         verified: true,
         onChain: true,
-        profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+        profile: `https://www.saidprotocol.com/agents/${wallet}`,
         badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
         badgeWithScore: `https://api.saidprotocol.com/api/badge/${wallet}.svg?style=score`,
       },
@@ -3068,7 +3113,7 @@ app.post('/api/platforms/said-hosting/confirm', async (c) => {
             name: agent.name,
             verified: true,
             onChain: true,
-            profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+            profile: `https://www.saidprotocol.com/agents/${wallet}`,
             badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
           },
         });
@@ -5267,7 +5312,7 @@ app.get('/api/badge/:wallet', async (c) => {
   }
   
   const baseUrl = 'https://api.saidprotocol.com';
-  const profileUrl = `https://www.saidprotocol.com/agent.html?wallet=${wallet}`;
+  const profileUrl = `https://www.saidprotocol.com/agents/${wallet}`;
   
   return c.json({
     agent: {
@@ -5317,7 +5362,61 @@ app.get('/api/stats', async (c) => {
  * Compute detailed trust score with component breakdown
  * Components: identity, activity, economic, ecosystem, longevity (+ fairscale when available)
  */
-function computeTrustScore(agent: any): {
+interface ActivityStatsInput {
+  txCount: number;
+  volumeSol: number;
+  uniqueCounterparties: number;
+  activeDays: number;
+}
+interface LaunchedTokenStatsInput {
+  tokenCount: number;
+  totalMarketCapUsd: number;
+  totalVolume24hUsd: number;
+  topMarketCapUsd: number;
+}
+
+/**
+ * Compute reputationScore from raw feedback rows using a Bayesian
+ * average against a neutral prior. Stops a single attestation from
+ * pushing an agent to 100; the prior dominates until many real data
+ * points accumulate.
+ *
+ * Formula:  (PRIOR_SCORE × PRIOR_WEIGHT + Σ score_i × weight_i)
+ *           ÷ (PRIOR_WEIGHT + Σ weight_i)
+ *
+ * Worked examples (all attestations at score 100 from verified
+ * agents at weight 2):
+ *
+ *   1 attestation  → ~58
+ *   5 attestations → ~75
+ *   10 attestations → ~83
+ *   25 attestations → ~91
+ *   50+ attestations → ~95+
+ */
+const REPUTATION_PRIOR_SCORE = 50;
+const REPUTATION_PRIOR_WEIGHT = 10;
+
+function computeReputationScore(
+  feedback: { score: number; weight: number | null | undefined }[],
+): number {
+  let sumWeightedScore = REPUTATION_PRIOR_SCORE * REPUTATION_PRIOR_WEIGHT;
+  let sumWeight = REPUTATION_PRIOR_WEIGHT;
+  for (const fb of feedback) {
+    const w = fb.weight ?? 1;
+    sumWeightedScore += fb.score * w;
+    sumWeight += w;
+  }
+  const score = sumWeightedScore / sumWeight;
+  return Math.max(0, Math.min(100, score));
+}
+
+function computeTrustScore(
+  agent: any,
+  anchorStats?: { anchorCount: number; totalReceipts: number },
+  activityStats?: ActivityStatsInput,
+  launchedTokenStats?: LaunchedTokenStatsInput,
+  fairscaleSubscore?: number, // 0-10, externally fetched
+): {
   score: number;
   tier: string;
   badges: string[];
@@ -5333,7 +5432,7 @@ function computeTrustScore(agent: any): {
   const now = new Date();
   const registeredAt = new Date(agent.registeredAt);
   const ageDays = Math.floor((now.getTime() - registeredAt.getTime()) / (1000 * 60 * 60 * 24));
-  
+
   // Identity component (0-10): verification + profile completeness
   let identityScore = 0;
   if (agent.isVerified) identityScore += 4;
@@ -5344,34 +5443,78 @@ function computeTrustScore(agent: any): {
   if (agent.image) identityScore += 1;
   if (agent.layer2Verified) identityScore += 1;
   identityScore = Math.min(10, identityScore);
-  
-  // Activity component (0-10): feedback count + activity count
+
+  // Activity component (0-10): feedback + activity counters + 30d on-chain
+  // tx count / active-day spread + anchored receipts. Logarithmic-ish bands
+  // so a wallet that's been busy on-chain meaningfully outscores a dormant one.
   const feedbackCount = agent._count?.feedbackReceived || agent.feedbackCount || 0;
   const activityCount = agent.activityCount || 0;
+  const txCount30d = activityStats?.txCount ?? 0;
+  const activeDays30d = activityStats?.activeDays ?? 0;
+  const counterparties30d = activityStats?.uniqueCounterparties ?? 0;
+
   let activityScore = 0;
-  if (feedbackCount >= 10) activityScore += 3;
-  else if (feedbackCount >= 5) activityScore += 2;
-  else if (feedbackCount >= 1) activityScore += 1;
-  if (activityCount >= 50) activityScore += 3;
-  else if (activityCount >= 20) activityScore += 2;
-  else if (activityCount >= 5) activityScore += 1;
+  if (feedbackCount >= 10) activityScore += 2;
+  else if (feedbackCount >= 5) activityScore += 1;
+  if (activityCount >= 50) activityScore += 1;
+  else if (activityCount >= 5) activityScore += 0.5;
   if (agent.lastActiveAt) {
     const lastActive = new Date(agent.lastActiveAt);
     const daysSinceActive = Math.floor((now.getTime() - lastActive.getTime()) / (1000 * 60 * 60 * 24));
-    if (daysSinceActive <= 7) activityScore += 2;
-    else if (daysSinceActive <= 30) activityScore += 1;
+    if (daysSinceActive <= 7) activityScore += 1;
+    else if (daysSinceActive <= 30) activityScore += 0.5;
   }
+  // 30-day on-chain activity from wallet history (Alchemy ingest)
+  if (txCount30d >= 1000) activityScore += 3;
+  else if (txCount30d >= 200) activityScore += 2.5;
+  else if (txCount30d >= 50) activityScore += 2;
+  else if (txCount30d >= 10) activityScore += 1;
+  if (activeDays30d >= 20) activityScore += 2;
+  else if (activeDays30d >= 7) activityScore += 1;
+  else if (activeDays30d >= 3) activityScore += 0.5;
+  if (counterparties30d >= 100) activityScore += 1;
+  else if (counterparties30d >= 20) activityScore += 0.5;
+  // Receipts: cryptographically anchored activity counts
+  const anchorCount = anchorStats?.anchorCount ?? 0;
+  const totalReceipts = anchorStats?.totalReceipts ?? 0;
+  if (totalReceipts >= 1000) activityScore += 2;
+  else if (totalReceipts >= 100) activityScore += 1.5;
+  else if (totalReceipts >= 25) activityScore += 1;
+  else if (totalReceipts >= 5) activityScore += 0.5;
+  if (anchorCount >= 5) activityScore += 0.5;
   activityScore = Math.min(10, activityScore);
   
-  // Economic component (0-10): reputation score + verification
+  // Economic component (0-10): reputation + on-chain volume + launched-token
+  // performance. This is the heaviest signal — actual money moving via the
+  // agent matters more than any profile field.
   let economicScore = 0;
   const repScore = agent.reputationScore || 0;
-  if (repScore >= 80) economicScore += 4;
-  else if (repScore >= 60) economicScore += 3;
-  else if (repScore >= 40) economicScore += 2;
-  else if (repScore >= 20) economicScore += 1;
-  if (agent.isVerified) economicScore += 3;
-  if (agent.passportMint) economicScore += 3;
+  if (repScore >= 80) economicScore += 2;
+  else if (repScore >= 60) economicScore += 1.5;
+  else if (repScore >= 40) economicScore += 1;
+  else if (repScore >= 20) economicScore += 0.5;
+  if (agent.isVerified) economicScore += 1;
+
+  // 30-day SOL volume through the wallet. Bands are roughly logarithmic so
+  // an order-of-magnitude bigger wallet gets ~+1.
+  const volumeSol30d = activityStats?.volumeSol ?? 0;
+  if (volumeSol30d >= 100_000) economicScore += 4;
+  else if (volumeSol30d >= 10_000) economicScore += 3;
+  else if (volumeSol30d >= 1_000) economicScore += 2;
+  else if (volumeSol30d >= 100) economicScore += 1;
+  else if (volumeSol30d >= 10) economicScore += 0.5;
+
+  // Tokens this agent launched. Sum of market caps (USD) across all their
+  // launched tokens, plus a kicker for any single token that did real volume.
+  const launchedMcUsd = launchedTokenStats?.totalMarketCapUsd ?? 0;
+  const launched24hVolUsd = launchedTokenStats?.totalVolume24hUsd ?? 0;
+  if (launchedMcUsd >= 10_000_000) economicScore += 3;
+  else if (launchedMcUsd >= 1_000_000) economicScore += 2;
+  else if (launchedMcUsd >= 100_000) economicScore += 1;
+  else if (launchedMcUsd >= 10_000) economicScore += 0.5;
+  if (launched24hVolUsd >= 1_000_000) economicScore += 1;
+  else if (launched24hVolUsd >= 100_000) economicScore += 0.5;
+
   economicScore = Math.min(10, economicScore);
   
   // Ecosystem component (0-10): endpoints + skills + service types
@@ -5391,34 +5534,49 @@ function computeTrustScore(agent: any): {
   else if (ageDays >= 7) longevityScore = 2;
   else longevityScore = 1;
   
-  // Fairscale component (0-10): placeholder for external reputation integration
-  // TODO: Integrate with FairScale API when available
-  const fairscaleScore = 0;
-  
-  // Calculate total score (0-100)
+  // FairScale component (0-10): external reputation source. Fetched
+  // upstream of computeTrustScore and passed in. Returns 0 if the API
+  // isn't reachable or the wallet is unknown to FairScale.
+  const fairscaleScore = Math.max(0, Math.min(10, fairscaleSubscore ?? 0));
+
+  // Weighted aggregate. Split is 80% SAID-native components / 20% FairScale.
+  // SAID weights sum to 8, FairScale weight = 2, total = 10, so a perfect
+  // 10 in every component still totals 100.
+  // Within SAID, economic carries the most weight — what an agent actually
+  // did on-chain matters more than its bio.
   const totalScore = Math.round(
-    (identityScore * 3 + activityScore * 2 + economicScore * 2 + ecosystemScore * 1.5 + longevityScore * 1 + fairscaleScore * 0.5)
+    economicScore * 3 +
+    activityScore * 2 +
+    identityScore * 1 +
+    ecosystemScore * 1 +
+    longevityScore * 1 +
+    fairscaleScore * 2,
   );
-  
-  // Determine tier
-  let tier = 'bronze';
-  if (totalScore >= 70) tier = 'gold';
-  else if (totalScore >= 50) tier = 'silver';
-  else if (totalScore >= 30) tier = 'bronze';
-  else tier = 'unranked';
+
+  // Tier thresholds. Platinum is new — reserved for genuinely high-signal
+  // agents (real on-chain volume / launched a token that traded).
+  let tier = 'unranked';
+  if (totalScore >= 80) tier = 'platinum';
+  else if (totalScore >= 65) tier = 'gold';
+  else if (totalScore >= 45) tier = 'silver';
+  else if (totalScore >= 25) tier = 'bronze';
   
   // Collect badges
   const badges: string[] = [];
   if (agent.isVerified) badges.push('verified');
-  if (agent.passportMint) badges.push('passport');
   if (agent.layer2Verified) badges.push('l2_verified');
   if (repScore >= 80 && feedbackCount >= 10) badges.push('trusted');
-  if (ageDays >= 30 && activityCount >= 50) badges.push('active');
+  if (txCount30d >= 100 || activeDays30d >= 14) badges.push('active');
   if (feedbackCount === 0 && ageDays < 7) badges.push('new');
-  
+  if (launchedTokenStats && launchedTokenStats.tokenCount > 0) badges.push('token_launcher');
+  if (volumeSol30d >= 10_000 || launchedMcUsd >= 1_000_000) badges.push('high_volume');
+
   // Sources
   const sources = ['said'];
   if (fairscaleScore > 0) sources.push('fairscale');
+  if (anchorCount > 0) sources.push('receipts');
+  if (txCount30d > 0) sources.push('onchain_activity');
+  if (launchedTokenStats && launchedTokenStats.tokenCount > 0) sources.push('launched_tokens');
   
   return {
     score: Math.min(100, totalScore),
@@ -5492,7 +5650,7 @@ app.get('/api/verify/:wallet', async (c) => {
     skills: agent.skills,
     registeredAt: agent.registeredAt.toISOString(),
     urls: {
-      profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+      profile: `https://www.saidprotocol.com/agents/${wallet}`,
       badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
       badgeWithScore: `https://api.saidprotocol.com/api/badge/${wallet}.svg?style=score`,
     },
@@ -5761,7 +5919,7 @@ app.get('/api/passport/:wallet/metadata', async (c) => {
     symbol: 'SAID',
     description: 'Soulbound AI agent identity passport. Issued by SAID Protocol on Solana. Non-transferable.',
     image: 'https://raw.githubusercontent.com/kaiclawd/said/main/passport-logo.png',
-    external_url: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+    external_url: `https://www.saidprotocol.com/agents/${wallet}`,
     attributes: [
       { trait_type: 'Protocol', value: 'SAID' },
       { trait_type: 'Wallet', value: wallet },
@@ -5953,7 +6111,7 @@ app.post('/api/passport/:wallet/finalize', async (c) => {
     passportTxHash: txHash,
     imageUrl: `https://api.saidprotocol.com/api/passport/${wallet}/image`,
     metadataUrl: `https://api.saidprotocol.com/api/passport/${wallet}/metadata`,
-    profileUrl: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+    profileUrl: `https://www.saidprotocol.com/agents/${wallet}`,
     message: 'SAID Passport minted. Your on-chain identity is now permanent and portable.',
   });
 });
@@ -6595,7 +6753,23 @@ app.post('/auth/login-privy', async (c) => {
       });
     }
     
-    // Generate session token (valid for 30 days)
+    // Reuse existing session if still valid (prevents race condition on multiple login calls)
+    if (user.sessionToken && user.sessionExpiry && user.sessionExpiry > new Date()) {
+      return c.json({
+        ok: true,
+        user: {
+          id: user.id,
+          privyId: user.privyId,
+          walletAddress: user.walletAddress,
+          email: user.email,
+          displayName: user.displayName,
+        },
+        sessionToken: user.sessionToken,
+        expiresAt: user.sessionExpiry.toISOString(),
+      });
+    }
+    
+    // Generate new session token (valid for 30 days)
     const sessionToken = generateSessionToken();
     const sessionExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
     
@@ -6624,9 +6798,12 @@ app.post('/auth/login-privy', async (c) => {
 
 // GET /auth/me
 app.get('/auth/me', async (c) => {
-  const user = await verifySession(c.req.header('Authorization'));
+  const authHeader = c.req.header('Authorization');
+  console.log('[auth/me] Authorization header:', authHeader ? `Bearer ${authHeader.slice(7, 19)}...` : 'NONE');
+  const user = await verifySession(authHeader);
   
   if (!user) {
+    console.log('[auth/me] verifySession returned null — token not found or expired');
     return c.json({ error: 'Unauthorized' }, 401);
   }
   
@@ -6844,10 +7021,126 @@ function parseAgentPDA(data: Buffer): {
     
     const createdAt = Number(data.readBigInt64LE(tsOffset));
     const isVerified = data[tsOffset + 8] === 1;
-    
+
     return { owner, authority, createdAt, isVerified, metadataUri };
   } catch {
     return null;
+  }
+}
+
+// ============ RECEIPT ANCHOR INGESTION ============
+//
+// Each successful `submit_anchor` instruction on the SAID program creates
+// a ReceiptAnchor PDA. Layout (105 bytes total):
+//   bytes 0..8     discriminator           (sha256("account:ReceiptAnchor")[0..8])
+//   bytes 8..40    agent_id (Pubkey)
+//   bytes 40..48   index    (u64 LE)
+//   bytes 48..56   start_seq (u64 LE)
+//   bytes 56..64   end_seq  (u64 LE)
+//   bytes 64..96   root     ([u8; 32])
+//   bytes 96..104  created_at (i64 LE)
+//   byte 104       bump
+//
+// Continuity enforced on-chain: anchor index 0 starts at seq 1, anchor N+1
+// starts at previous end_seq + 1. So end_seq of the latest anchor for an
+// agent equals the cumulative receipt count.
+
+const RECEIPT_ANCHOR_DISCRIMINATOR = Buffer.from([0x15, 0x73, 0xbb, 0x26, 0x52, 0x4c, 0x58, 0xab]);
+const RECEIPT_ANCHOR_SIZE = 105;
+
+interface ParsedReceiptAnchor {
+  agentPda: string;
+  index: number;
+  startSeq: bigint;
+  endSeq: bigint;
+  root: string;        // hex
+  createdAt: number;   // unix seconds
+}
+
+function parseReceiptAnchor(data: Buffer): ParsedReceiptAnchor | null {
+  try {
+    if (data.length !== RECEIPT_ANCHOR_SIZE) return null;
+    if (!data.subarray(0, 8).equals(RECEIPT_ANCHOR_DISCRIMINATOR)) return null;
+    const agentPda = new PublicKey(data.subarray(8, 40)).toString();
+    const index = Number(data.readBigUInt64LE(40));
+    const startSeq = data.readBigUInt64LE(48);
+    const endSeq = data.readBigUInt64LE(56);
+    const root = data.subarray(64, 96).toString('hex');
+    const createdAt = Number(data.readBigInt64LE(96));
+    return { agentPda, index, startSeq, endSeq, root, createdAt };
+  } catch {
+    return null;
+  }
+}
+
+async function syncAnchorsFromChain(): Promise<{ synced: number; inserted: number; skipped: number; errors: number }> {
+  const stats = { synced: 0, inserted: 0, skipped: 0, errors: 0 };
+  try {
+    // Filter by exact data size — agent accounts are 342 bytes, anchors are 105,
+    // so this is a cheap, unambiguous filter. Discriminator check happens in parse.
+    const accounts = await connection.getProgramAccounts(SAID_PROGRAM_ID, {
+      filters: [{ dataSize: RECEIPT_ANCHOR_SIZE }],
+    });
+
+    for (const { pubkey, account } of accounts) {
+      const parsed = parseReceiptAnchor(account.data);
+      if (!parsed) { stats.skipped++; continue; }
+
+      try {
+        const result = await prisma.receiptAnchor.upsert({
+          where: { pda: pubkey.toString() },
+          update: {
+            // Anchors are immutable on-chain — only update if something
+            // unexpectedly differs (forward-compat / repair).
+            agentPda: parsed.agentPda,
+            index: parsed.index,
+            startSeq: parsed.startSeq,
+            endSeq: parsed.endSeq,
+            root: parsed.root,
+            createdAt: new Date(parsed.createdAt * 1000),
+          },
+          create: {
+            pda: pubkey.toString(),
+            agentPda: parsed.agentPda,
+            index: parsed.index,
+            startSeq: parsed.startSeq,
+            endSeq: parsed.endSeq,
+            root: parsed.root,
+            createdAt: new Date(parsed.createdAt * 1000),
+          },
+          select: { syncedAt: true },
+        });
+        // syncedAt only equals "now" on first insert
+        if (Math.abs(Date.now() - result.syncedAt.getTime()) < 5_000) stats.inserted++;
+        stats.synced++;
+      } catch (err) {
+        console.error('[anchor-sync] upsert failed for', pubkey.toString(), err);
+        stats.errors++;
+      }
+    }
+  } catch (err) {
+    console.error('[anchor-sync] error:', err);
+    stats.errors++;
+  }
+  console.log(`[anchor-sync] synced=${stats.synced} new=${stats.inserted} skipped=${stats.skipped} errors=${stats.errors}`);
+  return stats;
+}
+
+// Aggregate per-agent stats from anchors. Used by computeTrustScore to
+// fold receipt activity into the activity subscore.
+async function getAnchorStatsByAgent(agentPda: string): Promise<{ anchorCount: number; totalReceipts: number }> {
+  try {
+    const agg = await prisma.receiptAnchor.aggregate({
+      where: { agentPda },
+      _count: { _all: true },
+      _max: { endSeq: true },
+    });
+    return {
+      anchorCount: agg._count._all ?? 0,
+      totalReceipts: Number(agg._max.endSeq ?? 0n),
+    };
+  } catch {
+    return { anchorCount: 0, totalReceipts: 0 };
   }
 }
 
@@ -7097,11 +7390,9 @@ app.post('/admin/feedback', async (c) => {
     create: { fromWallet, toWallet, score, comment, weight, signature: `trusted:saidprotocol:${Date.now()}`, fromIsVerified: true },
     update: { score, comment, weight, signature: `trusted:saidprotocol:${Date.now()}` }
   });
-  // Recalculate reputation score
+  // Recalculate reputation score using Bayesian prior
   const allFeedback = await prisma.feedback.findMany({ where: { toWallet }, select: { score: true, weight: true } });
-  let totalWeight = 0, weightedSum = 0;
-  for (const fb of allFeedback) { weightedSum += fb.score * fb.weight; totalWeight += fb.weight; }
-  const newScore = totalWeight > 0 ? weightedSum / totalWeight : 0;
+  const newScore = computeReputationScore(allFeedback);
   await prisma.agent.update({ where: { wallet: toWallet }, data: { reputationScore: newScore } });
   return c.json({ ok: true, feedback, newScore });
 });
@@ -7111,9 +7402,7 @@ app.post('/admin/delete-feedback', async (c) => {
   const { fromWallet, toWallet } = await c.req.json();
   await prisma.feedback.delete({ where: { fromWallet_toWallet: { fromWallet, toWallet } } });
   const allFeedback = await prisma.feedback.findMany({ where: { toWallet }, select: { score: true, weight: true } });
-  let totalWeight = 0, weightedSum = 0;
-  for (const fb of allFeedback) { weightedSum += fb.score * fb.weight; totalWeight += fb.weight; }
-  const newScore = totalWeight > 0 ? weightedSum / totalWeight : 0;
+  const newScore = computeReputationScore(allFeedback);
   await prisma.agent.update({ where: { wallet: toWallet }, data: { reputationScore: newScore } });
   return c.json({ ok: true, newScore });
 });
@@ -7695,7 +7984,7 @@ app.get('/api/agent/resolve/:wallet', async (c) => {
         wallet,
         agent: {
           ...agent,
-          profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+          profile: `https://www.saidprotocol.com/agents/${wallet}`,
           badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
         }
       });
@@ -7727,7 +8016,7 @@ app.get('/api/agent/resolve/:wallet', async (c) => {
           linkedTo: primaryAgent.wallet,
           agent: {
             ...primaryAgent,
-            profile: `https://www.saidprotocol.com/agent.html?wallet=${primaryAgent.wallet}`,
+            profile: `https://www.saidprotocol.com/agents/${primaryAgent.wallet}`,
             badge: `https://api.saidprotocol.com/api/badge/${primaryAgent.wallet}.svg`,
           }
         });
@@ -7783,7 +8072,7 @@ app.get('/api/agent/:wallet/wallets', async (c) => {
         wallet: agent.wallet,
         pda: agent.pda,
         name: agent.name,
-        profile: `https://www.saidprotocol.com/agent.html?wallet=${agent.wallet}`,
+        profile: `https://www.saidprotocol.com/agents/${agent.wallet}`,
       },
       wallets: {
         primary: {
@@ -8119,6 +8408,76 @@ app.route('/', walletRoutes);
 console.log('✅ Delegated Signing Authority endpoints mounted (/v1/wallet/*, /v1/transaction/*, /v1/apikey/*, /v1/policy/*)');
 
 setInterval(syncAgentsFromChain, 5 * 60 * 1000);
+syncAnchorsFromChain();
+setInterval(syncAnchorsFromChain, 5 * 60 * 1000);
+startWalletActivityWorkers(prisma);
+
+// One-time reputationScore backfill on startup. Existing rows were computed
+// with the old un-prior'd formula (single attestation could give score=100).
+// Recompute every agent that has any feedback using the Bayesian helper.
+// Idempotent — re-running is safe.
+async function backfillReputationScores(): Promise<void> {
+  try {
+    const agents = await prisma.agent.findMany({
+      where: { feedbackCount: { gt: 0 } },
+      select: { wallet: true },
+    });
+    if (agents.length === 0) return;
+    console.log(`[reputation-backfill] recomputing ${agents.length} agents with Bayesian prior`);
+    let updated = 0;
+    for (const a of agents) {
+      const fb = await prisma.feedback.findMany({
+        where: { toWallet: a.wallet },
+        select: { score: true, weight: true },
+      });
+      const newScore = computeReputationScore(fb);
+      await prisma.agent.update({
+        where: { wallet: a.wallet },
+        data: { reputationScore: newScore },
+      });
+      updated++;
+    }
+    console.log(`[reputation-backfill] done: ${updated} agents updated`);
+  } catch (err) {
+    console.error('[reputation-backfill] error:', err);
+  }
+}
+setTimeout(() => backfillReputationScores(), 10_000);
+
+// Re-band every cached AgentScore.tier based on its current score under
+// the new thresholds (platinum ≥80, gold ≥65, silver ≥45, bronze ≥25,
+// else unranked). The previous version only renamed 'unverified' to
+// 'unranked', which missed three other transitions (e.g. an agent at
+// score=62 was stored as 'gold' under the old ≥60 threshold but should
+// now be 'silver' under the new ≥65). Idempotent — re-running just
+// reapplies the same CASE expression.
+async function rebandCachedTiers(): Promise<void> {
+  try {
+    const result: number = await prisma.$executeRaw`
+      UPDATE "AgentScore"
+      SET tier = CASE
+        WHEN score >= 80 THEN 'platinum'
+        WHEN score >= 65 THEN 'gold'
+        WHEN score >= 45 THEN 'silver'
+        WHEN score >= 25 THEN 'bronze'
+        ELSE 'unranked'
+      END
+      WHERE tier <> CASE
+        WHEN score >= 80 THEN 'platinum'
+        WHEN score >= 65 THEN 'gold'
+        WHEN score >= 45 THEN 'silver'
+        WHEN score >= 25 THEN 'bronze'
+        ELSE 'unranked'
+      END
+    `;
+    if (result > 0) {
+      console.log(`[tier-reband] updated ${result} AgentScore rows to match new tier thresholds`);
+    }
+  } catch (err) {
+    console.error('[tier-reband] error:', err);
+  }
+}
+setTimeout(() => rebandCachedTiers(), 12_000);
 
 const server = serve({ fetch: app.fetch, port }, (info) => {
   console.log(`SAID API running on http://localhost:${info.port}`);
