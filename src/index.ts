@@ -2187,6 +2187,389 @@ app.post('/api/platforms/clawpump/confirm', async (c) => {
 });
 
 
+// ============ XONA-ORBIT PLATFORM INTEGRATION ============
+
+/**
+ * POST /api/platforms/xona-orbit/register
+ * Step 1: Build a transaction that registers + verifies an agent on SAID
+ * 
+ * Xona-Orbit self-funds. No SAID sponsorship.
+ * Agent wallet must already have ≥0.015 SOL for rent + verification + fees.
+ * Returns an unsigned transaction that Xona-Orbit must sign + broadcast.
+ */
+app.post('/api/platforms/xona-orbit/register', async (c) => {
+  const apiKey = c.req.header('X-Platform-Key');
+  const expectedKey = process.env.XONA_ORBIT_API_KEY;
+  
+  if (!expectedKey || !apiKey || apiKey !== expectedKey) {
+    return c.json({ error: 'Invalid API key' }, 401);
+  }
+  
+  const body = await c.req.json();
+  const { wallet, name, description, twitter, website, capabilities } = body;
+  
+  if (!wallet || !name) {
+    return c.json({ error: 'Required fields: wallet, name' }, 400);
+  }
+
+  let agentPubkey: PublicKey;
+  try {
+    agentPubkey = new PublicKey(wallet);
+  } catch {
+    return c.json({ error: 'Invalid wallet address' }, 400);
+  }
+  
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('agent'), agentPubkey.toBuffer()],
+    SAID_PROGRAM_ID
+  );
+  
+  // Idempotent: if already on-chain, return existing identity
+  const existingOnChain = await connection.getAccountInfo(pda);
+  if (existingOnChain) {
+    const existing = await prisma.agent.upsert({
+      where: { wallet },
+      create: {
+        wallet,
+        pda: pda.toString(),
+        owner: wallet,
+        metadataUri: `https://api.saidprotocol.com/api/cards/${wallet}.json`,
+        registeredAt: new Date(),
+        isVerified: true,
+        verifiedAt: new Date(),
+        sponsored: false,
+        name: name || 'Xona-Orbit Agent',
+        description: description || 'AI Agent via Xona-Orbit',
+        twitter: twitter || undefined,
+        website: website || undefined,
+        skills: capabilities || ['chat', 'assistant'],
+        registrationSource: 'xona-orbit',
+        layer2Verified: true,
+        layer2VerifiedAt: new Date(),
+        l2AttestationMethod: 'platform',
+      },
+      update: {
+        registrationSource: 'xona-orbit',
+        layer2Verified: true,
+        layer2VerifiedAt: new Date(),
+        l2AttestationMethod: 'platform',
+        sponsored: false,
+        isVerified: true,
+        verifiedAt: new Date(),
+      },
+    });
+    
+    emitAgentEvent('agent:registered', { wallet, name: existing.name, source: 'xona-orbit' });
+    
+    return c.json({
+      success: true,
+      message: 'Agent already registered on-chain',
+      agent: {
+        wallet,
+        pda: pda.toString(),
+        name: existing.name || name,
+        verified: true,
+        profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+        badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
+      }
+    });
+  }
+  
+  try {
+    // Store agent card
+    const card = {
+      name,
+      description: description || `${name} - AI Agent`,
+      wallet,
+      twitter: twitter || undefined,
+      website: website || undefined,
+      capabilities: capabilities || ['chat', 'assistant'],
+      platform: 'xona-orbit',
+      verified: true,
+      registeredAt: new Date().toISOString(),
+    };
+    
+    const metadataUri = `https://api.saidprotocol.com/api/cards/${wallet}.json`;
+    
+    await prisma.agentCard.upsert({
+      where: { wallet },
+      create: { wallet, cardJson: JSON.stringify(card) },
+      update: { cardJson: JSON.stringify(card) },
+    });
+    
+    const [treasuryPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from('treasury')],
+      SAID_PROGRAM_ID
+    );
+    
+    // === register_agent instruction ===
+    const registerDiscriminator = Buffer.from([135, 157, 66, 195, 2, 113, 175, 30]);
+    const uriBytes = Buffer.from(metadataUri, 'utf8');
+    const uriLen = Buffer.alloc(4);
+    uriLen.writeUInt32LE(uriBytes.length);
+    const registerData = Buffer.concat([registerDiscriminator, uriLen, uriBytes]);
+    
+    const registerIx = {
+      programId: SAID_PROGRAM_ID,
+      keys: [
+        { pubkey: pda, isSigner: false, isWritable: true },
+        { pubkey: agentPubkey, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data: registerData,
+    };
+    
+    // === get_verified instruction ===
+    const verifyDiscriminator = Buffer.from([132, 231, 2, 30, 115, 74, 23, 26]);
+    
+    const verifyIx = {
+      programId: SAID_PROGRAM_ID,
+      keys: [
+        { pubkey: pda, isSigner: false, isWritable: true },
+        { pubkey: treasuryPda, isSigner: false, isWritable: true },
+        { pubkey: agentPubkey, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data: verifyDiscriminator,
+    };
+    
+    // NO sponsor funding — Xona-Orbit pays from agent wallet directly
+    // Agent wallet must have ≥0.015 SOL before calling this endpoint
+    
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+    
+    const tx = new Transaction({
+      blockhash,
+      lastValidBlockHeight,
+      feePayer: agentPubkey, // Agent wallet pays tx fees
+    });
+    
+    tx.add(registerIx);  // 1. Register on-chain
+    tx.add(verifyIx);    // 2. Get verified badge
+    
+    // No partial sign — fully unsigned, Xona-Orbit signs with agent keypair
+    const serializedTx = tx.serialize({
+      requireAllSignatures: false,
+      verifySignatures: false,
+    }).toString('base64');
+    
+    return c.json({
+      success: true,
+      message: 'Transaction built. Agent wallet must sign and return via /confirm endpoint.',
+      transaction: serializedTx,
+      blockhash,
+      lastValidBlockHeight,
+      requiredSigner: wallet,
+      pda: pda.toString(),
+      metadataUri,
+      instructions: {
+        step1: 'Deserialize the base64 transaction',
+        step2: `Sign with the agent wallet (${wallet})`,
+        step3: 'POST the signed transaction to /api/platforms/xona-orbit/confirm',
+      },
+      fundingNote: 'Agent wallet must have ≥0.015 SOL for rent + verification fee + tx fees. No SAID sponsorship.',
+      expiresIn: '~60 seconds (blockhash expiry)',
+    });
+    
+  } catch (error: any) {
+    console.error('[Xona-Orbit Register Error]', error);
+    return c.json({ 
+      error: 'Failed to build transaction',
+      details: error.message,
+      support: 'contact@saidprotocol.com'
+    }, 500);
+  }
+});
+
+/**
+ * POST /api/platforms/xona-orbit/confirm
+ * Step 2: Receive signed transaction, broadcast on-chain, update DB
+ */
+app.post('/api/platforms/xona-orbit/confirm', async (c) => {
+  const apiKey = c.req.header('X-Platform-Key');
+  const expectedKey = process.env.XONA_ORBIT_API_KEY;
+  
+  if (!expectedKey || !apiKey || apiKey !== expectedKey) {
+    return c.json({ error: 'Invalid or missing X-Platform-Key header' }, 401);
+  }
+  
+  const body = await c.req.json();
+  const { signedTransaction, wallet, name, description, twitter, website, capabilities } = body;
+  
+  if (!signedTransaction || !wallet) {
+    return c.json({ error: 'Required: signedTransaction (base64), wallet' }, 400);
+  }
+  
+  try {
+    const txBuffer = Buffer.from(signedTransaction, 'base64');
+    const tx = Transaction.from(txBuffer);
+    
+    const agentPubkey = new PublicKey(wallet);
+    const signers = tx.signatures.map(s => s.publicKey.toBase58());
+    if (!signers.includes(wallet)) {
+      return c.json({ error: 'Transaction must be signed by the agent wallet' }, 400);
+    }
+    
+    const rawTx = tx.serialize();
+    const txHash = await connection.sendRawTransaction(rawTx, {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+    
+    const confirmation = await connection.confirmTransaction({
+      signature: txHash,
+      blockhash: tx.recentBlockhash!,
+      lastValidBlockHeight: tx.lastValidBlockHeight!,
+    }, 'confirmed');
+    
+    if (confirmation.value.err) {
+      return c.json({ 
+        error: 'Transaction failed on-chain',
+        txHash,
+        details: JSON.stringify(confirmation.value.err),
+      }, 500);
+    }
+    
+    const [pda] = PublicKey.findProgramAddressSync(
+      [Buffer.from('agent'), agentPubkey.toBuffer()],
+      SAID_PROGRAM_ID
+    );
+    
+    const metadataUri = `https://api.saidprotocol.com/api/cards/${wallet}.json`;
+    
+    const agent = await prisma.agent.upsert({
+      where: { wallet },
+      create: {
+        wallet,
+        pda: pda.toString(),
+        owner: wallet,
+        metadataUri,
+        registeredAt: new Date(),
+        isVerified: true,
+        verifiedAt: new Date(),
+        sponsored: false,
+        name: name || 'Xona-Orbit Agent',
+        description: description || 'AI Agent via Xona-Orbit',
+        twitter: twitter || undefined,
+        website: website || undefined,
+        skills: capabilities || ['chat', 'assistant'],
+        registrationSource: 'xona-orbit',
+        layer2Verified: true,
+        layer2VerifiedAt: new Date(),
+        l2AttestationMethod: 'platform',
+      },
+      update: {
+        isVerified: true,
+        verifiedAt: new Date(),
+        sponsored: false,
+        registrationSource: 'xona-orbit',
+        layer2Verified: true,
+        layer2VerifiedAt: new Date(),
+        l2AttestationMethod: 'platform',
+      },
+    });
+    
+    emitAgentEvent('agent:registered', { wallet: agent.wallet, name: agent.name, source: 'xona-orbit', txHash });
+    
+    return c.json({
+      success: true,
+      message: 'Agent registered and verified ON-CHAIN via Xona-Orbit',
+      txHash,
+      explorer: `https://solscan.io/tx/${txHash}`,
+      agent: {
+        wallet: agent.wallet,
+        pda: agent.pda,
+        name: agent.name,
+        verified: true,
+        onChain: true,
+        profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+        badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
+      },
+      platform: {
+        name: 'xona-orbit',
+        costCovered: '~0.015 SOL (rent + verification + fees)',
+        paidBy: 'Xona-Orbit',
+      }
+    });
+    
+  } catch (error: any) {
+    console.error('[Xona-Orbit Confirm Error]', error.message);
+    
+    // Recovery: sync DB if agent already exists on-chain
+    try {
+      const agentPubkey = new PublicKey(wallet);
+      const [pda] = PublicKey.findProgramAddressSync(
+        [Buffer.from('agent'), agentPubkey.toBuffer()],
+        SAID_PROGRAM_ID
+      );
+      
+      const accountInfo = await connection.getAccountInfo(pda);
+      if (accountInfo) {
+        console.log('[Xona-Orbit Recovery] Agent PDA exists on-chain, syncing DB...');
+        const metadataUri = `https://api.saidprotocol.com/api/cards/${wallet}.json`;
+        
+        const agent = await prisma.agent.upsert({
+          where: { wallet },
+          create: {
+            wallet,
+            pda: pda.toString(),
+            owner: wallet,
+            metadataUri,
+            registeredAt: new Date(),
+            isVerified: true,
+            verifiedAt: new Date(),
+            sponsored: false,
+            name: name || 'Xona-Orbit Agent',
+            description: description || 'AI Agent via Xona-Orbit',
+            twitter: twitter || undefined,
+            website: website || undefined,
+            skills: capabilities || ['chat', 'assistant'],
+            registrationSource: 'xona-orbit',
+            layer2Verified: true,
+            layer2VerifiedAt: new Date(),
+            l2AttestationMethod: 'platform',
+          },
+          update: {
+            isVerified: true,
+            verifiedAt: new Date(),
+            sponsored: false,
+            registrationSource: 'xona-orbit',
+            layer2Verified: true,
+            layer2VerifiedAt: new Date(),
+            l2AttestationMethod: 'platform',
+          },
+        });
+        
+        emitAgentEvent('agent:registered', { wallet: agent.wallet, name: agent.name, source: 'xona-orbit', recovered: true });
+        
+        return c.json({
+          success: true,
+          message: 'Agent already registered on-chain. Database synced.',
+          recovered: true,
+          agent: {
+            wallet: agent.wallet,
+            pda: agent.pda,
+            name: agent.name,
+            verified: true,
+            onChain: true,
+            profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+            badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
+          },
+        });
+      }
+    } catch (recoveryError: any) {
+      console.error('[Xona-Orbit Recovery Failed]', recoveryError.message);
+    }
+    
+    return c.json({ 
+      error: 'Broadcast failed',
+      details: error.message,
+      support: 'contact@saidprotocol.com'
+    }, 500);
+  }
+});
+
+
 // ============ SAID HOSTING PLATFORM INTEGRATION ============
 
 /**
@@ -2213,8 +2596,13 @@ app.post('/api/platforms/said-hosting/register', async (c) => {
   }
   
   const body = await c.req.json();
-  const { wallet, name, description, twitter, website, capabilities } = body;
-  
+  const { wallet, name, description, twitter, website, capabilities, platform } = body;
+
+  // platform — optional partner tag (e.g. 'fairscale', 'seekerclaw')
+  // Falls back to 'said-hosting' if not provided
+  const VALID_PLATFORMS = ['said-hosting', 'fairscale', 'seekerclaw', 'spawnr'];
+  const registrationSource = platform && VALID_PLATFORMS.includes(platform) ? platform : 'said-hosting';
+
   // Validate required fields
   if (!wallet || !name) {
     return c.json({ error: 'Required fields: wallet, name' }, 400);
@@ -2227,16 +2615,16 @@ app.post('/api/platforms/said-hosting/register', async (c) => {
   } catch {
     return c.json({ error: 'Invalid wallet address' }, 400);
   }
-  
+
   // Check if already registered on-chain
   const [pda] = PublicKey.findProgramAddressSync(
     [Buffer.from('agent'), agentPubkey.toBuffer()],
     SAID_PROGRAM_ID
   );
-  
+
   const existingOnChain = await connection.getAccountInfo(pda);
   if (existingOnChain) {
-    // Already on-chain — ensure DB is tagged as SAID Hosting and return
+    // Already on-chain — ensure DB is tagged and return
     const existing = await prisma.agent.upsert({
       where: { wallet },
       create: {
@@ -2253,13 +2641,15 @@ app.post('/api/platforms/said-hosting/register', async (c) => {
         twitter: twitter || undefined,
         website: website || undefined,
         skills: capabilities || ['chat', 'assistant'],
-        registrationSource: 'said-hosting',
+        registrationSource,
+        platformId: registrationSource !== 'said-hosting' ? registrationSource : undefined,
         layer2Verified: true,
         layer2VerifiedAt: new Date(),
         l2AttestationMethod: 'platform',
       },
       update: {
-        registrationSource: 'said-hosting',
+        registrationSource,
+        platformId: registrationSource !== 'said-hosting' ? registrationSource : undefined,
         layer2Verified: true,
         layer2VerifiedAt: new Date(),
         l2AttestationMethod: 'platform',
@@ -2269,7 +2659,7 @@ app.post('/api/platforms/said-hosting/register', async (c) => {
       },
     });
     
-    emitAgentEvent('agent:registered', { wallet, name: existing.name, source: 'said-hosting' });
+    emitAgentEvent('agent:registered', { wallet, name: existing.name, source: registrationSource });
     
     return c.json({
       success: true,
@@ -2305,11 +2695,11 @@ app.post('/api/platforms/said-hosting/register', async (c) => {
       twitter: twitter || undefined,
       website: website || undefined,
       capabilities: capabilities || ['chat', 'assistant'],
-      platform: 'said.hosting',
+      platform: registrationSource === 'said-hosting' ? 'said.hosting' : registrationSource,
       verified: true,
       registeredAt: new Date().toISOString(),
     };
-    
+
     const metadataUri = `https://api.saidprotocol.com/api/cards/${wallet}.json`;
     
     await prisma.agentCard.upsert({
@@ -2428,14 +2818,17 @@ app.post('/api/platforms/said-hosting/confirm', async (c) => {
   // Validate SAID Hosting API key
   const apiKey = c.req.header('X-Platform-Key');
   const expectedKey = process.env.SAID_HOSTING_API_KEY;
-  
+
   if (!expectedKey || !apiKey || apiKey !== expectedKey) {
     return c.json({ error: "Invalid or missing X-Platform-Key header" }, 401);
   }
-  
+
   const body = await c.req.json();
-  const { signedTransaction, wallet, name, description, twitter, website, capabilities } = body;
-  
+  const { signedTransaction, wallet, name, description, twitter, website, capabilities, platform } = body;
+
+  const VALID_PLATFORMS = ['said-hosting', 'fairscale', 'seekerclaw', 'spawnr'];
+  const registrationSource = platform && VALID_PLATFORMS.includes(platform) ? platform : 'said-hosting';
+
   if (!signedTransaction || !wallet) {
     return c.json({ error: 'Required: signedTransaction (base64), wallet' }, 400);
   }
@@ -2569,7 +2962,8 @@ app.post('/api/platforms/said-hosting/confirm', async (c) => {
         twitter: twitter || undefined,
         website: website || undefined,
         skills: capabilities || ['chat', 'assistant'],
-        registrationSource: 'said-hosting',
+        registrationSource,
+        platformId: registrationSource !== 'said-hosting' ? registrationSource : undefined,
         layer2Verified: true,
         layer2VerifiedAt: new Date(),
         l2AttestationMethod: 'platform',
@@ -2578,15 +2972,16 @@ app.post('/api/platforms/said-hosting/confirm', async (c) => {
         isVerified: true,
         verifiedAt: new Date(),
         sponsored: true,
-        registrationSource: 'said-hosting',
+        registrationSource,
+        platformId: registrationSource !== 'said-hosting' ? registrationSource : undefined,
         layer2Verified: true,
         layer2VerifiedAt: new Date(),
         l2AttestationMethod: 'platform',
       },
     });
-    
+
     // Emit SSE event for real-time frontend updates
-    emitAgentEvent('agent:registered', { wallet: agent.wallet, name: agent.name, source: 'said-hosting', txHash });
+    emitAgentEvent('agent:registered', { wallet: agent.wallet, name: agent.name, source: registrationSource, txHash });
     
     return c.json({
       success: true,
@@ -2643,7 +3038,8 @@ app.post('/api/platforms/said-hosting/confirm', async (c) => {
             twitter: twitter || undefined,
             website: website || undefined,
             skills: capabilities || ['chat', 'assistant'],
-            registrationSource: 'said-hosting',
+            registrationSource,
+            platformId: registrationSource !== 'said-hosting' ? registrationSource : undefined,
             layer2Verified: true,
             layer2VerifiedAt: new Date(),
             l2AttestationMethod: 'platform',
@@ -2652,14 +3048,15 @@ app.post('/api/platforms/said-hosting/confirm', async (c) => {
             isVerified: true,
             verifiedAt: new Date(),
             sponsored: true,
-            registrationSource: 'said-hosting',
+            registrationSource,
+            platformId: registrationSource !== 'said-hosting' ? registrationSource : undefined,
             layer2Verified: true,
             layer2VerifiedAt: new Date(),
             l2AttestationMethod: 'platform',
           },
         });
-        
-        emitAgentEvent('agent:registered', { wallet: agent.wallet, name: agent.name, source: 'said-hosting', recovered: true });
+
+        emitAgentEvent('agent:registered', { wallet: agent.wallet, name: agent.name, source: registrationSource, recovered: true });
         
         return c.json({
           success: true,
@@ -3949,6 +4346,661 @@ app.get('/api/platforms/seekerclaw/balance', async (c) => {
   });
 
   const costPerAgent = 0.015; // SOL
+  const estimatedAgentsRemaining = Math.floor(sponsorBalance / LAMPORTS_PER_SOL / costPerAgent);
+
+  let currentFeeTier = 'free (10 per agent)';
+  if (usage.signatures >= 1_000_000) currentFeeTier = '0.00005 SOL';
+  else if (usage.signatures >= 100_000) currentFeeTier = '0.00008 SOL';
+  else if (usage.signatures >= 10_000) currentFeeTier = '0.0001 SOL';
+
+  return c.json({
+    sponsor_wallet_balance: sponsorBalance / LAMPORTS_PER_SOL,
+    cost_per_agent_sol: costPerAgent,
+    estimated_agents_remaining: estimatedAgentsRemaining,
+    month: currentMonth,
+    agents_created_this_month: usage.agentsCreated,
+    platform_signatures_this_month: usage.signatures,
+    fees_collected_sol: usage.feesCollected,
+    current_volume_tier: currentFeeTier,
+    free_tier_model: '10 signatures per agent per month',
+  });
+});
+
+// ============ FAIRSCALE PLATFORM INTEGRATION ============
+//
+// FairScale hosts agents on SAID infrastructure.
+// Same custodial model as SeekerClaw — Privy holds keys, SAID authorizes.
+// Auth: X-Platform-Key header (FAIRSCALE_API_KEY env var)
+
+app.post('/api/platforms/fairscale/provision', async (c) => {
+  const apiKey = c.req.header('X-Platform-Key');
+  const expectedKey = process.env.FAIRSCALE_API_KEY;
+
+  if (!expectedKey || !apiKey || apiKey !== expectedKey) {
+    return c.json({ error: 'Invalid API key' }, 401);
+  }
+
+  const body = await c.req.json();
+  const { agent_name, metadata } = body;
+
+  if (!agent_name) {
+    return c.json({ error: 'Required: agent_name' }, 400);
+  }
+
+  // Idempotency — if external_id provided, check if already provisioned
+  if (metadata?.external_id) {
+    const existing = await prisma.agent.findFirst({
+      where: {
+        registrationSource: 'fairscale',
+        description: { contains: metadata.external_id },
+      },
+      include: { agentWallets: true },
+    });
+
+    if (existing && existing.agentWallets.length > 0) {
+      return c.json({
+        success: true,
+        already_provisioned: true,
+        agent: {
+          id: existing.id,
+          wallet: existing.wallet,
+          pda: existing.pda,
+          name: existing.name,
+          status: existing.isVerified ? 'verified' : 'registered',
+          profile: `https://www.saidprotocol.com/agent.html?wallet=${existing.wallet}`,
+          badge: `https://api.saidprotocol.com/api/badge/${existing.wallet}.svg`,
+        },
+      });
+    }
+  }
+
+  const sponsorKey = process.env['SPAWNR_SPONSOR_PRIVATE_KEY'];
+  if (!sponsorKey) {
+    return c.json({ error: 'Sponsor wallet not configured', support: 'contact@saidprotocol.com' }, 500);
+  }
+
+  const sponsorKeypair = Keypair.fromSecretKey(bs58.decode(sponsorKey));
+  const sponsorBalance = await connection.getBalance(sponsorKeypair.publicKey);
+  const REQUIRED_SPONSOR_BALANCE = 0.02 * LAMPORTS_PER_SOL;
+
+  if (sponsorBalance < REQUIRED_SPONSOR_BALANCE) {
+    return c.json({
+      error: 'Sponsor wallet balance too low to provision',
+      code: 'INSUFFICIENT_FUNDS',
+      sponsor_balance_sol: sponsorBalance / LAMPORTS_PER_SOL,
+      required_sol: REQUIRED_SPONSOR_BALANCE / LAMPORTS_PER_SOL,
+    }, 402);
+  }
+
+  try {
+    console.log(`[FairScale] Creating Privy wallet for agent "${agent_name}"`);
+
+    let agentPubkey: PublicKey;
+    let privyWalletId: string;
+    let walletProvider: string;
+
+    const isLiveMode = process.env.PRIVY_WALLET_MODE === 'live';
+    if (isLiveMode) {
+      const wallet = await (privyClient as any).wallets().create({ chain_type: 'solana' });
+      agentPubkey = new PublicKey(wallet.address);
+      privyWalletId = wallet.id;
+      walletProvider = 'privy';
+    } else {
+      const mockKeypair = Keypair.generate();
+      agentPubkey = mockKeypair.publicKey;
+      privyWalletId = `mock-${mockKeypair.publicKey.toBase58().substring(0, 8)}`;
+      walletProvider = 'mock';
+    }
+
+    const walletAddress = agentPubkey.toBase58();
+    console.log(`[FairScale] Wallet created: ${walletAddress} (${walletProvider})`);
+
+    const [pda] = PublicKey.findProgramAddressSync(
+      [Buffer.from('agent'), agentPubkey.toBuffer()],
+      SAID_PROGRAM_ID
+    );
+
+    const metadataUri = `https://api.saidprotocol.com/api/cards/${walletAddress}.json`;
+    const card = {
+      name: agent_name,
+      description: `${agent_name} - FairScale AI Agent`,
+      wallet: walletAddress,
+      capabilities: metadata?.capabilities || ['scoring', 'trust', 'payments'],
+      platform: 'fairscale',
+      verified: true,
+      registeredAt: new Date().toISOString(),
+      external_id: metadata?.external_id,
+    };
+
+    await prisma.agentCard.upsert({
+      where: { wallet: walletAddress },
+      create: { wallet: walletAddress, cardJson: JSON.stringify(card) },
+      update: { cardJson: JSON.stringify(card) },
+    });
+
+    const [treasuryPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from('treasury')],
+      SAID_PROGRAM_ID
+    );
+
+    const FUND_AMOUNT = 0.015 * LAMPORTS_PER_SOL;
+
+    const fundIx = SystemProgram.transfer({
+      fromPubkey: sponsorKeypair.publicKey,
+      toPubkey: agentPubkey,
+      lamports: FUND_AMOUNT,
+    });
+
+    const registerDiscriminator = Buffer.from([135, 157, 66, 195, 2, 113, 175, 30]);
+    const uriBytes = Buffer.from(metadataUri, 'utf8');
+    const uriLen = Buffer.alloc(4);
+    uriLen.writeUInt32LE(uriBytes.length);
+    const registerData = Buffer.concat([registerDiscriminator, uriLen, uriBytes]);
+
+    const registerIx = {
+      programId: SAID_PROGRAM_ID,
+      keys: [
+        { pubkey: pda, isSigner: false, isWritable: true },
+        { pubkey: agentPubkey, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data: registerData,
+    };
+
+    const verifyDiscriminator = Buffer.from([132, 231, 2, 30, 115, 74, 23, 26]);
+    const verifyIx = {
+      programId: SAID_PROGRAM_ID,
+      keys: [
+        { pubkey: pda, isSigner: false, isWritable: true },
+        { pubkey: treasuryPda, isSigner: false, isWritable: true },
+        { pubkey: agentPubkey, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data: verifyDiscriminator,
+    };
+
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+    const tx = new Transaction({ blockhash, lastValidBlockHeight, feePayer: sponsorKeypair.publicKey });
+    tx.add(fundIx);
+    tx.add(registerIx);
+    tx.add(verifyIx);
+    tx.partialSign(sponsorKeypair);
+
+    if (isLiveMode) {
+      const serializedTx = tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64');
+
+      const signResult = await (privyClient as any).wallets().rpc(privyWalletId, {
+        method: 'signTransaction',
+        params: { encoding: 'base64', transaction: serializedTx },
+      });
+
+      const signedTxBuffer = Buffer.from((signResult.data as any).signed_transaction, 'base64');
+      const signedTx = Transaction.from(signedTxBuffer);
+
+      const txHash = await connection.sendRawTransaction(signedTx.serialize(), {
+        skipPreflight: false,
+        preflightCommitment: 'confirmed',
+      });
+
+      const confirmation = await connection.confirmTransaction({
+        signature: txHash,
+        blockhash,
+        lastValidBlockHeight,
+      }, 'confirmed');
+
+      if (confirmation.value.err) {
+        return c.json({
+          error: 'On-chain transaction failed',
+          code: 'SOLANA_ERROR',
+          txHash,
+          details: JSON.stringify(confirmation.value.err),
+        }, 500);
+      }
+
+      console.log(`[FairScale] On-chain registration confirmed: ${txHash}`);
+
+      const agent = await prisma.agent.upsert({
+        where: { wallet: walletAddress },
+        create: {
+          wallet: walletAddress,
+          pda: pda.toBase58(),
+          owner: walletAddress,
+          metadataUri,
+          registeredAt: new Date(),
+          isVerified: true,
+          verifiedAt: new Date(),
+          sponsored: true,
+          name: agent_name,
+          description: `${agent_name} - FairScale AI Agent${metadata?.external_id ? ` [ext:${metadata.external_id}]` : ''}`,
+          skills: metadata?.capabilities || ['scoring', 'trust', 'payments'],
+          registrationSource: 'fairscale',
+          layer2Verified: true,
+          layer2VerifiedAt: new Date(),
+          l2AttestationMethod: 'platform',
+          platformId: 'fairscale',
+        },
+        update: {
+          isVerified: true,
+          verifiedAt: new Date(),
+          registrationSource: 'fairscale',
+          platformId: 'fairscale',
+        },
+      });
+
+      await prisma.agentWallet.create({
+        data: {
+          agentId: agent.id,
+          publicKey: walletAddress,
+          provider: walletProvider,
+          providerWalletId: privyWalletId,
+          walletType: 'transaction',
+          isPrimary: true,
+        },
+      });
+
+      const currentMonth = new Date().toISOString().slice(0, 7);
+      await prisma.monthlyUsage.upsert({
+        where: { platformId_month: { platformId: 'fairscale', month: currentMonth } },
+        create: { platformId: 'fairscale', month: currentMonth, agentsCreated: 1 },
+        update: { agentsCreated: { increment: 1 } },
+      });
+
+      let nftAddress: string | undefined;
+      try {
+        const nftResponse = await fetch('https://app.saidprotocol.com/api/internal/mint-nft', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Internal-Key': process.env.SAID_HOSTING_INTERNAL_KEY || '',
+          },
+          body: JSON.stringify({
+            walletAddress,
+            name: agent_name,
+            description: `${agent_name} - FairScale AI Agent${metadata?.external_id ? ` [ext:${metadata.external_id}]` : ''}`,
+            capabilities: metadata?.capabilities || ['scoring', 'trust', 'payments'],
+            tier: 'fairscale',
+            ownerAddress: walletAddress,
+          }),
+        });
+
+        if (nftResponse.ok) {
+          const nftResult = await nftResponse.json();
+          nftAddress = nftResult.nft_address;
+          await prisma.agent.update({
+            where: { id: agent.id },
+            data: { nftAddress },
+          });
+          console.log(`[FairScale] Minted NFT for ${walletAddress}: ${nftAddress}`);
+        } else {
+          console.error(`[FairScale] NFT mint failed: ${nftResponse.status} ${await nftResponse.text()}`);
+        }
+      } catch (nftError: any) {
+        console.error(`[FairScale] NFT mint error (non-fatal):`, nftError.message);
+      }
+
+      emitAgentEvent('agent:registered', { wallet: walletAddress, name: agent_name, source: 'fairscale', txHash });
+
+      return c.json({
+        success: true,
+        agent: {
+          id: agent.id,
+          wallet: walletAddress,
+          pda: pda.toBase58(),
+          name: agent_name,
+          status: 'verified',
+          nft_address: nftAddress,
+          profile: `https://www.saidprotocol.com/agent.html?wallet=${walletAddress}`,
+          badge: `https://api.saidprotocol.com/api/badge/${walletAddress}.svg`,
+        },
+        privy_wallet: {
+          public_key: walletAddress,
+          provider: walletProvider,
+        },
+        on_chain: {
+          register_tx: txHash,
+          explorer: `https://solscan.io/tx/${txHash}`,
+          verification_fee_paid: '0.01 SOL',
+        },
+        cost: {
+          total_sol: 0.019,
+          breakdown: {
+            pda_rent: '~0.005 SOL',
+            verification_fee: '0.01 SOL (→ SAID treasury)',
+            nft_mint_rent: '~0.004 SOL',
+            tx_fees: '~0.00002 SOL',
+          },
+        },
+      });
+    } else {
+      const agent = await prisma.agent.upsert({
+        where: { wallet: walletAddress },
+        create: {
+          wallet: walletAddress,
+          pda: pda.toBase58(),
+          owner: walletAddress,
+          metadataUri,
+          registeredAt: new Date(),
+          isVerified: true,
+          verifiedAt: new Date(),
+          sponsored: true,
+          name: agent_name,
+          description: `${agent_name} - FairScale AI Agent (mock)${metadata?.external_id ? ` [ext:${metadata.external_id}]` : ''}`,
+          skills: metadata?.capabilities || ['scoring', 'trust', 'payments'],
+          registrationSource: 'fairscale',
+          layer2Verified: true,
+          layer2VerifiedAt: new Date(),
+          l2AttestationMethod: 'platform',
+          platformId: 'fairscale',
+        },
+        update: {
+          registrationSource: 'fairscale',
+          platformId: 'fairscale',
+        },
+      });
+
+      await prisma.agentWallet.create({
+        data: {
+          agentId: agent.id,
+          publicKey: walletAddress,
+          provider: walletProvider,
+          providerWalletId: privyWalletId,
+          walletType: 'transaction',
+          isPrimary: true,
+        },
+      });
+
+      const currentMonth = new Date().toISOString().slice(0, 7);
+      await prisma.monthlyUsage.upsert({
+        where: { platformId_month: { platformId: 'fairscale', month: currentMonth } },
+        create: { platformId: 'fairscale', month: currentMonth, agentsCreated: 1 },
+        update: { agentsCreated: { increment: 1 } },
+      });
+
+      return c.json({
+        success: true,
+        mock: true,
+        agent: {
+          id: agent.id,
+          wallet: walletAddress,
+          pda: pda.toBase58(),
+          name: agent_name,
+          status: 'verified',
+        },
+        privy_wallet: {
+          public_key: walletAddress,
+          provider: walletProvider,
+        },
+        note: 'Mock mode — no on-chain transaction. Set PRIVY_WALLET_MODE=live for production.',
+      });
+    }
+
+  } catch (error: any) {
+    console.error('[FairScale Provision Error]', error);
+    return c.json({
+      error: 'Provisioning failed',
+      code: error.code || 'INTERNAL_ERROR',
+      details: error.message,
+      support: 'contact@saidprotocol.com',
+    }, 500);
+  }
+});
+
+app.post('/api/platforms/fairscale/sign', async (c) => {
+  const apiKey = c.req.header('X-Platform-Key');
+  const expectedKey = process.env.FAIRSCALE_API_KEY;
+
+  if (!expectedKey || !apiKey || apiKey !== expectedKey) {
+    return c.json({ error: 'Invalid API key' }, 401);
+  }
+
+  const body = await c.req.json();
+  const { agent_id, transaction, description } = body;
+
+  if (!agent_id || !transaction) {
+    return c.json({ error: 'Required: agent_id, transaction (base64)' }, 400);
+  }
+
+  try {
+    const agent = await prisma.agent.findUnique({
+      where: { id: agent_id },
+      include: { agentWallets: true },
+    });
+
+    if (!agent) return c.json({ error: 'Agent not found', code: 'NOT_FOUND' }, 404);
+    if (agent.registrationSource !== 'fairscale') {
+      return c.json({ error: 'Agent does not belong to FairScale', code: 'FORBIDDEN' }, 403);
+    }
+
+    const wallet = agent.agentWallets.find(w => w.walletType === 'transaction' && w.isPrimary);
+    if (!wallet) return c.json({ error: 'No active wallet for this agent', code: 'NOT_FOUND' }, 404);
+
+    let tx: Transaction;
+    try {
+      const txBuffer = Buffer.from(transaction, 'base64');
+      tx = Transaction.from(txBuffer);
+    } catch {
+      return c.json({ error: 'Invalid transaction: failed to deserialize', code: 'INVALID_TRANSACTION' }, 400);
+    }
+
+    const currentMonth = new Date().toISOString().slice(0, 7);
+
+    const agentUsage = await prisma.monthlyUsage.upsert({
+      where: { platformId_month: { platformId: `agent:${agent_id}`, month: currentMonth } },
+      create: { platformId: `agent:${agent_id}`, month: currentMonth },
+      update: {},
+    });
+
+    const platformUsage = await prisma.monthlyUsage.upsert({
+      where: { platformId_month: { platformId: 'fairscale', month: currentMonth } },
+      create: { platformId: 'fairscale', month: currentMonth },
+      update: {},
+    });
+
+    const AGENT_FREE_TIER = 10;
+    const pastFreeTier = agentUsage.signatures >= AGENT_FREE_TIER;
+
+    let feeLamports = 0;
+    if (pastFreeTier) {
+      if (platformUsage.signatures < 100_000) feeLamports = 100_000;
+      else if (platformUsage.signatures < 1_000_000) feeLamports = 80_000;
+      else feeLamports = 50_000;
+
+      const SAID_TREASURY = new PublicKey('2XfHTeNWTjNwUmgoXaafYuqHcAAXj8F5Kjw2Bnzi4FxH');
+      const agentPubkey = new PublicKey(wallet.publicKey);
+
+      const balance = await connection.getBalance(agentPubkey);
+      if (balance < feeLamports + 5000) {
+        return c.json({
+          error: 'Insufficient balance for signing fee',
+          code: 'INSUFFICIENT_FUNDS',
+          balance_sol: balance / LAMPORTS_PER_SOL,
+          fee_sol: feeLamports / LAMPORTS_PER_SOL,
+        }, 402);
+      }
+
+      tx.add(SystemProgram.transfer({
+        fromPubkey: agentPubkey,
+        toPubkey: SAID_TREASURY,
+        lamports: feeLamports,
+      }));
+    }
+
+    const serializedTx = tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64');
+
+    let signedTxBase64: string;
+    let signature: string;
+
+    if (wallet.provider === 'privy') {
+      const signResult = await (privyClient as any).wallets().rpc(wallet.providerWalletId!, {
+        method: 'signTransaction',
+        params: { encoding: 'base64', transaction: serializedTx },
+      });
+      signedTxBase64 = (signResult.data as any).signed_transaction;
+      const signedTx = Transaction.from(Buffer.from(signedTxBase64, 'base64'));
+      signature = bs58.encode(signedTx.signature!);
+    } else {
+      signedTxBase64 = serializedTx;
+      signature = `mock-sig-${Date.now()}`;
+    }
+
+    const feeCollectedSol = feeLamports / LAMPORTS_PER_SOL;
+    await Promise.all([
+      prisma.monthlyUsage.update({
+        where: { platformId_month: { platformId: `agent:${agent_id}`, month: currentMonth } },
+        data: { signatures: { increment: 1 }, feesCollected: { increment: feeCollectedSol } },
+      }),
+      prisma.monthlyUsage.update({
+        where: { platformId_month: { platformId: 'fairscale', month: currentMonth } },
+        data: { signatures: { increment: 1 }, feesCollected: { increment: feeCollectedSol } },
+      }),
+    ]);
+
+    console.log(`[FairScale] Signed tx for agent ${agent_id}, fee: ${feeCollectedSol} SOL, sig: ${signature}`);
+
+    return c.json({
+      success: true,
+      signed_transaction: signedTxBase64,
+      signature,
+      fee_charged_sol: feeCollectedSol,
+      agent_signatures_this_month: agentUsage.signatures + 1,
+      agent_free_remaining: Math.max(0, AGENT_FREE_TIER - agentUsage.signatures - 1),
+      platform_signatures_this_month: platformUsage.signatures + 1,
+      submitted: false,
+    });
+
+  } catch (error: any) {
+    console.error('[FairScale Sign Error]', error);
+    return c.json({
+      error: 'Signing failed',
+      code: error.code || 'INTERNAL_ERROR',
+      details: error.message,
+    }, 500);
+  }
+});
+
+app.get('/api/platforms/fairscale/agents', async (c) => {
+  const apiKey = c.req.header('X-Platform-Key');
+  const expectedKey = process.env.FAIRSCALE_API_KEY;
+
+  if (!expectedKey || !apiKey || apiKey !== expectedKey) {
+    return c.json({ error: 'Invalid API key' }, 401);
+  }
+
+  const limit = Math.min(parseInt(c.req.query('limit') || '50'), 200);
+  const offset = parseInt(c.req.query('offset') || '0');
+  const status = c.req.query('status');
+
+  const where: any = { registrationSource: 'fairscale' };
+  if (status === 'verified') where.isVerified = true;
+  if (status === 'pending') where.isVerified = false;
+
+  const [agents, total] = await Promise.all([
+    prisma.agent.findMany({
+      where,
+      select: {
+        id: true, wallet: true, pda: true, name: true,
+        isVerified: true, createdAt: true, nftAddress: true,
+      },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      skip: offset,
+    }),
+    prisma.agent.count({ where }),
+  ]);
+
+  return c.json({
+    agents: agents.map(a => ({
+      agent_id: a.id,
+      wallet: a.wallet,
+      pda: a.pda,
+      name: a.name,
+      status: a.isVerified ? 'verified' : 'pending',
+      nft_address: a.nftAddress,
+      created_at: a.createdAt,
+    })),
+    total,
+    limit,
+    offset,
+  });
+});
+
+app.get('/api/platforms/fairscale/agents/:agent_id', async (c) => {
+  const apiKey = c.req.header('X-Platform-Key');
+  const expectedKey = process.env.FAIRSCALE_API_KEY;
+
+  if (!expectedKey || !apiKey || apiKey !== expectedKey) {
+    return c.json({ error: 'Invalid API key' }, 401);
+  }
+
+  const { agent_id } = c.req.param();
+
+  const agent = await prisma.agent.findUnique({
+    where: { id: agent_id },
+    include: { agentWallets: { where: { isPrimary: true }, take: 1 } },
+  });
+
+  if (!agent || agent.registrationSource !== 'fairscale') {
+    return c.json({ error: 'Agent not found' }, 404);
+  }
+
+  let balanceSol = 0;
+  try {
+    const balance = await connection.getBalance(new PublicKey(agent.wallet));
+    balanceSol = balance / LAMPORTS_PER_SOL;
+  } catch {}
+
+  const currentMonth = new Date().toISOString().slice(0, 7);
+  const usage = await prisma.monthlyUsage.findUnique({
+    where: { platformId_month: { platformId: `agent:${agent_id}`, month: currentMonth } },
+  });
+
+  const AGENT_FREE_TIER = 10;
+  const sigs = usage?.signatures || 0;
+
+  return c.json({
+    agent_id: agent.id,
+    wallet: agent.wallet,
+    pda: agent.pda,
+    name: agent.name,
+    status: agent.isVerified ? 'verified' : 'pending',
+    nft_address: agent.nftAddress,
+    balance_sol: balanceSol,
+    created_at: agent.createdAt,
+    usage: {
+      month: currentMonth,
+      signatures: sigs,
+      free_remaining: Math.max(0, AGENT_FREE_TIER - sigs),
+      fees_paid_sol: usage?.feesCollected || 0,
+    },
+    profile: `https://www.saidprotocol.com/agent.html?wallet=${agent.wallet}`,
+    badge: `https://api.saidprotocol.com/api/badge/${agent.wallet}.svg`,
+  });
+});
+
+app.get('/api/platforms/fairscale/balance', async (c) => {
+  const apiKey = c.req.header('X-Platform-Key');
+  const expectedKey = process.env.FAIRSCALE_API_KEY;
+
+  if (!expectedKey || !apiKey || apiKey !== expectedKey) {
+    return c.json({ error: 'Invalid API key' }, 401);
+  }
+
+  const sponsorKey = process.env['SPAWNR_SPONSOR_PRIVATE_KEY'];
+  if (!sponsorKey) {
+    return c.json({ error: 'Sponsor wallet not configured' }, 500);
+  }
+
+  const sponsorKeypair = Keypair.fromSecretKey(bs58.decode(sponsorKey));
+  const sponsorBalance = await connection.getBalance(sponsorKeypair.publicKey);
+
+  const currentMonth = new Date().toISOString().slice(0, 7);
+  const usage = await prisma.monthlyUsage.upsert({
+    where: { platformId_month: { platformId: 'fairscale', month: currentMonth } },
+    create: { platformId: 'fairscale', month: currentMonth },
+    update: {},
+  });
+
+  const costPerAgent = 0.015;
   const estimatedAgentsRemaining = Math.floor(sponsorBalance / LAMPORTS_PER_SOL / costPerAgent);
 
   let currentFeeTier = 'free (10 per agent)';
