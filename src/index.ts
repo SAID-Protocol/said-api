@@ -2460,18 +2460,44 @@ app.post('/api/platforms/xona-orbit/confirm', async (c) => {
       preflightCommitment: 'confirmed',
     });
     
-    const confirmation = await connection.confirmTransaction({
-      signature: txHash,
-      blockhash: tx.recentBlockhash!,
-      lastValidBlockHeight: tx.lastValidBlockHeight!,
-    }, 'confirmed');
-    
-    if (confirmation.value.err) {
-      return c.json({ 
-        error: 'Transaction failed on-chain',
-        txHash,
-        details: JSON.stringify(confirmation.value.err),
-      }, 500);
+    // Handle blockhash expiry gracefully — tx may land even if confirmation polling misses it
+    let txConfirmed = false;
+    try {
+      const confirmation = await connection.confirmTransaction({
+        signature: txHash,
+        blockhash: tx.recentBlockhash!,
+        lastValidBlockHeight: tx.lastValidBlockHeight!,
+      }, 'confirmed');
+      
+      if (confirmation.value.err) {
+        return c.json({ 
+          error: 'Transaction failed on-chain',
+          txHash,
+          details: JSON.stringify(confirmation.value.err),
+        }, 500);
+      }
+      txConfirmed = true;
+    } catch (confirmErr: any) {
+      console.warn('[Xona-Orbit Confirm] confirmTransaction threw:', confirmErr.message);
+      console.log('[Xona-Orbit Confirm] Checking if tx actually landed via getSignatureStatuses...');
+      
+      const { value } = await connection.getSignatureStatuses([txHash]);
+      const status = value?.[0];
+      
+      if (status?.err) {
+        return c.json({ 
+          error: 'Transaction failed on-chain',
+          txHash,
+          details: JSON.stringify(status.err),
+        }, 500);
+      }
+      
+      if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') {
+        console.log('[Xona-Orbit Confirm] Tx confirmed despite blockhash expiry. txHash:', txHash);
+        txConfirmed = true;
+      } else {
+        throw confirmErr; // Truly failed
+      }
     }
     
     const [pda] = PublicKey.findProgramAddressSync(
