@@ -40,6 +40,23 @@ import {
   getLaunchedTokenStatsForWallet,
 } from './services/wallet-activity.js';
 import { fetchFairScaleScore } from './score-engine.js';
+import {
+  shapeReputationResponse,
+  shapeReputationResponseV7,
+  shapeNotFoundReputationResponse,
+  type AgentInput,
+  type ReputationResponse,
+} from './reputation-shaping.js';
+import { REPUTATION_METHODOLOGY } from './reputation-methodology.js';
+import {
+  isValidSolanaAddress,
+  reputationRateLimit,
+  getCachedReputation,
+  setCachedReputation,
+  createConcurrencyLimiter,
+  fetchFairScaleWithBreaker,
+} from './reputation-hardening.js';
+import { computeTrustScoreV7 } from './reputation-engine-v7.js';
 // Verify a Solana wallet signature
 function verifySignature(message: string, signature: string, walletAddress: string): boolean {
   try {
@@ -726,11 +743,171 @@ app.get('/api/agents/:wallet/feedback/message', async (c) => {
   const timestamp = Date.now();
   const message = getFeedbackMessage(fromWallet, toWallet, parseInt(score), timestamp);
   
-  return c.json({ 
+  return c.json({
     message,
     timestamp,
     instructions: 'Sign this exact message with your wallet, then POST to /api/agents/:wallet/feedback with { fromWallet, score, comment?, signature, timestamp }'
   });
+});
+
+// ============ REPUTATION API (external consumer surface) ============
+//
+// Focused, IDLE-shaped reputation endpoints. Reuses the same live-overlay
+// scoring pipeline as /api/agents/:wallet but projects the response down to
+// just what a routing/preferential-treatment consumer needs:
+//   - tier + score + component breakdown
+//   - human-readable reason codes that drove the score
+//   - data_completeness flag so the consumer can decide how much to trust it
+//   - last_updated and methodology_version for cache/freshness logic
+//
+// Unknown wallets return HTTP 200 with tier=unranked + reason=agent_not_registered
+// so consumers don't have to special-case 404s in their routing logic.
+//
+// Hardening applied via reputation-hardening.ts:
+//   - Per-IP / per-partner rate limit (60/min anon, 600/min for x-partner)
+//   - Per-wallet response cache (60s TTL, Redis if available, in-memory fallback)
+//   - Wallet format validation before any DB hit
+//   - Bulk endpoint capped at 25 wallets/request with concurrency limited to 10
+//   - FairScale circuit breaker after 3 consecutive failures
+
+const REPUTATION_BULK_MAX = 25;
+const REPUTATION_BULK_CONCURRENCY = 10;
+const bulkLimit = createConcurrencyLimiter(REPUTATION_BULK_CONCURRENCY);
+
+// Rate limit applies to every /api/reputation/* route — applied here so
+// it's visible alongside the route definitions and obvious to anyone
+// editing nearby code.
+app.use('/api/reputation/*', reputationRateLimit());
+
+/**
+ * Compute a fresh reputation response for a single wallet using v0.7.
+ *
+ * Always returns a ReputationResponse — unknown wallets get the
+ * not-found-shaped payload so the cache and bulk endpoint can treat
+ * known and unknown wallets uniformly. Caches the result for 60s.
+ *
+ * v0.7 differs from the directory's scoring in three ways:
+ *   - Square-gated composite (Trust gates Traction)
+ *   - Structural ceilings (unverified→Silver, no-delivery→Gold)
+ *   - Continuous-membership type model + conditional weights
+ *
+ * The directory endpoint /api/agents/:wallet still uses the v0.6
+ * computeTrustScore for backward compatibility.
+ */
+async function loadReputationForWallet(wallet: string): Promise<ReputationResponse> {
+  const cached = await getCachedReputation(wallet);
+  if (cached) return cached;
+
+  const agent = await prisma.agent.findUnique({
+    where: { wallet },
+    include: {
+      _count: { select: { feedbackReceived: true } },
+      trustScore: true,
+    },
+  });
+  if (!agent) {
+    const notFound = shapeNotFoundReputationResponse(wallet);
+    await setCachedReputation(wallet, notFound);
+    return notFound;
+  }
+  const [anchorStats, activityStatsResult, launchedTokens, fairscaleRaw] = await Promise.all([
+    agent.pda
+      ? getAnchorStatsByAgent(agent.pda)
+      : Promise.resolve({ anchorCount: 0, totalReceipts: 0 }),
+    getActivityStatsForWallet(prisma, agent.wallet),
+    getLaunchedTokenStatsForWallet(prisma, agent.wallet),
+    fetchFairScaleWithBreaker(() => fetchFairScaleScore(agent.wallet)),
+  ]);
+  const activityStats = activityStatsResult ?? undefined;
+  const fairscaleSubscore =
+    fairscaleRaw && fairscaleRaw.max > 0
+      ? Math.max(0, Math.min(10, (fairscaleRaw.score / fairscaleRaw.max) * 10))
+      : 0;
+  const trustScoreV7 = computeTrustScoreV7(
+    agent,
+    anchorStats,
+    activityStats,
+    launchedTokens,
+    fairscaleSubscore,
+  );
+  const shaped = shapeReputationResponseV7(
+    agent as unknown as AgentInput,
+    trustScoreV7,
+    anchorStats,
+    activityStats,
+    launchedTokens,
+  );
+  await setCachedReputation(wallet, shaped);
+  return shaped;
+}
+
+// Per-wallet reputation query — the main IDLE consumer endpoint.
+app.get('/api/reputation/:wallet', async (c) => {
+  const wallet = c.req.param('wallet');
+  if (!isValidSolanaAddress(wallet)) {
+    return c.json({ error: 'Invalid Solana wallet address', wallet }, 400);
+  }
+  try {
+    const result = await loadReputationForWallet(wallet);
+    return c.json(result);
+  } catch (err) {
+    console.error('[reputation]', wallet, err);
+    return c.json({ error: 'Failed to compute reputation', wallet }, 500);
+  }
+});
+
+// Bulk reputation query — for consumers pre-warming their routing cache.
+// Capped at REPUTATION_BULK_MAX wallets per request. Concurrency inside
+// the bulk fan-out is bounded by bulkLimit so a single request can't
+// spawn 100 parallel DB+external calls and starve the connection pool.
+// Malformed wallets are filtered before any DB hit.
+app.post('/api/reputation/bulk', async (c) => {
+  let body: { wallets?: unknown };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+  const wallets = Array.isArray(body.wallets) ? body.wallets : null;
+  if (!wallets) {
+    return c.json({ error: 'Body must include `wallets` array' }, 400);
+  }
+  if (wallets.length === 0) {
+    return c.json({ results: {} });
+  }
+  if (wallets.length > REPUTATION_BULK_MAX) {
+    return c.json(
+      { error: `Maximum ${REPUTATION_BULK_MAX} wallets per request`, requested: wallets.length },
+      400,
+    );
+  }
+  // Filter to well-formed Solana addresses; everything else is rejected
+  // up-front so an attacker can't force DB lookups on garbage strings.
+  const validWallets = wallets.filter(isValidSolanaAddress);
+  const results = await Promise.all(
+    validWallets.map((w) =>
+      bulkLimit(async () => {
+        try {
+          const r = await loadReputationForWallet(w);
+          return [w, r] as const;
+        } catch (err) {
+          console.error('[reputation:bulk]', w, err);
+          return [w, shapeNotFoundReputationResponse(w)] as const;
+        }
+      }),
+    ),
+  );
+  return c.json({
+    results: Object.fromEntries(results),
+    skipped_invalid: wallets.length - validWallets.length,
+  });
+});
+
+// Published methodology — consumers fetch this to defend their routing
+// decisions to their own users. Stable JSON; version field bumps when
+// material changes ship.
+app.get('/api/reputation/methodology', (c) => {
+  return c.json(REPUTATION_METHODOLOGY);
 });
 
 // ============ TRUSTED SOURCE FEEDBACK ============
