@@ -23,10 +23,12 @@ import { Connection, PublicKey, ParsedInstruction } from '@solana/web3.js';
 import {
   computeTrustScoreV7,
   type V7ScoreResult,
-} from '/Users/callum/said-api/src/reputation-engine-v7.ts';
+} from '../src/reputation-engine-v7.js';
 
 const SAID_API = 'https://api.saidprotocol.com';
-const ALCHEMY = 'https://solana-mainnet.g.alchemy.com/v2/IDEFlrzwbGmzujtisWINo';
+const ALCHEMY = process.env.ALCHEMY_SOLANA_RPC_URL
+  || process.env.SOLANA_RPC_URL
+  || 'https://api.mainnet-beta.solana.com';
 const PUMP_PROG = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const WSOL = 'So11111111111111111111111111111111111111112';
 
