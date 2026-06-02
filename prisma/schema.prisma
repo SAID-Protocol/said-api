@@ -600,3 +600,36 @@ model LaunchedToken {
   @@index([agentWallet])
   @@index([enrichedAt])
 }
+
+// One row per agent wallet, populated from x402scan's public tRPC.
+// Captures the agent's participation in the x402 micropayment economy
+// on BOTH sides: as a provider (selling endpoints, receiving USDC) and
+// as a buyer (calling other agents' endpoints, paying USDC). Used by
+// the v0.7 paid_service demonstrated-delivery signal — see
+// reputation-engine-v7.ts detectDemonstratedDelivery.
+//
+// Sync cadence: 12-24h via scripts/sync-x402-activity.ts.
+// Source-of-truth: https://www.x402scan.com/api/trpc/public.sellers.all.list
+// and public.buyers.all.list.
+model AgentX402Activity {
+  wallet                  String   @id
+
+  // Provider side (this wallet is paid for offering an x402 endpoint)
+  providerTxCount         Int      @default(0)
+  providerAmountAtomic    BigInt   @default(0) // raw USDC atomic units (6 decimals)
+  providerUniqueBuyers    Int      @default(0)
+  providerFacilitators    String[] @default([])
+  providerLastSeenAt      DateTime?
+
+  // Buyer side (this wallet pays other x402 endpoints)
+  buyerTxCount            Int      @default(0)
+  buyerAmountAtomic       BigInt   @default(0)
+  buyerUniqueSellers      Int      @default(0)
+  buyerFacilitators       String[] @default([])
+  buyerLastSeenAt         DateTime?
+
+  syncedAt                DateTime @default(now())
+
+  @@index([providerUniqueBuyers])
+  @@index([syncedAt])
+}

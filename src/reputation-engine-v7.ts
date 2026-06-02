@@ -79,6 +79,25 @@ export interface V7LaunchedTokenStats {
   topMarketCapUsd: number;
 }
 
+/**
+ * x402 micropayment activity (both sides) for this wallet, as indexed
+ * by x402scan. Powers the paid_service path of demonstrated-delivery.
+ *
+ * - Provider side: this wallet sells endpoints; unique_buyers counts
+ *   distinct payers across the full lookback.
+ * - Buyer side: this wallet pays other endpoints; unique_sellers counts
+ *   distinct services consumed.
+ *
+ * Both sides being non-empty is the strongest "full agent-economy
+ * participant" signal.
+ */
+export interface V7X402ActivityStats {
+  providerUniqueBuyers: number;
+  providerTxCount: number;
+  buyerUniqueSellers: number;
+  buyerTxCount: number;
+}
+
 export type V7Tier = 'unranked' | 'bronze' | 'silver' | 'gold' | 'platinum';
 export type V7AgentType = 'launcher' | 'service' | 'new' | 'mixed';
 
@@ -155,6 +174,16 @@ const DELIVERY_CAP_FULL_USD = 1_000_000;
 const DELIVERY_CAP_PARTIAL_USD = 250_000;
 const DELIVERY_BONUS_FULL = 2.0; // points added to identity (0-10 scale)
 const DELIVERY_BONUS_PARTIAL = 1.0;
+
+// paid_service path thresholds (x402scan-indexed)
+// Calibrated against the actual SAID corpus distribution: ~0.05% of
+// verified agents have any x402 provider activity today. Xona is the
+// only agent in the corpus that clears the FULL threshold (580 unique
+// buyers). PARTIAL is set low enough to catch emerging real providers
+// (≥5 distinct payers) without rewarding sybil setups.
+const PAID_SERVICE_FULL_UNIQUE_BUYERS = 50;
+const PAID_SERVICE_PARTIAL_UNIQUE_BUYERS = 5;
+const PAID_SERVICE_PARTIAL_BUYER_UNIQUE_SELLERS = 5;
 
 // Type model
 const NEW_AGENT_DAYS = 14;
@@ -292,14 +321,36 @@ function computeLongevitySubscore(ageDays: number): number {
  */
 function detectDemonstratedDelivery(
   launched: V7LaunchedTokenStats | undefined,
+  x402?: V7X402ActivityStats,
 ): V7DemonstratedDelivery {
+  // Path (a): launcher_token — agent's token reached real market cap
   const topCap = launched?.topMarketCapUsd ?? 0;
   if (topCap >= DELIVERY_CAP_FULL_USD) {
     return { active: true, path: 'launcher_token', contribution: DELIVERY_BONUS_FULL };
   }
+
+  // Path (b): paid_service — agent is an active x402 provider with
+  // independently-verified buyer activity (per x402scan).
+  const providerBuyers = x402?.providerUniqueBuyers ?? 0;
+  if (providerBuyers >= PAID_SERVICE_FULL_UNIQUE_BUYERS) {
+    return { active: true, path: 'paid_service', contribution: DELIVERY_BONUS_FULL };
+  }
+
+  // Partial delivery falls through both paths
   if (topCap >= DELIVERY_CAP_PARTIAL_USD) {
     return { active: true, path: 'launcher_token', contribution: DELIVERY_BONUS_PARTIAL };
   }
+  if (providerBuyers >= PAID_SERVICE_PARTIAL_UNIQUE_BUYERS) {
+    return { active: true, path: 'paid_service', contribution: DELIVERY_BONUS_PARTIAL };
+  }
+  // Buyer-side fallback: an autonomous agent that consumes services across
+  // multiple distinct sellers is a credible economy participant even if it
+  // hasn't (yet) attracted enough buyers as a provider.
+  const buyerSellers = x402?.buyerUniqueSellers ?? 0;
+  if (buyerSellers >= PAID_SERVICE_PARTIAL_BUYER_UNIQUE_SELLERS) {
+    return { active: true, path: 'paid_service', contribution: DELIVERY_BONUS_PARTIAL };
+  }
+
   return { active: false, path: null, contribution: 0 };
 }
 
@@ -459,12 +510,16 @@ function buildSources(
   anchorStats: V7AnchorStats | undefined,
   activityStats: V7ActivityStats | undefined,
   launched: V7LaunchedTokenStats | undefined,
+  x402?: V7X402ActivityStats,
 ): string[] {
   const sources = ['said'];
   if (trustScore.fairscale > 0) sources.push('fairscale');
   if ((anchorStats?.anchorCount ?? 0) > 0) sources.push('receipts');
   if ((activityStats?.txCount ?? 0) > 0) sources.push('onchain_activity');
   if ((launched?.tokenCount ?? 0) > 0) sources.push('launched_tokens');
+  if ((x402?.providerUniqueBuyers ?? 0) > 0 || (x402?.buyerUniqueSellers ?? 0) > 0) {
+    sources.push('x402scan');
+  }
   return sources;
 }
 
@@ -483,6 +538,7 @@ export function computeTrustScoreV7(
   activityStats?: V7ActivityStats,
   launchedTokenStats?: V7LaunchedTokenStats,
   fairscaleSubscore?: number,
+  x402ActivityStats?: V7X402ActivityStats,
 ): V7ScoreResult {
   const now = Date.now();
   const ageDays = Math.floor(
@@ -491,7 +547,7 @@ export function computeTrustScoreV7(
   const fairscale = Math.max(0, Math.min(10, fairscaleSubscore ?? 0));
 
   // Step 1: Demonstrated delivery (feeds Identity)
-  const delivery = detectDemonstratedDelivery(launchedTokenStats);
+  const delivery = detectDemonstratedDelivery(launchedTokenStats, x402ActivityStats);
 
   // Step 2: Sub-signals (each 0-10)
   const identity = computeIdentitySubscore(agent, delivery);
@@ -559,7 +615,7 @@ export function computeTrustScoreV7(
     demonstrated_delivery: delivery,
     ceiling_applied: ceiling,
     badges: buildBadges(agent, dominantType(typeMembership), delivery, activityStats, launchedTokenStats),
-    sources: buildSources({ fairscale }, anchorStats, activityStats, launchedTokenStats),
+    sources: buildSources({ fairscale }, anchorStats, activityStats, launchedTokenStats, x402ActivityStats),
     computedAt: new Date().toISOString(),
     methodology_version: METHODOLOGY_VERSION_V7,
   };
