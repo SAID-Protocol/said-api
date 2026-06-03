@@ -47,6 +47,8 @@
     "bullmq": "^5.71.1",
     "dotenv": "^16.5.0",
     "ethers": "^6.16.0",
+    "graphology": "^0.26.0",
+    "graphology-communities-louvain": "^2.0.2",
     "hono": "^4.7.4",
     "ioredis": "^5.10.1",
     "prisma": "^6.5.0",

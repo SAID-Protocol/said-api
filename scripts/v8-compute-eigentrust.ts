@@ -17,6 +17,12 @@
  *   RESTART_ALPHA=0.15                     # restart probability (default 0.15)
  *   MAX_ITER=100
  *   EPSILON=1e-6
+ *   COCM=true                              # Phase 3b: discount collusive
+ *                                          # (reciprocal) intra-cluster edges
+ *                                          # before running EigenTrust
+ *   COCM_DISCOUNT=0.3                      # floor multiplier for a fully
+ *                                          # reciprocal cluster's edges
+ *   COCM_MIN_CLUSTER=3                     # min cluster size to discount
  */
 import { PrismaClient } from '@prisma/client';
 import {
@@ -24,6 +30,7 @@ import {
   type Edge,
   DEFAULT_EIGENTRUST_PARAMS,
 } from '../src/reputation-v0.8/graph.js';
+import { applyCocmDiscount, type RawEdge } from '../src/reputation-v0.8/cocm.js';
 import { AXES } from '../src/reputation-v0.8/axes.js';
 
 const prisma = new PrismaClient();
@@ -35,6 +42,9 @@ const SEED_WALLETS = (process.env.SEED_WALLETS ?? '')
 const RESTART_ALPHA = Number(process.env.RESTART_ALPHA ?? DEFAULT_EIGENTRUST_PARAMS.restartAlpha);
 const MAX_ITER = Number(process.env.MAX_ITER ?? DEFAULT_EIGENTRUST_PARAMS.maxIterations);
 const EPSILON = Number(process.env.EPSILON ?? DEFAULT_EIGENTRUST_PARAMS.epsilon);
+const COCM = process.env.COCM === 'true';
+const COCM_DISCOUNT = Number(process.env.COCM_DISCOUNT ?? 0.3);
+const COCM_MIN_CLUSTER = Number(process.env.COCM_MIN_CLUSTER ?? 3);
 
 async function run() {
   console.log('EigenTrust computation starting');
@@ -42,6 +52,7 @@ async function run() {
   console.log(`  restart α:     ${RESTART_ALPHA}`);
   console.log(`  max iter:      ${MAX_ITER}`);
   console.log(`  epsilon:       ${EPSILON}`);
+  console.log(`  cocm:          ${COCM ? `on (discount=${COCM_DISCOUNT}, minCluster=${COCM_MIN_CLUSTER})` : 'off'}`);
   if (SEED_WALLETS.length === 0) {
     console.log('  ⚠️  WARNING: no seed set — using uniform restart (NOT sybil-resistant).');
   }
@@ -50,7 +61,7 @@ async function run() {
 
   // Load all TrustEdge rows into memory
   const trustEdges = await prisma.trustEdge.findMany({
-    select: { fromWallet: true, toWallet: true, weight: true },
+    select: { fromWallet: true, toWallet: true, edgeType: true, weight: true },
   });
   console.log(`\nLoaded ${trustEdges.length} TrustEdge rows.`);
 
@@ -60,7 +71,38 @@ async function run() {
     return;
   }
 
-  const edges: Edge[] = trustEdges.map((e) => ({
+  // Phase 3b — COCM cluster discount. Reciprocal (mutual-admiration)
+  // clusters get their intra-edges downweighted before propagation; the
+  // sybil ring collapses while legitimate one-directional stars (Xona's
+  // buyers) are untouched. Off by default.
+  let workingEdges: RawEdge[] = trustEdges.map((e) => ({
+    fromWallet: e.fromWallet,
+    toWallet: e.toWallet,
+    edgeType: e.edgeType,
+    weight: e.weight,
+  }));
+
+  if (COCM) {
+    const cocm = applyCocmDiscount(workingEdges, {
+      baseDiscount: COCM_DISCOUNT,
+      minClusterSize: COCM_MIN_CLUSTER,
+    });
+    workingEdges = cocm.edges;
+    console.log(
+      `\n── COCM ─────────────────────────────────────────────\n` +
+        `  ${cocm.numCommunities} communities; discounted ${cocm.discountedClusters.length} collusive cluster(s), ` +
+        `${cocm.intraEdgesDiscounted} edges, ${cocm.weightRemovedTotal.toFixed(1)} weight removed`,
+    );
+    for (const c of cocm.discountedClusters.slice(0, 10)) {
+      console.log(
+        `    community size=${String(c.size).padStart(3)} intra=${String(c.intraDirectedEdges).padStart(4)} ` +
+          `reciprocity=${c.reciprocity.toFixed(2)} ×${c.appliedDiscount.toFixed(2)}  ` +
+          `[${c.members.map((m) => m.slice(0, 8)).join(', ')}…]`,
+      );
+    }
+  }
+
+  const edges: Edge[] = workingEdges.map((e) => ({
     from: e.fromWallet,
     to: e.toWallet,
     weight: e.weight,
