@@ -2668,6 +2668,414 @@ app.post('/api/platforms/xona-orbit/confirm', async (c) => {
 });
 
 
+// ============ KAUSA (MAZE POCKET) PLATFORM INTEGRATION ============
+
+/**
+ * POST /api/platforms/kausa/register
+ * Step 1: Build a transaction that registers + verifies an agent on SAID
+ * 
+ * Kausa self-funds. No SAID sponsorship.
+ * Agent wallet must already have ≥0.015 SOL for rent + verification + fees.
+ * Returns an unsigned transaction that Kausa must sign + broadcast.
+ */
+app.post('/api/platforms/kausa/register', async (c) => {
+  const apiKey = c.req.header('X-Platform-Key');
+  const expectedKey = process.env.KAUSA_API_KEY;
+  
+  if (!expectedKey || !apiKey || apiKey !== expectedKey) {
+    return c.json({ error: 'Invalid API key' }, 401);
+  }
+  
+  const body = await c.req.json();
+  const { wallet, name, description, twitter, website, capabilities } = body;
+  
+  if (!wallet || !name) {
+    return c.json({ error: 'Required fields: wallet, name' }, 400);
+  }
+
+  let agentPubkey: PublicKey;
+  try {
+    agentPubkey = new PublicKey(wallet);
+  } catch {
+    return c.json({ error: 'Invalid wallet address' }, 400);
+  }
+  
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('agent'), agentPubkey.toBuffer()],
+    SAID_PROGRAM_ID
+  );
+
+  // Idempotent: if already on-chain, return existing identity
+  const existingOnChain = await connection.getAccountInfo(pda);
+  if (existingOnChain) {
+    const existing = await prisma.agent.upsert({
+      where: { wallet },
+      create: {
+        wallet,
+        pda: pda.toString(),
+        owner: wallet,
+        metadataUri: `https://api.saidprotocol.com/api/cards/${wallet}.json`,
+        registeredAt: new Date(),
+        isVerified: true,
+        verifiedAt: new Date(),
+        sponsored: false,
+        name: name || 'Kausa Agent',
+        description: description || 'AI Agent via Kausa Maze Pocket',
+        twitter: twitter || undefined,
+        website: website || undefined,
+        skills: capabilities || ['chat', 'maze-routing', 'assistant'],
+        registrationSource: 'kausa',
+        layer2Verified: true,
+        layer2VerifiedAt: new Date(),
+        l2AttestationMethod: 'platform',
+      },
+      update: {
+        registrationSource: 'kausa',
+        layer2Verified: true,
+        layer2VerifiedAt: new Date(),
+        l2AttestationMethod: 'platform',
+        sponsored: false,
+        isVerified: true,
+        verifiedAt: new Date(),
+      },
+    });
+    
+    emitAgentEvent('agent:registered', { wallet, name: existing.name, source: 'kausa' });
+    
+    return c.json({
+      success: true,
+      message: 'Agent already registered on-chain',
+      agent: {
+        wallet,
+        pda: pda.toString(),
+        name: existing.name || name,
+        verified: true,
+        profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+        badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
+      }
+    });
+  }
+  
+  try {
+    // Store agent card
+    const card = {
+      name,
+      description: description || `${name} - AI Agent`,
+      wallet,
+      twitter: twitter || undefined,
+      website: website || undefined,
+      capabilities: capabilities || ['chat', 'maze-routing', 'assistant'],
+      platform: 'kausa',
+      verified: true,
+      registeredAt: new Date().toISOString(),
+    };
+    
+    const metadataUri = `https://api.saidprotocol.com/api/cards/${wallet}.json`;
+    
+    await prisma.agentCard.upsert({
+      where: { wallet },
+      create: { wallet, cardJson: JSON.stringify(card) },
+      update: { cardJson: JSON.stringify(card) },
+    });
+    
+    const [treasuryPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from('treasury')],
+      SAID_PROGRAM_ID
+    );
+    
+    // === register_agent instruction ===
+    const registerDiscriminator = Buffer.from([135, 157, 66, 195, 2, 113, 175, 30]);
+    const uriBytes = Buffer.from(metadataUri, 'utf8');
+    const uriLen = Buffer.alloc(4);
+    uriLen.writeUInt32LE(uriBytes.length);
+    const registerData = Buffer.concat([registerDiscriminator, uriLen, uriBytes]);
+    
+    const registerIx = {
+      programId: SAID_PROGRAM_ID,
+      keys: [
+        { pubkey: pda, isSigner: false, isWritable: true },
+        { pubkey: agentPubkey, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data: registerData,
+    };
+    
+    // === get_verified instruction ===
+    const verifyDiscriminator = Buffer.from([132, 231, 2, 30, 115, 74, 23, 26]);
+    
+    const verifyIx = {
+      programId: SAID_PROGRAM_ID,
+      keys: [
+        { pubkey: pda, isSigner: false, isWritable: true },
+        { pubkey: treasuryPda, isSigner: false, isWritable: true },
+        { pubkey: agentPubkey, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data: verifyDiscriminator,
+    };
+    
+    // NO sponsor funding — Kausa pays from agent wallet directly
+    // Agent wallet must have ≥0.015 SOL before calling this endpoint
+    
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+    
+    const tx = new Transaction({
+      blockhash,
+      lastValidBlockHeight,
+      feePayer: agentPubkey, // Agent wallet pays tx fees
+    });
+    
+    tx.add(registerIx);  // 1. Register on-chain
+    tx.add(verifyIx);    // 2. Get verified badge
+    
+    // No partial sign — fully unsigned, Kausa signs with agent keypair
+    const serializedTx = tx.serialize({
+      requireAllSignatures: false,
+      verifySignatures: false,
+    }).toString('base64');
+    
+    return c.json({
+      success: true,
+      message: 'Transaction built. Agent wallet must sign and return via /confirm endpoint.',
+      transaction: serializedTx,
+      blockhash,
+      lastValidBlockHeight,
+      requiredSigner: wallet,
+      pda: pda.toString(),
+      metadataUri,
+      instructions: {
+        step1: 'Deserialize the base64 transaction',
+        step2: `Sign with the agent wallet (${wallet})`,
+        step3: 'POST the signed transaction to /api/platforms/kausa/confirm',
+      },
+      fundingNote: 'Agent wallet must have ≥0.015 SOL for rent + verification fee + tx fees. No SAID sponsorship.',
+      expiresIn: '~60 seconds (blockhash expiry)',
+    });
+    
+  } catch (error: any) {
+    console.error('[Kausa Register Error]', error);
+    return c.json({ 
+      error: 'Failed to build transaction',
+      details: error.message,
+      support: 'contact@saidprotocol.com'
+    }, 500);
+  }
+});
+
+/**
+ * POST /api/platforms/kausa/confirm
+ * Step 2: Receive signed transaction, broadcast on-chain, update DB
+ */
+app.post('/api/platforms/kausa/confirm', async (c) => {
+  const apiKey = c.req.header('X-Platform-Key');
+  const expectedKey = process.env.KAUSA_API_KEY;
+  
+  if (!expectedKey || !apiKey || apiKey !== expectedKey) {
+    return c.json({ error: 'Invalid or missing X-Platform-Key header' }, 401);
+  }
+  
+  const body = await c.req.json();
+  const { signedTransaction, wallet, name, description, twitter, website, capabilities } = body;
+  
+  if (!signedTransaction || !wallet) {
+    return c.json({ error: 'Required: signedTransaction (base64), wallet' }, 400);
+  }
+  
+  try {
+    const txBuffer = Buffer.from(signedTransaction, 'base64');
+    const tx = Transaction.from(txBuffer);
+    
+    const agentPubkey = new PublicKey(wallet);
+    const signers = tx.signatures.map(s => s.publicKey.toBase58());
+    if (!signers.includes(wallet)) {
+      return c.json({ error: 'Transaction must be signed by the agent wallet' }, 400);
+    }
+    
+    const rawTx = tx.serialize();
+    const txHash = await connection.sendRawTransaction(rawTx, {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+    });
+    
+    // Handle blockhash expiry gracefully
+    let txConfirmed = false;
+    try {
+      const confirmation = await connection.confirmTransaction({
+        signature: txHash,
+        blockhash: tx.recentBlockhash!,
+        lastValidBlockHeight: tx.lastValidBlockHeight!,
+      }, 'confirmed');
+      
+      if (confirmation.value.err) {
+        return c.json({ 
+          error: 'Transaction failed on-chain',
+          txHash,
+          details: JSON.stringify(confirmation.value.err),
+        }, 500);
+      }
+      txConfirmed = true;
+    } catch (confirmErr: any) {
+      console.warn('[Kausa Confirm] confirmTransaction threw:', confirmErr.message);
+      
+      const { value } = await connection.getSignatureStatuses([txHash]);
+      const status = value?.[0];
+      
+      if (status?.err) {
+        return c.json({ 
+          error: 'Transaction failed on-chain',
+          txHash,
+          details: JSON.stringify(status.err),
+        }, 500);
+      }
+      
+      if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') {
+        console.log('[Kausa Confirm] Tx confirmed despite blockhash expiry. txHash:', txHash);
+        txConfirmed = true;
+      } else {
+        throw confirmErr;
+      }
+    }
+    
+    const [pda] = PublicKey.findProgramAddressSync(
+      [Buffer.from('agent'), agentPubkey.toBuffer()],
+      SAID_PROGRAM_ID
+    );
+    
+    const metadataUri = `https://api.saidprotocol.com/api/cards/${wallet}.json`;
+    
+    const agent = await prisma.agent.upsert({
+      where: { wallet },
+      create: {
+        wallet,
+        pda: pda.toString(),
+        owner: wallet,
+        metadataUri,
+        registeredAt: new Date(),
+        isVerified: true,
+        verifiedAt: new Date(),
+        sponsored: false,
+        name: name || 'Kausa Agent',
+        description: description || 'AI Agent via Kausa Maze Pocket',
+        twitter: twitter || undefined,
+        website: website || undefined,
+        skills: capabilities || ['chat', 'maze-routing', 'assistant'],
+        registrationSource: 'kausa',
+        layer2Verified: true,
+        layer2VerifiedAt: new Date(),
+        l2AttestationMethod: 'platform',
+      },
+      update: {
+        isVerified: true,
+        verifiedAt: new Date(),
+        sponsored: false,
+        registrationSource: 'kausa',
+        layer2Verified: true,
+        layer2VerifiedAt: new Date(),
+        l2AttestationMethod: 'platform',
+      },
+    });
+    
+    emitAgentEvent('agent:registered', { wallet: agent.wallet, name: agent.name, source: 'kausa', txHash });
+    
+    return c.json({
+      success: true,
+      message: 'Agent registered and verified ON-CHAIN via Kausa',
+      txHash,
+      explorer: `https://solscan.io/tx/${txHash}`,
+      agent: {
+        wallet: agent.wallet,
+        pda: agent.pda,
+        name: agent.name,
+        verified: true,
+        onChain: true,
+        profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+        badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
+      },
+      platform: {
+        name: 'kausa',
+        costCovered: '~0.015 SOL (rent + verification + fees)',
+        paidBy: 'Kausa',
+      }
+    });
+    
+  } catch (error: any) {
+    console.error('[Kausa Confirm Error]', error.message);
+    
+    // Recovery: sync DB if agent already exists on-chain
+    try {
+      const agentPubkey = new PublicKey(wallet);
+      const [pda] = PublicKey.findProgramAddressSync(
+        [Buffer.from('agent'), agentPubkey.toBuffer()],
+        SAID_PROGRAM_ID
+      );
+      
+      const accountInfo = await connection.getAccountInfo(pda);
+      if (accountInfo) {
+        console.log('[Kausa Recovery] Agent PDA exists on-chain, syncing DB...');
+        const metadataUri = `https://api.saidprotocol.com/api/cards/${wallet}.json`;
+        
+        const agent = await prisma.agent.upsert({
+          where: { wallet },
+          create: {
+            wallet,
+            pda: pda.toString(),
+            owner: wallet,
+            metadataUri,
+            registeredAt: new Date(),
+            isVerified: true,
+            verifiedAt: new Date(),
+            sponsored: false,
+            name: name || 'Kausa Agent',
+            description: description || 'AI Agent via Kausa Maze Pocket',
+            twitter: twitter || undefined,
+            website: website || undefined,
+            skills: capabilities || ['chat', 'maze-routing', 'assistant'],
+            registrationSource: 'kausa',
+            layer2Verified: true,
+            layer2VerifiedAt: new Date(),
+            l2AttestationMethod: 'platform',
+          },
+          update: {
+            isVerified: true,
+            verifiedAt: new Date(),
+            sponsored: false,
+            registrationSource: 'kausa',
+            layer2Verified: true,
+            layer2VerifiedAt: new Date(),
+            l2AttestationMethod: 'platform',
+          },
+        });
+        
+        emitAgentEvent('agent:registered', { wallet: agent.wallet, name: agent.name, source: 'kausa', recovered: true });
+        
+        return c.json({
+          success: true,
+          message: 'Agent already registered on-chain. Database synced.',
+          recovered: true,
+          agent: {
+            wallet: agent.wallet,
+            pda: agent.pda,
+            name: agent.name,
+            verified: true,
+            onChain: true,
+            profile: `https://www.saidprotocol.com/agent.html?wallet=${wallet}`,
+            badge: `https://api.saidprotocol.com/api/badge/${wallet}.svg`,
+          },
+        });
+      }
+    } catch (recoveryError: any) {
+      console.error('[Kausa Recovery Failed]', recoveryError.message);
+    }
+    
+    return c.json({ 
+      error: 'Broadcast failed',
+      details: error.message,
+      support: 'contact@saidprotocol.com'
+    }, 500);
+  }
+});
+
+
 // ============ SAID HOSTING PLATFORM INTEGRATION ============
 
 /**
