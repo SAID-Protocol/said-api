@@ -8,71 +8,71 @@ datasource db {
 }
 
 model Agent {
-  id            String   @id @default(cuid())
-  wallet        String   @unique
-  pda           String   @unique
-  owner         String
-  metadataUri   String
-  registeredAt  DateTime
-  isVerified    Boolean  @default(false)
-  verifiedAt    DateTime?
-  sponsored     Boolean  @default(false)  // Was registration sponsored (free)?
-  
+  id           String    @id @default(cuid())
+  wallet       String    @unique
+  pda          String    @unique
+  owner        String
+  metadataUri  String
+  registeredAt DateTime
+  isVerified   Boolean   @default(false)
+  verifiedAt   DateTime?
+  sponsored    Boolean   @default(false) // Was registration sponsored (free)?
+
   // Extended metadata (cached from AgentCard)
-  name          String?
-  description   String?
-  twitter       String?
-  website       String?
-  image         String?  // Avatar/profile picture URL
-  
+  name        String?
+  description String?
+  twitter     String?
+  website     String?
+  image       String? // Avatar/profile picture URL
+
   // Service endpoints
-  mcpEndpoint   String?
-  a2aEndpoint   String?
-  x402Wallet    String?
-  serviceTypes  String[]  @default([])
-  skills        String[]  @default([])
-  
+  mcpEndpoint  String?
+  a2aEndpoint  String?
+  x402Wallet   String?
+  serviceTypes String[] @default([])
+  skills       String[] @default([])
+
   // Layer 2 verification (endpoint challenge-response)
-  layer2Verified      Boolean  @default(false)
+  layer2Verified      Boolean   @default(false)
   layer2VerifiedAt    DateTime?
   verifiedEndpointUrl String?
   l2AttestationMethod String?
   registrationSource  String?
-  activityCount       Int      @default(0)
+  activityCount       Int       @default(0)
   lastActiveAt        DateTime?
 
   // Passport (soulbound NFT)
-  passportMint        String?
-  passportMintedAt    DateTime?
-  passportTxHash      String?
+  passportMint     String?
+  passportMintedAt DateTime?
+  passportTxHash   String?
 
   // Reputation
-  reputationScore Float   @default(0)
-  feedbackCount   Int     @default(0)
-  
+  reputationScore Float @default(0)
+  feedbackCount   Int   @default(0)
+
   // Timestamps
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-  lastSyncedAt  DateTime @default(now())
-  
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  lastSyncedAt DateTime @default(now())
+
   // Relations
-  feedbackReceived Feedback[] @relation("FeedbackReceived")
-  feedbackGiven    Feedback[] @relation("FeedbackGiven")
+  feedbackReceived     Feedback[]    @relation("FeedbackReceived")
+  feedbackGiven        Feedback[]    @relation("FeedbackGiven")
   attestationsReceived Attestation[] @relation("AttestationsReceived")
   attestationsGiven    Attestation[] @relation("AttestationsGiven")
-  createdByUsers   UserAgent[]
-  capabilities     Capability[]
-  trustScore       AgentScore?
-  
+  createdByUsers       UserAgent[]
+  capabilities         Capability[]
+  trustScore           AgentScore?
+
   // Delegated Signing Authority
-  agentWallets     AgentWallet[]
+  agentWallets        AgentWallet[]
   transactionRequests TransactionRequest[]
-  apiKeys          ApiKey[]
-  transactionPolicy TransactionPolicy?
+  apiKeys             ApiKey[]
+  transactionPolicy   TransactionPolicy?
 
   // Partner platform (SeekerClaw, etc.)
-  platformId       String?          // null for self-hosted/organic agents
-  nftAddress       String?          // Metaplex Core asset address
+  platformId String? // null for self-hosted/organic agents
+  nftAddress String? // Metaplex Core asset address
 
   @@index([name])
   @@index([reputationScore])
@@ -81,27 +81,27 @@ model Agent {
 }
 
 model Feedback {
-  id          String   @id @default(cuid())
-  
+  id String @id @default(cuid())
+
   // Who gave feedback
-  fromWallet  String
-  fromAgent   Agent?   @relation("FeedbackGiven", fields: [fromWallet], references: [wallet])
-  
+  fromWallet String
+  fromAgent  Agent? @relation("FeedbackGiven", fields: [fromWallet], references: [wallet])
+
   // Who received feedback
-  toWallet    String
-  toAgent     Agent    @relation("FeedbackReceived", fields: [toWallet], references: [wallet])
-  
+  toWallet String
+  toAgent  Agent  @relation("FeedbackReceived", fields: [toWallet], references: [wallet])
+
   // Feedback content
-  score       Int      // 0-100
-  comment     String?
-  weight      Float    @default(1.0)  // Verified agents = 2.0, others = 1.0
-  
+  score   Int // 0-100
+  comment String?
+  weight  Float   @default(1.0) // Verified agents = 2.0, others = 1.0
+
   // Verification
-  signature   String   // Wallet signature proving authenticity
+  signature      String // Wallet signature proving authenticity
   fromIsVerified Boolean @default(false) // Was giver verified at time of feedback?
-  txHash      String?  // On-chain hash if stored on-chain
-  
-  createdAt   DateTime @default(now())
+  txHash         String? // On-chain hash if stored on-chain
+
+  createdAt DateTime @default(now())
 
   @@unique([fromWallet, toWallet])
   @@index([toWallet])
@@ -109,47 +109,47 @@ model Feedback {
 }
 
 model SyncState {
-  id          String   @id @default("main")
-  lastSlot    BigInt   @default(0)
-  lastSyncAt  DateTime @default(now())
+  id         String   @id @default("main")
+  lastSlot   BigInt   @default(0)
+  lastSyncAt DateTime @default(now())
 }
 
 model AgentCard {
-  id          String   @id @default(cuid())
-  wallet      String   @unique
-  cardJson    String   // JSON blob of the agent card
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  
+  id        String   @id @default(cuid())
+  wallet    String   @unique
+  cardJson  String // JSON blob of the agent card
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   @@index([wallet])
 }
 
 model Attestation {
-  id              String    @id @default(cuid())
-  
+  id String @id @default(cuid())
+
   // Who is attesting
-  attesterWallet  String
-  attester        Agent     @relation("AttestationsGiven", fields: [attesterWallet], references: [wallet])
-  
+  attesterWallet String
+  attester       Agent  @relation("AttestationsGiven", fields: [attesterWallet], references: [wallet])
+
   // Who is being attested
-  subjectWallet   String
-  subject         Agent     @relation("AttestationsReceived", fields: [subjectWallet], references: [wallet])
-  
+  subjectWallet String
+  subject       Agent  @relation("AttestationsReceived", fields: [subjectWallet], references: [wallet])
+
   // Attestation details
-  type            String    @default("trust")  // trust, endorsement, interaction, skill
-  confidence      Int       @default(50)       // 1-100
-  context         String?                      // Optional note/reason
-  skill           String?                      // For skill attestations: which skill
-  
+  type       String  @default("trust") // trust, endorsement, interaction, skill
+  confidence Int     @default(50) // 1-100
+  context    String? // Optional note/reason
+  skill      String? // For skill attestations: which skill
+
   // Verification
-  signature       String?                      // Wallet signature (optional for trusted sources)
-  txHash          String?                      // On-chain anchor (future)
-  
+  signature String? // Wallet signature (optional for trusted sources)
+  txHash    String? // On-chain anchor (future)
+
   // Lifecycle
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-  revokedAt       DateTime?
-  
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  revokedAt DateTime?
+
   @@unique([attesterWallet, subjectWallet, type])
   @@index([subjectWallet])
   @@index([attesterWallet])
@@ -157,31 +157,31 @@ model Attestation {
 }
 
 model User {
-  id              String    @id @default(cuid())
-  
+  id String @id @default(cuid())
+
   // Login methods (one of these is set)
-  privyId         String?   @unique
-  walletAddress   String?   @unique
-  email           String?   @unique
-  emailVerified   Boolean   @default(false)
-  
+  privyId       String? @unique
+  walletAddress String? @unique
+  email         String? @unique
+  emailVerified Boolean @default(false)
+
   // Profile
-  displayName     String?
-  username        String?   @unique
-  avatarUrl       String?   @db.Text
-  
+  displayName String?
+  username    String? @unique
+  avatarUrl   String? @db.Text
+
   // Session management
-  sessionToken    String?   @unique
-  sessionExpiry   DateTime?
-  
+  sessionToken  String?   @unique
+  sessionExpiry DateTime?
+
   // Timestamps
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-  lastLoginAt     DateTime  @default(now())
-  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  lastLoginAt DateTime @default(now())
+
   // Relations
-  agents          UserAgent[]
-  
+  agents UserAgent[]
+
   @@index([privyId])
   @@index([walletAddress])
   @@index([email])
@@ -189,49 +189,49 @@ model User {
 }
 
 model UserAgent {
-  id              String    @id @default(cuid())
-  
-  userId          String
-  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  
-  agentWallet     String
-  agent           Agent     @relation(fields: [agentWallet], references: [wallet], onDelete: Cascade)
-  
-  createdAt       DateTime  @default(now())
-  
+  id String @id @default(cuid())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  agentWallet String
+  agent       Agent  @relation(fields: [agentWallet], references: [wallet], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
   @@unique([userId, agentWallet])
   @@index([userId])
   @@index([agentWallet])
 }
 
 model GrantApplication {
-  id               String   @id @default(cuid())
-  agentName        String
-  walletAddress    String
-  twitter          String?
-  website          String?
-  description      String
-  useCase          String
-  fundingAmount    String
-  fundingDuration  String
-  milestones       String
-  teamBackground   String?
-  status           String   @default("pending")
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  id              String   @id @default(cuid())
+  agentName       String
+  walletAddress   String
+  twitter         String?
+  website         String?
+  description     String
+  useCase         String
+  fundingAmount   String
+  fundingDuration String
+  milestones      String
+  teamBackground  String?
+  status          String   @default("pending")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
   @@index([walletAddress])
   @@index([status])
 }
 
 model AgentChallenge {
-  id          String   @id @default(cuid())
+  id          String    @id @default(cuid())
   wallet      String
-  nonce       String   @unique
+  nonce       String    @unique
   endpointUrl String
-  createdAt   DateTime @default(now())
+  createdAt   DateTime  @default(now())
   expiresAt   DateTime
-  verified    Boolean  @default(false)
+  verified    Boolean   @default(false)
   verifiedAt  DateTime?
 
   @@index([wallet])
@@ -239,26 +239,26 @@ model AgentChallenge {
 }
 
 model EmailOTP {
-  id              String    @id @default(cuid())
-  email           String
-  code            String
-  expiresAt       DateTime
-  verified        Boolean   @default(false)
-  createdAt       DateTime  @default(now())
-  
+  id        String   @id @default(cuid())
+  email     String
+  code      String
+  expiresAt DateTime
+  verified  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
   @@index([email])
   @@index([code])
 }
 
 model WebhookConfig {
-  id              String    @id @default(cuid())
-  platform        String    // e.g., "spawnr"
-  url             String
-  events          String[]  // e.g., ["reputation_change", "verification_complete"]
-  active          Boolean   @default(true)
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-  
+  id        String   @id @default(cuid())
+  platform  String // e.g., "spawnr"
+  url       String
+  events    String[] // e.g., ["reputation_change", "verification_complete"]
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   @@index([platform])
 }
 
@@ -274,7 +274,7 @@ model Capability {
   updatedAt   DateTime @updatedAt
   active      Boolean  @default(true)
 
-  agent       Agent    @relation(fields: [wallet], references: [wallet])
+  agent Agent @relation(fields: [wallet], references: [wallet])
 
   @@unique([wallet, capability])
   @@index([capability])
@@ -286,7 +286,7 @@ model CrossChainWebhook {
   chain     String
   address   String
   url       String
-  secret    String?  // HMAC-SHA256 signing key
+  secret    String? // HMAC-SHA256 signing key
   createdAt DateTime @default(now())
 
   @@unique([chain, address])
@@ -294,30 +294,30 @@ model CrossChainWebhook {
 }
 
 model A2AMessage {
-  id          String   @id @default(cuid())
-  
+  id String @id @default(cuid())
+
   // Routing
-  fromWallet  String
-  toWallet    String
-  
+  fromWallet String
+  toWallet   String
+
   // Content
-  message     String   @db.Text
-  context     String?  @db.Text  // JSON
-  
+  message String  @db.Text
+  context String? @db.Text // JSON
+
   // Task tracking
-  taskId      String?  @unique
-  status      String   @default("created")  // created, working, complete, failed
-  progress    Int      @default(0)
-  result      String?  @db.Text  // JSON
-  
+  taskId   String? @unique
+  status   String  @default("created") // created, working, complete, failed
+  progress Int     @default(0)
+  result   String? @db.Text // JSON
+
   // Verification
   fromVerified Boolean @default(false)
-  signature   String?
-  
+  signature    String?
+
   // Timestamps
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   @@index([toWallet])
   @@index([fromWallet])
   @@index([status])
@@ -325,32 +325,32 @@ model A2AMessage {
 }
 
 model AgentScore {
-  id              String    @id @default(cuid())
-  wallet          String    @unique
-  score           Int       @default(0)       // 0-100
-  tier            String    @default("unverified")
-  
+  id     String @id @default(cuid())
+  wallet String @unique
+  score  Int    @default(0) // 0-100
+  tier   String @default("unverified")
+
   // SAID Engine breakdown (recomputed every 6h)
-  identity        Float     @default(0)
-  activity        Float     @default(0)
-  economic        Float     @default(0)
-  ecosystem       Float     @default(0)
-  longevity       Float     @default(0)
-  
+  identity  Float @default(0)
+  activity  Float @default(0)
+  economic  Float @default(0)
+  ecosystem Float @default(0)
+  longevity Float @default(0)
+
   // FairScale enrichment (recomputed every 7d)
-  fairscale       Float     @default(0)
-  fairscaleRaw    Json?     // Raw FairScale API response
-  fairscaleAt     DateTime? // When FairScale was last fetched
-  
-  badges          String[]  @default([])
-  flags           String[]  @default([])
-  sources         String[]  @default(["said"])
-  
-  computedAt      DateTime  @default(now())   // Last full computation
-  lastQueriedAt   DateTime  @default(now())   // Last time someone requested this score
-  
-  agent           Agent     @relation(fields: [wallet], references: [wallet])
-  
+  fairscale    Float     @default(0)
+  fairscaleRaw Json? // Raw FairScale API response
+  fairscaleAt  DateTime? // When FairScale was last fetched
+
+  badges  String[] @default([])
+  flags   String[] @default([])
+  sources String[] @default(["said"])
+
+  computedAt    DateTime @default(now()) // Last full computation
+  lastQueriedAt DateTime @default(now()) // Last time someone requested this score
+
+  agent Agent @relation(fields: [wallet], references: [wallet])
+
   @@index([score(sort: Desc)])
   @@index([tier])
   @@index([computedAt])
@@ -358,17 +358,17 @@ model AgentScore {
 }
 
 model WalletLink {
-  id          String   @id @default(cuid())
-  
+  id String @id @default(cuid())
+
   // On-chain state (cache)
-  pda         String   @unique
-  agentPda    String   // Points to Agent.pda
-  wallet      String   @unique
-  
+  pda      String @unique
+  agentPda String // Points to Agent.pda
+  wallet   String @unique
+
   // Metadata
-  linkedAt    DateTime @default(now())
-  lastSynced  DateTime @default(now())
-  
+  linkedAt   DateTime @default(now())
+  lastSynced DateTime @default(now())
+
   @@index([wallet])
   @@index([agentPda])
 }
@@ -378,159 +378,159 @@ model WalletLink {
 // ============================================================
 
 model AgentWallet {
-  id                String    @id @default(cuid())
-  
+  id String @id @default(cuid())
+
   // Links to existing agent identity
-  agentId           String
-  agent             Agent     @relation(fields: [agentId], references: [id], onDelete: Cascade)
-  
+  agentId String
+  agent   Agent  @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
   // Wallet details
-  publicKey         String    @unique   // Solana public key (from Privy)
-  provider          String    @default("privy")  // privy, mock
-  providerWalletId  String?   // Privy's internal wallet identifier
-  
+  publicKey        String  @unique // Solana public key (from Privy)
+  provider         String  @default("privy") // privy, mock
+  providerWalletId String? // Privy's internal wallet identifier
+
   // Wallet type
-  walletType        String    @default("transaction")  // transaction, subscription
-  isPrimary         Boolean   @default(false)  // Is this the agent's primary transaction wallet?
-  
+  walletType String  @default("transaction") // transaction, subscription
+  isPrimary  Boolean @default(false) // Is this the agent's primary transaction wallet?
+
   // Status
-  status            String    @default("active")  // active, suspended, revoked
-  
+  status String @default("active") // active, suspended, revoked
+
   // Timestamps
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   // Metadata from Privy
-  metadata          Json?
-  
+  metadata Json?
+
   // Relations
-  transactions      TransactionRequest[]
-  
-  @@unique([agentId, walletType])  // One wallet per type per agent
+  transactions TransactionRequest[]
+
+  @@unique([agentId, walletType]) // One wallet per type per agent
   @@index([agentId])
   @@index([publicKey])
   @@index([status])
 }
 
 model TransactionRequest {
-  id                String    @id @default(cuid())
-  
+  id String @id @default(cuid())
+
   // Who requested it
-  agentId           String
-  agent             Agent     @relation(fields: [agentId], references: [id], onDelete: Cascade)
-  walletId          String
-  wallet            AgentWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
-  apiKeyId          String?
-  apiKey            ApiKey?   @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
-  
+  agentId  String
+  agent    Agent       @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  walletId String
+  wallet   AgentWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  apiKeyId String?
+  apiKey   ApiKey?     @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+
   // Transaction details
-  type              String    // transfer, swap, register, custom
-  token             String    // USDC, SOL, etc.
-  amount            Decimal   @db.Decimal(18, 6)
-  recipient         String?   // Destination address
-  programId         String?   // Solana program being called
-  memo              String?
-  
+  type      String // transfer, swap, register, custom
+  token     String // USDC, SOL, etc.
+  amount    Decimal @db.Decimal(18, 6)
+  recipient String? // Destination address
+  programId String? // Solana program being called
+  memo      String?
+
   // Raw transaction data
-  serializedTx      String?   @db.Text  // Base64 serialized unsigned tx
-  
+  serializedTx String? @db.Text // Base64 serialized unsigned tx
+
   // Policy check
-  policyPassed      Boolean?
-  policyReason      String?   // Why approved/denied
-  
+  policyPassed Boolean?
+  policyReason String? // Why approved/denied
+
   // Execution
-  status            String    @default("pending")  // pending, approved, denied, signing, broadcast, confirmed, failed
-  txHash            String?   // Solana transaction signature
-  errorMessage      String?
-  
+  status       String  @default("pending") // pending, approved, denied, signing, broadcast, confirmed, failed
+  txHash       String? // Solana transaction signature
+  errorMessage String?
+
   // Timestamps
-  createdAt         DateTime  @default(now())
-  signedAt          DateTime?
-  broadcastAt       DateTime?
-  confirmedAt       DateTime?
-  
+  createdAt   DateTime  @default(now())
+  signedAt    DateTime?
+  broadcastAt DateTime?
+  confirmedAt DateTime?
+
   @@index([agentId, createdAt(sort: Desc)])
   @@index([status])
   @@index([txHash])
 }
 
 model ApiKey {
-  id                String    @id @default(cuid())
-  
+  id String @id @default(cuid())
+
   // Who owns this key
-  agentId           String
-  agent             Agent     @relation(fields: [agentId], references: [id], onDelete: Cascade)
-  
+  agentId String
+  agent   Agent  @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
   // Key data (we store hash, never the raw key)
-  keyHash           String    @unique
-  keyPrefix         String    // First 12 chars for identification: said_ak_xxxx
-  name              String?   // Human-readable label
-  
+  keyHash   String  @unique
+  keyPrefix String // First 12 chars for identification: said_ak_xxxx
+  name      String? // Human-readable label
+
   // Permissions
-  scopes            String[]  @default(["wallet", "transaction"])
-  
+  scopes String[] @default(["wallet", "transaction"])
+
   // Rate limiting
-  rateLimitPerHour  Int       @default(100)
-  
+  rateLimitPerHour Int @default(100)
+
   // Lifecycle
-  createdAt         DateTime  @default(now())
-  lastUsedAt        DateTime?
-  expiresAt         DateTime?
-  revokedAt         DateTime?
-  
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+  revokedAt  DateTime?
+
   // Who created this (user session token or admin)
-  createdBy         String?
-  
+  createdBy String?
+
   // Relations
-  transactions      TransactionRequest[]
-  
+  transactions TransactionRequest[]
+
   @@index([agentId])
   @@index([keyHash])
   @@index([keyPrefix])
 }
 
 model MonthlyUsage {
-  id              String   @id @default(cuid())
-  platformId      String
-  month           String   // "2026-04"
-  signatures      Int      @default(0)
-  feesCollected   Float    @default(0)  // SOL
-  agentsCreated   Int      @default(0)
-  
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  id            String @id @default(cuid())
+  platformId    String
+  month         String // "2026-04"
+  signatures    Int    @default(0)
+  feesCollected Float  @default(0) // SOL
+  agentsCreated Int    @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@unique([platformId, month])
   @@index([platformId])
 }
 
 model TransactionPolicy {
-  id                    String    @id @default(cuid())
-  
+  id String @id @default(cuid())
+
   // One policy per agent
-  agentId               String    @unique
-  agent                 Agent     @relation(fields: [agentId], references: [id], onDelete: Cascade)
-  
+  agentId String @unique
+  agent   Agent  @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
   // Spending limits (in USDC equivalent)
-  maxPerTransaction     Decimal   @default(10.00)  @db.Decimal(10, 2)
-  maxPerDay             Decimal   @default(100.00) @db.Decimal(10, 2)
-  maxPerMonth           Decimal   @default(1000.00) @db.Decimal(10, 2)
-  
+  maxPerTransaction Decimal @default(10.00) @db.Decimal(10, 2)
+  maxPerDay         Decimal @default(100.00) @db.Decimal(10, 2)
+  maxPerMonth       Decimal @default(1000.00) @db.Decimal(10, 2)
+
   // Token restrictions
-  allowedTokens         String[]  @default(["USDC", "SOL"])
-  
+  allowedTokens String[] @default(["USDC", "SOL"])
+
   // Program restrictions (Solana program IDs)
-  allowedPrograms       String[]  @default([])
-  
+  allowedPrograms String[] @default([])
+
   // Approval thresholds
-  requireApprovalAbove  Decimal   @default(50.00) @db.Decimal(10, 2)
+  requireApprovalAbove Decimal @default(50.00) @db.Decimal(10, 2)
 
   // Status
-  status                String    @default("active")  // active, suspended
+  status String @default("active") // active, suspended
 
   // Timestamps
-  createdAt             DateTime  @default(now())
-  updatedAt             DateTime  @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([agentId])
 }
@@ -542,15 +542,15 @@ model TransactionPolicy {
 // previous endSeq + 1. Indexed by an off-chain sync worker; never edited
 // after insert.
 model ReceiptAnchor {
-  id          String   @id @default(cuid())
-  pda         String   @unique                // ReceiptAnchor PDA on-chain
-  agentPda    String                          // The agent identity PDA this anchor belongs to
-  index       Int                             // Anchor sequence (0, 1, 2, ...)
-  startSeq    BigInt                          // First receipt seq in this anchor
-  endSeq      BigInt                          // Last receipt seq in this anchor
-  root        String                          // Merkle root, hex-encoded (32 bytes)
-  createdAt   DateTime                        // On-chain created_at (i64 unix ts)
-  syncedAt    DateTime @default(now())        // When the indexer first saw it
+  id        String   @id @default(cuid())
+  pda       String   @unique // ReceiptAnchor PDA on-chain
+  agentPda  String // The agent identity PDA this anchor belongs to
+  index     Int // Anchor sequence (0, 1, 2, ...)
+  startSeq  BigInt // First receipt seq in this anchor
+  endSeq    BigInt // Last receipt seq in this anchor
+  root      String // Merkle root, hex-encoded (32 bytes)
+  createdAt DateTime // On-chain created_at (i64 unix ts)
+  syncedAt  DateTime @default(now()) // When the indexer first saw it
 
   @@unique([agentPda, index])
   @@index([agentPda])
@@ -562,17 +562,17 @@ model ReceiptAnchor {
 // One row per agent wallet; upserted on refresh. Purely a cache of signals
 // we'll fold into the trust score — never the source of truth.
 model AgentActivityStats {
-  id                      String   @id @default(cuid())
-  wallet                  String   @unique             // agent wallet
-  windowDays              Int      @default(30)
-  txCount                 Int      @default(0)         // total signed txs in window
-  volumeSolLamports       BigInt   @default(0)         // gross SOL moved (in + out) in window, lamports
-  uniqueCounterparties    Int      @default(0)
-  activeDays              Int      @default(0)         // distinct days the wallet transacted
-  oldestSeen              DateTime?                    // earliest tx in window we observed
-  latestSeen              DateTime?                    // most recent tx
-  computedAt              DateTime @default(now())
-  source                  String   @default("alchemy") // which RPC fed this snapshot
+  id                   String    @id @default(cuid())
+  wallet               String    @unique // agent wallet
+  windowDays           Int       @default(30)
+  txCount              Int       @default(0) // total signed txs in window
+  volumeSolLamports    BigInt    @default(0) // gross SOL moved (in + out) in window, lamports
+  uniqueCounterparties Int       @default(0)
+  activeDays           Int       @default(0) // distinct days the wallet transacted
+  oldestSeen           DateTime? // earliest tx in window we observed
+  latestSeen           DateTime? // most recent tx
+  computedAt           DateTime  @default(now())
+  source               String    @default("alchemy") // which RPC fed this snapshot
 
   @@index([latestSeen])
 }
@@ -582,21 +582,301 @@ model AgentActivityStats {
 // Enriched with DexScreener stats on a slower cadence. Used as a
 // "tokens this agent launched" signal for the economic subscore.
 model LaunchedToken {
-  id                      String   @id @default(cuid())
-  mint                    String   @unique             // SPL mint address
-  agentWallet             String                       // the agent that launched it
-  detectedAt              DateTime @default(now())
-  firstSeenSlot           BigInt?                      // slot of the InitializeMint tx, if known
+  id            String   @id @default(cuid())
+  mint          String   @unique // SPL mint address
+  agentWallet   String // the agent that launched it
+  detectedAt    DateTime @default(now())
+  firstSeenSlot BigInt? // slot of the InitializeMint tx, if known
 
   // DexScreener-enriched fields (nullable until enriched, refreshed periodically)
-  priceUsd                Float?
-  marketCapUsd            Float?
-  liquidityUsd            Float?
-  volume24hUsd            Float?
-  volumeLifetimeUsd       Float?
-  dexId                   String?                      // 'pumpswap', 'raydium', 'meteora', etc.
-  enrichedAt              DateTime?
+  priceUsd          Float?
+  marketCapUsd      Float?
+  liquidityUsd      Float?
+  volume24hUsd      Float?
+  volumeLifetimeUsd Float?
+  dexId             String? // 'pumpswap', 'raydium', 'meteora', etc.
+  enrichedAt        DateTime?
 
   @@index([agentWallet])
   @@index([enrichedAt])
+}
+
+// ── Reputation v0.8 tables ──────────────────────────────────────────
+// Additive: these tables are written/read by the score-backfill (v0.8)
+// service on the same database. They live here so main deploys
+// (prisma db push --accept-data-loss) CREATE and preserve them instead of
+// dropping them. No relations into existing models; safe to add.
+
+model AgentX402Activity {
+  wallet String @id
+
+  // Provider side (this wallet is paid for offering an x402 endpoint)
+  providerTxCount      Int       @default(0)
+  providerAmountAtomic BigInt    @default(0)
+  providerUniqueBuyers Int       @default(0)
+  providerFacilitators String[]  @default([])
+  providerLastSeenAt   DateTime?
+
+  // Buyer side (this wallet pays other x402 endpoints)
+  buyerTxCount       Int       @default(0)
+  buyerAmountAtomic  BigInt    @default(0)
+  buyerUniqueSellers Int       @default(0)
+  buyerFacilitators  String[]  @default([])
+  buyerLastSeenAt    DateTime?
+
+  syncedAt DateTime @default(now())
+
+  @@index([providerUniqueBuyers])
+  @@index([syncedAt])
+}
+
+model AgentSaidEngagement {
+  wallet String @id
+
+  registerCount         Int @default(0)
+  getVerifiedCount      Int @default(0)
+  registerAndStakeCount Int @default(0)
+  sponsorRegisterCount  Int @default(0)
+  sponsorVerifyCount    Int @default(0)
+  updateAgentCount      Int @default(0)
+
+  submitAnchorCount   Int @default(0)
+  validateWorkCount   Int @default(0)
+  submitFeedbackCount Int @default(0)
+
+  stakeCount            Int @default(0)
+  addStakeCount         Int @default(0)
+  unstakeLifecycleCount Int @default(0)
+
+  linkWalletCount        Int @default(0)
+  unlinkWalletCount      Int @default(0)
+  transferAuthorityCount Int @default(0)
+
+  slashAgentCount Int @default(0)
+
+  otherSaidCount        Int @default(0)
+  totalSaidInstructions Int @default(0)
+
+  firstSaidInteractionAt DateTime?
+  lastSaidInteractionAt  DateTime?
+  scannedUpToSignature   String?
+  syncedAt               DateTime  @default(now())
+
+  @@index([totalSaidInstructions])
+  @@index([submitAnchorCount])
+  @@index([syncedAt])
+}
+
+model ReputationEvent {
+  id String @id @default(cuid())
+
+  // Idempotency key — set by the producer (backfill script, live ingest
+  // hook, sync worker). Format is "<source>:<deterministic_id>", e.g.,
+  // "fb:cm123abc", "x402:wallet:provider", "anchor:tx_hash:axis".
+  // Lets us re-run backfills without double-counting. Null is allowed
+  // for genuinely one-off system events.
+  sourceKey String? @unique
+
+  // Subject — the agent whose reputation this affects
+  subjectWallet String
+
+  // Actor — who created the event (may equal subject for self-actions
+  // like submit_anchor; null for system-generated events like decay sweeps)
+  actorWallet String?
+
+  // Event kind — semantic category. Drives weight and polarity defaults.
+  // Vocabulary: 'submit_anchor', 'validate_work', 'feedback_pos',
+  // 'feedback_neg', 'x402_payment_received', 'x402_payment_sent',
+  // 'attestation', 'stake', 'slash', 'dispute_open', 'dispute_lost',
+  // 'dispute_won', 'operator_bind', 'pop_link', ...
+  kind String
+
+  // Axis it contributes to. An action can fan out to multiple axes via
+  // multiple ReputationEvent rows.
+  // Vocabulary: 'delivery', 'payments', 'validation', 'content',
+  // 'identity', 'community'
+  axis String
+
+  polarity Int // +1 (positive), -1 (negative), 0 (structural / no direct effect)
+  weight   Float // raw signal weight before decay or graph propagation
+
+  // Provenance
+  txHash        String?
+  attestationId String?
+  metadata      Json?
+
+  // Time anchor — used for exponential decay calculations
+  occurredAt DateTime
+  ingestedAt DateTime @default(now())
+
+  @@index([subjectWallet, kind])
+  @@index([subjectWallet, axis, occurredAt])
+  @@index([actorWallet, occurredAt])
+  @@index([occurredAt])
+  @@index([kind, occurredAt])
+}
+
+model ReputationSignal {
+  id            String @id @default(cuid())
+  subjectWallet String
+  axis          String
+  kind          String // 'anchors', 'feedback_pos', 'feedback_neg', 'vouches', etc.
+
+  // Decayed sum (incremental)
+  decayedValue Float     @default(0)
+  lastEventAt  DateTime?
+  lastDecayAt  DateTime  @default(now())
+
+  // Half-life (days). Override per-row, otherwise pulled from a policy
+  // table in code. Null = use default for this kind.
+  halfLifeDays Float?
+
+  // Counterparty diversity tracking — supports COCM and Shannon-entropy
+  // discounting (see docs §7.2). Updated on each new event.
+  uniqueActors      Int   @default(0)
+  shannonEntropyEst Float @default(0)
+
+  // Beta posterior parameters for this (wallet, axis, kind) slice.
+  // Cold-start prior alpha=2, beta=2 — mildly conservative.
+  alpha Float @default(2.0)
+  beta  Float @default(2.0)
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([subjectWallet, axis, kind])
+  @@index([axis, decayedValue])
+  @@index([subjectWallet, axis])
+}
+
+model TrustEdge {
+  id         String @id @default(cuid())
+  fromWallet String // endorser / payer / validator
+  toWallet   String // recipient of trust flow
+  edgeType   String // 'feedback', 'validation', 'payment', 'attestation', 'vouch'
+
+  // Aggregated decayed weight from all events of this type between this pair
+  weight      Float     @default(0)
+  lastEventAt DateTime?
+  lastDecayAt DateTime  @default(now())
+
+  // Source's posterior mean at last update — snapshot to keep graph
+  // recomputes deterministic and so EigenTrust can use it without
+  // joining back to ReputationPosterior.
+  fromScoreSnapshot Float?
+
+  @@unique([fromWallet, toWallet, edgeType])
+  @@index([toWallet])
+  @@index([fromWallet])
+  @@index([edgeType])
+}
+
+model ReputationPosterior {
+  id            String @id @default(cuid())
+  subjectWallet String
+  axis          String
+
+  // Beta posterior
+  alpha             Float
+  beta              Float
+  posteriorMean     Float // α / (α + β)
+  posteriorVariance Float
+  lowerBound95      Float // conservative score for risk-averse consumers
+
+  // Graph-propagated scores
+  eigentrustScore  Float  @default(0)
+  hittingTimeScore Float?
+
+  // Composite (for consumers who want one number)
+  compositeScore Float
+
+  // Evidence — top-k events/edges that backed this score. JSON blob with
+  // wallet refs, event kinds, decayed values. Used by /reputation/:wallet
+  // for the explainability response.
+  topSourcesJson Json?
+  sampleSize     Int   @default(0)
+
+  computedAt DateTime @default(now())
+
+  @@unique([subjectWallet, axis])
+  @@index([axis, compositeScore(sort: Desc)])
+  @@index([axis, lowerBound95(sort: Desc)])
+  @@index([computedAt])
+}
+
+model Operator {
+  id String @id @default(cuid())
+
+  // Pseudonymous default — the wallet that controls this operator account
+  controllingWallet String @unique
+
+  // Optional verified bindings — only set for premium tier
+  privyUserId        String? @unique
+  humanPassportProof String? // Holonym / Gitcoin Passport proof ID
+  worldIdProof       String?
+  kybProvider        String? // 'persona', 'sumsub', etc.
+  kybVerificationId  String?
+
+  // Stake bond (slashable on confirmed fraud)
+  bondLamports    BigInt    @default(0)
+  bondLockedUntil DateTime?
+
+  // Slashing history
+  slashCount           Int    @default(0)
+  totalSlashedLamports BigInt @default(0)
+
+  // Tier (drives the KYA multiplier in scoring)
+  // 'pseudonymous' | 'verified_human' | 'verified_org'
+  verifiedTier String @default("pseudonymous")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agents OperatorAgent[]
+
+  @@index([verifiedTier])
+  @@index([controllingWallet])
+}
+
+model OperatorAgent {
+  id          String   @id @default(cuid())
+  operatorId  String
+  operator    Operator @relation(fields: [operatorId], references: [id], onDelete: Cascade)
+  agentWallet String   @unique
+  boundAt     DateTime @default(now())
+
+  @@index([operatorId])
+}
+
+model Dispute {
+  id String @id @default(cuid())
+
+  claimantWallet  String
+  defendantWallet String
+
+  eventId     String? // optional pointer to the disputed ReputationEvent
+  axis        String // which reputation axis the claim is about
+  claimType   String // 'failed_delivery', 'fraudulent_anchor',
+  // 'malicious_validation', ...
+  evidenceUri String? // off-chain evidence (IPFS, Arweave, URL)
+
+  // Bonds (in lamports)
+  claimantBondLamports  BigInt
+  defendantBondLamports BigInt?
+
+  // Lifecycle
+  // 'open' | 'arbitrating' | 'resolved' | 'expired_no_response'
+  status               String    @default("open")
+  openedAt             DateTime  @default(now())
+  arbitrationStartedAt DateTime?
+  resolvedAt           DateTime?
+  expiresAt            DateTime // when the dispute auto-expires if not arbitrated
+
+  // Resolution
+  // null while open; 'claimant_wins' | 'defendant_wins' | 'no_finding' | 'invalid'
+  verdict        String?
+  arbiterWallets String[] @default([])
+
+  @@index([defendantWallet, status])
+  @@index([claimantWallet, status])
+  @@index([status, expiresAt])
 }
