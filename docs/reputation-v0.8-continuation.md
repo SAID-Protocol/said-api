@@ -247,3 +247,45 @@ SELECT COUNT(DISTINCT "subjectWallet") FROM "ReputationPosterior"; -- expect ~4,
 ```
 
 If those numbers match, you're picking up exactly where we stopped.
+
+---
+
+## ⚠️ Data-loss landmine — the v0.8 tables share main's database
+
+**What happened (2026-06-03):** the production `said-api` service deploys from
+`main`, whose start command is `npx prisma db push --accept-data-loss`. `main`'s
+`schema.prisma` does **not** declare the v0.8 tables, and the score-backfill
+(v0.8) service uses the **same Postgres**. So a main redeploy reconciled the
+shared DB to main's schema and **dropped all 9 v0.8 tables and their data**
+(`P2021: ReputationSignal does not exist`).
+
+The 9 tables that only existed on the v0.8 branch:
+`ReputationEvent, ReputationSignal, ReputationPosterior, TrustEdge, Operator,
+OperatorAgent, Dispute, AgentX402Activity, AgentSaidEngagement`.
+
+**Durable fix:** PR adding those 9 models (additive) to `main`'s schema so
+main deploys CREATE/preserve them instead of dropping them. **Until that PR is
+merged, every main deploy will wipe v0.8 again — don't rebuild before it's in.**
+
+## Full rebuild from scratch (after the schema is durable)
+
+All v0.8 data is derived, so it rebuilds from native tables (`Agent`,
+`Feedback`, `Attestation`, which live on main and survive) plus x402scan +
+Alchemy. The two source-sync scripts now live on this branch (ported from v0.7
+during recovery) so the rebuild is self-contained. Run on `score-backfill`,
+rotating the Start Command in order:
+
+```
+1. npx prisma db push --skip-generate --accept-data-loss   # recreate 9 tables (empty)
+2. npm run v8:sync-x402-activity        # repopulate AgentX402Activity (x402scan aggregate)
+3. npm run v8:sync-said-engagement      # repopulate AgentSaidEngagement (needs ALCHEMY_SOLANA_RPC_URL)
+4. npm run v8:backfill                  # ReputationEvent from all sources
+5. npm run v8:sync-x402-pertx           # per-tx buyer edges (the graph unlock)
+6. COCM=true npm run v8:signals         # decayed accumulators + collusive-feedback collapse
+7. npm run v8:posteriors                # Beta posteriors + composite + tier
+8. npm run v8:edges                     # TrustEdge graph
+9. COCM=true npm run v8:eigentrust      # EigenTrust (+ graph cluster discount)
+```
+
+Step 3 is the slow one (per-wallet chain scan; rate-limited on Alchemy). All
+steps are idempotent.

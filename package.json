@@ -11,6 +11,8 @@
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
     "db:studio": "prisma studio",
+    "v8:sync-x402-activity": "tsx scripts/sync-x402-activity.ts",
+    "v8:sync-said-engagement": "tsx scripts/sync-said-engagement.ts",
     "v8:backfill": "tsx scripts/v8-backfill-events.ts",
     "v8:sync-x402-pertx": "tsx scripts/sync-x402-per-tx.ts",
     "v8:signals": "tsx scripts/v8-compute-signals.ts",
