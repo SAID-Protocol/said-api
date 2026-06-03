@@ -600,3 +600,255 @@ model LaunchedToken {
   @@index([agentWallet])
   @@index([enrichedAt])
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// REPUTATION v0.8 — see docs/reputation-v0.8.md for full design
+// ═══════════════════════════════════════════════════════════════════
+
+// Append-only event log. Every reputation-relevant action becomes a row
+// here — never updated, never deleted. This is the authoritative source
+// from which decayed signals, graph edges, and posteriors are derived.
+//
+// One on-chain action can produce multiple ReputationEvent rows (one per
+// axis affected). E.g., a successful x402 payment affects both `delivery`
+// (the seller delivered) and `payments` (the buyer paid).
+model ReputationEvent {
+  id              String   @id @default(cuid())
+
+  // Subject — the agent whose reputation this affects
+  subjectWallet   String
+
+  // Actor — who created the event (may equal subject for self-actions
+  // like submit_anchor; null for system-generated events like decay sweeps)
+  actorWallet     String?
+
+  // Event kind — semantic category. Drives weight and polarity defaults.
+  // Vocabulary: 'submit_anchor', 'validate_work', 'feedback_pos',
+  // 'feedback_neg', 'x402_payment_received', 'x402_payment_sent',
+  // 'attestation', 'stake', 'slash', 'dispute_open', 'dispute_lost',
+  // 'dispute_won', 'operator_bind', 'pop_link', ...
+  kind            String
+
+  // Axis it contributes to. An action can fan out to multiple axes via
+  // multiple ReputationEvent rows.
+  // Vocabulary: 'delivery', 'payments', 'validation', 'content',
+  // 'identity', 'community'
+  axis            String
+
+  polarity        Int      // +1 (positive), -1 (negative), 0 (structural / no direct effect)
+  weight          Float    // raw signal weight before decay or graph propagation
+
+  // Provenance
+  txHash          String?
+  attestationId   String?
+  metadata        Json?
+
+  // Time anchor — used for exponential decay calculations
+  occurredAt      DateTime
+  ingestedAt      DateTime @default(now())
+
+  @@index([subjectWallet, kind])
+  @@index([subjectWallet, axis, occurredAt])
+  @@index([actorWallet, occurredAt])
+  @@index([occurredAt])
+  @@index([kind, occurredAt])
+}
+
+// Per-agent, per-axis, per-signal-kind decayed accumulator. Maintained
+// incrementally — each new ReputationEvent updates the matching row in
+// O(1) via the decay-and-add pattern:
+//   elapsed = now - lastDecayAt
+//   decayedValue = decayedValue * exp(-ln(2) * elapsed / halfLifeDays)
+//                + newEventWeight
+//   lastDecayAt = now
+//
+// Half-lives chosen so positive signals fade faster than negatives (FICO
+// pattern — prevents "sin then wait" laundering). See docs §5.1.
+model ReputationSignal {
+  id                String   @id @default(cuid())
+  subjectWallet     String
+  axis              String
+  kind              String   // 'anchors', 'feedback_pos', 'feedback_neg', 'vouches', etc.
+
+  // Decayed sum (incremental)
+  decayedValue      Float    @default(0)
+  lastEventAt       DateTime?
+  lastDecayAt       DateTime @default(now())
+
+  // Half-life (days). Override per-row, otherwise pulled from a policy
+  // table in code. Null = use default for this kind.
+  halfLifeDays      Float?
+
+  // Counterparty diversity tracking — supports COCM and Shannon-entropy
+  // discounting (see docs §7.2). Updated on each new event.
+  uniqueActors      Int      @default(0)
+  shannonEntropyEst Float    @default(0)
+
+  // Beta posterior parameters for this (wallet, axis, kind) slice.
+  // Cold-start prior alpha=2, beta=2 — mildly conservative.
+  alpha             Float    @default(2.0)
+  beta              Float    @default(2.0)
+
+  updatedAt         DateTime @updatedAt
+
+  @@unique([subjectWallet, axis, kind])
+  @@index([axis, decayedValue])
+  @@index([subjectWallet, axis])
+}
+
+// Directed weighted edges between agents. Source of truth for graph
+// propagation. Edge weight is the aggregate decayed contribution of all
+// events of this type between the pair — recomputed by the same decay
+// math on each new event.
+model TrustEdge {
+  id                  String   @id @default(cuid())
+  fromWallet          String   // endorser / payer / validator
+  toWallet            String   // recipient of trust flow
+  edgeType            String   // 'feedback', 'validation', 'payment', 'attestation', 'vouch'
+
+  // Aggregated decayed weight from all events of this type between this pair
+  weight              Float    @default(0)
+  lastEventAt         DateTime?
+  lastDecayAt         DateTime @default(now())
+
+  // Source's posterior mean at last update — snapshot to keep graph
+  // recomputes deterministic and so EigenTrust can use it without
+  // joining back to ReputationPosterior.
+  fromScoreSnapshot   Float?
+
+  @@unique([fromWallet, toWallet, edgeType])
+  @@index([toWallet])
+  @@index([fromWallet])
+  @@index([edgeType])
+}
+
+// Computed output, per agent per axis. The thing the API serves. Written
+// by the posterior + graph propagation worker, read by the API layer.
+model ReputationPosterior {
+  id                  String   @id @default(cuid())
+  subjectWallet       String
+  axis                String
+
+  // Beta posterior
+  alpha               Float
+  beta                Float
+  posteriorMean       Float    // α / (α + β)
+  posteriorVariance   Float
+  lowerBound95        Float    // conservative score for risk-averse consumers
+
+  // Graph-propagated scores
+  eigentrustScore     Float    @default(0)
+  hittingTimeScore    Float?
+
+  // Composite (for consumers who want one number)
+  compositeScore      Float
+
+  // Evidence — top-k events/edges that backed this score. JSON blob with
+  // wallet refs, event kinds, decayed values. Used by /reputation/:wallet
+  // for the explainability response.
+  topSourcesJson      Json?
+  sampleSize          Int      @default(0)
+
+  computedAt          DateTime @default(now())
+
+  @@unique([subjectWallet, axis])
+  @@index([axis, compositeScore(sort: Desc)])
+  @@index([axis, lowerBound95(sort: Desc)])
+  @@index([computedAt])
+}
+
+// An Operator is the entity (human, org, or pseudonymous wallet) that
+// controls one or more agents. Operators are the KYA layer: they're what
+// you bind a verified-human credential to, what holds the slashable bond,
+// and what gets punished for fraud — not the individual agent identity.
+//
+// Pseudonymous is the default (just a controlling wallet). Verified tiers
+// are opt-in premium features.
+model Operator {
+  id                    String   @id @default(cuid())
+
+  // Pseudonymous default — the wallet that controls this operator account
+  controllingWallet     String   @unique
+
+  // Optional verified bindings — only set for premium tier
+  privyUserId           String?  @unique
+  humanPassportProof    String?  // Holonym / Gitcoin Passport proof ID
+  worldIdProof          String?
+  kybProvider           String?  // 'persona', 'sumsub', etc.
+  kybVerificationId     String?
+
+  // Stake bond (slashable on confirmed fraud)
+  bondLamports          BigInt   @default(0)
+  bondLockedUntil       DateTime?
+
+  // Slashing history
+  slashCount            Int      @default(0)
+  totalSlashedLamports  BigInt   @default(0)
+
+  // Tier (drives the KYA multiplier in scoring)
+  // 'pseudonymous' | 'verified_human' | 'verified_org'
+  verifiedTier          String   @default("pseudonymous")
+
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  agents                OperatorAgent[]
+
+  @@index([verifiedTier])
+  @@index([controllingWallet])
+}
+
+// Many-to-one: one operator can control multiple agents. Each agent binds
+// to at most one operator (unique constraint on agentWallet).
+model OperatorAgent {
+  id              String   @id @default(cuid())
+  operatorId      String
+  operator        Operator @relation(fields: [operatorId], references: [id], onDelete: Cascade)
+  agentWallet     String   @unique
+  boundAt         DateTime @default(now())
+
+  @@index([operatorId])
+}
+
+// Arbitration primitive. When agent A claims agent B failed to deliver,
+// A opens a Dispute and escrows a bond. B may post a counter-bond. An
+// arbiter quorum decides; the loser's bond is partly redistributed to
+// the winner (and partly burned, to prevent collusive disputes).
+//
+// Disputes feed back into the reputation system as ReputationEvent rows:
+// a `dispute_lost` event on the defendant decays slowly (180-365 day
+// half-life depending on severity).
+model Dispute {
+  id                      String   @id @default(cuid())
+
+  claimantWallet          String
+  defendantWallet         String
+
+  eventId                 String?  // optional pointer to the disputed ReputationEvent
+  axis                    String   // which reputation axis the claim is about
+  claimType               String   // 'failed_delivery', 'fraudulent_anchor',
+                                   // 'malicious_validation', ...
+  evidenceUri             String?  // off-chain evidence (IPFS, Arweave, URL)
+
+  // Bonds (in lamports)
+  claimantBondLamports    BigInt
+  defendantBondLamports   BigInt?
+
+  // Lifecycle
+  // 'open' | 'arbitrating' | 'resolved' | 'expired_no_response'
+  status                  String   @default("open")
+  openedAt                DateTime @default(now())
+  arbitrationStartedAt    DateTime?
+  resolvedAt              DateTime?
+  expiresAt               DateTime // when the dispute auto-expires if not arbitrated
+
+  // Resolution
+  // null while open; 'claimant_wins' | 'defendant_wins' | 'no_finding' | 'invalid'
+  verdict                 String?
+  arbiterWallets          String[] @default([])
+
+  @@index([defendantWallet, status])
+  @@index([claimantWallet, status])
+  @@index([status, expiresAt])
+}
+
