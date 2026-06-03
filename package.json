@@ -10,7 +10,14 @@
     "start": "npx prisma db push --accept-data-loss && node dist/index.js",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "v8:backfill": "tsx scripts/v8-backfill-events.ts",
+    "v8:sync-x402-pertx": "tsx scripts/sync-x402-per-tx.ts",
+    "v8:signals": "tsx scripts/v8-compute-signals.ts",
+    "v8:posteriors": "tsx scripts/v8-compute-posteriors.ts",
+    "v8:edges": "tsx scripts/v8-build-edges.ts",
+    "v8:eigentrust": "tsx scripts/v8-compute-eigentrust.ts",
+    "v8:recompute": "npm run v8:signals && npm run v8:posteriors && npm run v8:edges && npm run v8:eigentrust"
   },
   "keywords": [
     "said",
