@@ -147,9 +147,47 @@ export interface V7DemonstratedDelivery {
 
 export interface V7CeilingDecision {
   /** Name of the ceiling rule that fired, or null if no ceiling applied. */
-  name: 'unverified_silver' | 'no_delivery_gold' | null;
+  name:
+    | 'unverified_silver'
+    | 'no_delivery_no_engagement_bronze'
+    | 'no_delivery_gold'
+    | null;
   /** The cap value the composite was clamped to. 100 means no cap. */
   cap: number;
+}
+
+/**
+ * Optional overrides for engine constants. When omitted, the engine
+ * uses its hard-coded defaults. Used primarily by the calibration
+ * harness (scripts/calibrate-v0.7.ts) to sweep the tuning space
+ * without modifying defaults — winning configs can then be promoted
+ * back into the defaults.
+ *
+ * Keeping all overrides optional and partial means callers can tune
+ * one knob in isolation without restating the whole config.
+ */
+export interface V7EngineConfig {
+  // Ceilings
+  capUnverified?: number;
+  capNoDelivery?: number;
+  capNoDeliveryNoEngagement?: number;
+  /** said_engagement subscore (0-10) below which the no-engagement cap fires. */
+  noEngagementThreshold?: number;
+
+  // paid_service delivery thresholds
+  paidServiceFullUniqueBuyers?: number;
+  paidServicePartialUniqueBuyers?: number;
+  paidServicePartialBuyerUniqueSellers?: number;
+
+  // launcher_token delivery thresholds
+  deliveryCapFullUsd?: number;
+  deliveryCapPartialUsd?: number;
+
+  // Type-weight overrides (only the said_engagement slot for now; others
+  // are stable enough that tuning them is out of scope)
+  serviceSaidWeight?: number;
+  launcherSaidWeight?: number;
+  newSaidWeight?: number;
 }
 
 export interface V7TypeMembership {
@@ -205,6 +243,13 @@ const TIER_BRONZE = 25;
 // top of Silver is 64. Gold tier is 65-79, so the top of Gold is 79.
 const CAP_UNVERIFIED = 64; // Cap at top of Silver tier
 const CAP_NO_DELIVERY = 79; // Cap at top of Gold tier
+// New (v0.7.2): if an agent has neither demonstrated_delivery NOR meaningful
+// SAID engagement, cap at the top of bronze. This is the principled answer to
+// the "registered + verified profile = silver" problem — the meaning of silver
+// requires *some* verifiable participation, and 'registered' alone doesn't
+// satisfy that.
+const CAP_NO_DELIVERY_NO_ENGAGEMENT = 44; // Top of bronze
+const NO_ENGAGEMENT_SAID_THRESHOLD = 1.0; // said_engagement subscore floor
 
 // Demonstrated-delivery thresholds (path a — launched token sustained cap).
 // $1M is the "sustained real cap" proxy; tier is fully partial below it.
@@ -402,33 +447,41 @@ function computeLongevitySubscore(ageDays: number): number {
  */
 function detectDemonstratedDelivery(
   launched: V7LaunchedTokenStats | undefined,
-  x402?: V7X402ActivityStats,
+  x402: V7X402ActivityStats | undefined,
+  cfg: V7EngineConfig,
 ): V7DemonstratedDelivery {
+  const fullUsd = cfg.deliveryCapFullUsd ?? DELIVERY_CAP_FULL_USD;
+  const partialUsd = cfg.deliveryCapPartialUsd ?? DELIVERY_CAP_PARTIAL_USD;
+  const fullBuyers = cfg.paidServiceFullUniqueBuyers ?? PAID_SERVICE_FULL_UNIQUE_BUYERS;
+  const partialBuyers = cfg.paidServicePartialUniqueBuyers ?? PAID_SERVICE_PARTIAL_UNIQUE_BUYERS;
+  const partialSellers =
+    cfg.paidServicePartialBuyerUniqueSellers ?? PAID_SERVICE_PARTIAL_BUYER_UNIQUE_SELLERS;
+
   // Path (a): launcher_token — agent's token reached real market cap
   const topCap = launched?.topMarketCapUsd ?? 0;
-  if (topCap >= DELIVERY_CAP_FULL_USD) {
+  if (topCap >= fullUsd) {
     return { active: true, path: 'launcher_token', contribution: DELIVERY_BONUS_FULL };
   }
 
   // Path (b): paid_service — agent is an active x402 provider with
   // independently-verified buyer activity (per x402scan).
   const providerBuyers = x402?.providerUniqueBuyers ?? 0;
-  if (providerBuyers >= PAID_SERVICE_FULL_UNIQUE_BUYERS) {
+  if (providerBuyers >= fullBuyers) {
     return { active: true, path: 'paid_service', contribution: DELIVERY_BONUS_FULL };
   }
 
   // Partial delivery falls through both paths
-  if (topCap >= DELIVERY_CAP_PARTIAL_USD) {
+  if (topCap >= partialUsd) {
     return { active: true, path: 'launcher_token', contribution: DELIVERY_BONUS_PARTIAL };
   }
-  if (providerBuyers >= PAID_SERVICE_PARTIAL_UNIQUE_BUYERS) {
+  if (providerBuyers >= partialBuyers) {
     return { active: true, path: 'paid_service', contribution: DELIVERY_BONUS_PARTIAL };
   }
   // Buyer-side fallback: an autonomous agent that consumes services across
   // multiple distinct sellers is a credible economy participant even if it
   // hasn't (yet) attracted enough buyers as a provider.
   const buyerSellers = x402?.buyerUniqueSellers ?? 0;
-  if (buyerSellers >= PAID_SERVICE_PARTIAL_BUYER_UNIQUE_SELLERS) {
+  if (buyerSellers >= partialSellers) {
     return { active: true, path: 'paid_service', contribution: DELIVERY_BONUS_PARTIAL };
   }
 
@@ -557,12 +610,24 @@ function blendWeights(
 function decideCeiling(
   agent: AgentLike,
   delivery: V7DemonstratedDelivery,
+  saidEngagement: number,
+  cfg: V7EngineConfig,
 ): V7CeilingDecision {
+  const capUnverified = cfg.capUnverified ?? CAP_UNVERIFIED;
+  const capNoDelivery = cfg.capNoDelivery ?? CAP_NO_DELIVERY;
+  const capNoEng = cfg.capNoDeliveryNoEngagement ?? CAP_NO_DELIVERY_NO_ENGAGEMENT;
+  const engThreshold = cfg.noEngagementThreshold ?? NO_ENGAGEMENT_SAID_THRESHOLD;
+
   if (!agent.isVerified) {
-    return { name: 'unverified_silver', cap: CAP_UNVERIFIED };
+    return { name: 'unverified_silver', cap: capUnverified };
   }
   if (!delivery.active) {
-    return { name: 'no_delivery_gold', cap: CAP_NO_DELIVERY };
+    // No delivery AND no meaningful protocol engagement → bronze cap.
+    // This is the structural answer to "registered profile ≠ silver."
+    if (saidEngagement < engThreshold) {
+      return { name: 'no_delivery_no_engagement_bronze', cap: capNoEng };
+    }
+    return { name: 'no_delivery_gold', cap: capNoDelivery };
   }
   return { name: null, cap: 100 };
 }
@@ -639,6 +704,7 @@ export function computeTrustScoreV7(
   fairscaleSubscore?: number,
   x402ActivityStats?: V7X402ActivityStats,
   saidEngagementStats?: V7SaidEngagementStats,
+  cfg: V7EngineConfig = {},
 ): V7ScoreResult {
   const now = Date.now();
   const ageDays = Math.floor(
@@ -647,7 +713,7 @@ export function computeTrustScoreV7(
   const fairscale = Math.max(0, Math.min(10, fairscaleSubscore ?? 0));
 
   // Step 1: Demonstrated delivery (feeds Identity)
-  const delivery = detectDemonstratedDelivery(launchedTokenStats, x402ActivityStats);
+  const delivery = detectDemonstratedDelivery(launchedTokenStats, x402ActivityStats, cfg);
 
   // Step 2: Sub-signals (each 0-10)
   const identity = computeIdentitySubscore(agent, delivery);
@@ -661,6 +727,27 @@ export function computeTrustScoreV7(
   const hasLaunchedToken = (launchedTokenStats?.tokenCount ?? 0) > 0;
   const typeMembership = computeTypeMembership(ageDays, hasLaunchedToken);
   const W = blendWeights(typeMembership);
+  // Apply per-type said_engagement weight overrides if calibration provides them.
+  // The traction basket must still sum to 1.0, so we rebalance by scaling the
+  // non-said weights proportionally.
+  if (
+    cfg.serviceSaidWeight !== undefined ||
+    cfg.launcherSaidWeight !== undefined ||
+    cfg.newSaidWeight !== undefined
+  ) {
+    const blendedSaidOverride =
+      typeMembership.service * (cfg.serviceSaidWeight ?? WEIGHTS_SERVICE.said_engagement) +
+      typeMembership.launcher * (cfg.launcherSaidWeight ?? WEIGHTS_LAUNCHER.said_engagement) +
+      typeMembership.new * (cfg.newSaidWeight ?? WEIGHTS_NEW.said_engagement);
+    const otherWeightSum = W.activity + W.economic + W.ecosystem;
+    if (otherWeightSum > 0) {
+      const scale = (1 - blendedSaidOverride) / otherWeightSum;
+      W.activity *= scale;
+      W.economic *= scale;
+      W.ecosystem *= scale;
+    }
+    W.said_engagement = blendedSaidOverride;
+  }
 
   // Step 4: Compute Trust and Traction axes (each 0-100)
   // Trust axis: identity + longevity, plus a fraction of fairscale routed in
@@ -690,7 +777,7 @@ export function computeTrustScoreV7(
   composite = Math.max(0, Math.min(100, composite));
 
   // Step 6: Apply structural ceiling.
-  const ceiling = decideCeiling(agent, delivery);
+  const ceiling = decideCeiling(agent, delivery, saidEngagement, cfg);
   composite = Math.min(composite, ceiling.cap);
   const finalScore = Math.round(composite);
 
