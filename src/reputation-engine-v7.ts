@@ -80,6 +80,28 @@ export interface V7LaunchedTokenStats {
 }
 
 /**
+ * Per-wallet rollup of calls into the SAID program itself, broken
+ * down by Anchor instruction discriminator. Distinguishes agents
+ * who actually USE the protocol (anchor receipts, submit feedback,
+ * etc.) from agents who just registered + filled out a profile.
+ *
+ * Defeats the "verified + nice profile = silver" trap: an agent with
+ * zero post-registration SAID engagement scores 0 here even if their
+ * identity sub-signal is high.
+ */
+export interface V7SaidEngagementStats {
+  registerCount: number;
+  getVerifiedCount: number;
+  submitFeedbackCount: number;
+  anchorReceiptCount: number;
+  linkWalletCount: number;
+  attestationCount: number;
+  updateMetadataCount: number;
+  otherSaidCount: number;
+  totalSaidInstructions: number;
+}
+
+/**
  * x402 micropayment activity (both sides) for this wallet, as indexed
  * by x402scan. Powers the paid_service path of demonstrated-delivery.
  *
@@ -138,6 +160,7 @@ export interface V7ScoreResult {
   ecosystem: number; // 0-10
   longevity: number; // 0-10
   fairscale: number; // 0-10
+  said_engagement: number; // 0-10 — calls into SAID program (v0.7.1+)
 
   // v0.7-specific signals
   type: V7AgentType;
@@ -296,6 +319,37 @@ function computeEcosystemSubscore(agent: AgentLike): number {
   return Math.min(10, score);
 }
 
+/**
+ * Reward agents who actually use SAID program infrastructure.
+ *
+ * Weighting rationale:
+ *   - anchored receipts (4 pts max) = on-chain proof-of-work; strongest single signal
+ *   - outgoing peer feedback (3 pts max) = active participation in reputation graph
+ *   - attestations (2 pts max) = curating other agents
+ *   - layer-2 verifies / link-wallets (1 pt max) = lifecycle but bounded
+ *   - generic/other SAID instructions (0.5 pts) = catch-all
+ *
+ * register_agent intentionally NOT rewarded — every verified agent
+ * registered once. It's a precondition, not a signal.
+ *
+ * Log scaling so 1→10 anchors swings 2 points but 100→1000 only swings
+ * ~1 more; rewards meaningful usage without making 1 prolific user
+ * eclipse everyone else.
+ */
+function computeSaidEngagementSubscore(stats: V7SaidEngagementStats | undefined): number {
+  if (!stats || stats.totalSaidInstructions === 0) return 0;
+  const log2 = (n: number) => (n <= 0 ? 0 : Math.log2(n + 1));
+  let raw = 0;
+  raw += Math.min(4, log2(stats.anchorReceiptCount) * 1.0);
+  raw += Math.min(3, log2(stats.submitFeedbackCount) * 0.8);
+  raw += Math.min(2, log2(stats.attestationCount) * 0.7);
+  raw += Math.min(1, log2(stats.getVerifiedCount) * 0.5);
+  raw += Math.min(1, log2(stats.linkWalletCount) * 0.5);
+  raw += Math.min(0.5, log2(stats.updateMetadataCount) * 0.25);
+  raw += Math.min(0.5, log2(stats.otherSaidCount) * 0.2);
+  return Math.max(0, Math.min(10, raw));
+}
+
 function computeLongevitySubscore(ageDays: number): number {
   if (ageDays >= 90) return 10;
   if (ageDays >= 60) return 8;
@@ -387,6 +441,7 @@ interface TypeWeights {
   activity: number;
   economic: number;
   ecosystem: number;
+  said_engagement: number;
   // External enrichment — applied to whichever axis is most appropriate
   fairscale_to_trust: number; // fraction routed to Trust
   // Composite mix
@@ -394,12 +449,20 @@ interface TypeWeights {
   wTraction: number;
 }
 
+// v0.7.1 weight adjustments — said_engagement gets meaningful traction
+// share (15-25%) so that agents who actually invoke SAID program
+// instructions (anchor receipts, submit feedback, etc.) outrank agents
+// whose only on-chain footprint is the registration tx.
+//
+// Traction basket sums to 1.0 in each table:
+//   activity + economic + ecosystem + said_engagement = 1.0
 const WEIGHTS_LAUNCHER: TypeWeights = {
   identity: 0.65,
   longevity: 0.35,
-  activity: 0.30,
-  economic: 0.55,
-  ecosystem: 0.15,
+  activity: 0.25,
+  economic: 0.50,
+  ecosystem: 0.10,
+  said_engagement: 0.15,
   fairscale_to_trust: 0.5,
   wTrust: 0.55,
   wTraction: 0.45,
@@ -408,9 +471,10 @@ const WEIGHTS_LAUNCHER: TypeWeights = {
 const WEIGHTS_SERVICE: TypeWeights = {
   identity: 0.55,
   longevity: 0.45,
-  activity: 0.60,
-  economic: 0.20,
-  ecosystem: 0.20,
+  activity: 0.45,
+  economic: 0.15,
+  ecosystem: 0.15,
+  said_engagement: 0.25,
   fairscale_to_trust: 0.5,
   wTrust: 0.60,
   wTraction: 0.40,
@@ -419,10 +483,11 @@ const WEIGHTS_SERVICE: TypeWeights = {
 const WEIGHTS_NEW: TypeWeights = {
   identity: 0.75,
   longevity: 0.25,
-  activity: 0.55,
-  economic: 0.25,
-  ecosystem: 0.20,
-  fairscale_to_trust: 0.7, // new agents lean on identity-style enrichment
+  activity: 0.40,
+  economic: 0.20,
+  ecosystem: 0.15,
+  said_engagement: 0.25,
+  fairscale_to_trust: 0.7,
   wTrust: 0.80,
   wTraction: 0.20,
 };
@@ -436,6 +501,7 @@ function blendWeights(
     activity: 0,
     economic: 0,
     ecosystem: 0,
+    said_engagement: 0,
     fairscale_to_trust: 0,
     wTrust: 0,
     wTraction: 0,
@@ -451,6 +517,7 @@ function blendWeights(
     out.activity += weight * set.activity;
     out.economic += weight * set.economic;
     out.ecosystem += weight * set.ecosystem;
+    out.said_engagement += weight * set.said_engagement;
     out.fairscale_to_trust += weight * set.fairscale_to_trust;
     out.wTrust += weight * set.wTrust;
     out.wTraction += weight * set.wTraction;
@@ -511,6 +578,7 @@ function buildSources(
   activityStats: V7ActivityStats | undefined,
   launched: V7LaunchedTokenStats | undefined,
   x402?: V7X402ActivityStats,
+  said?: V7SaidEngagementStats,
 ): string[] {
   const sources = ['said'];
   if (trustScore.fairscale > 0) sources.push('fairscale');
@@ -519,6 +587,10 @@ function buildSources(
   if ((launched?.tokenCount ?? 0) > 0) sources.push('launched_tokens');
   if ((x402?.providerUniqueBuyers ?? 0) > 0 || (x402?.buyerUniqueSellers ?? 0) > 0) {
     sources.push('x402scan');
+  }
+  if ((said?.totalSaidInstructions ?? 0) > 1) {
+    // > 1 because every verified agent has at least register_agent
+    sources.push('said_program');
   }
   return sources;
 }
@@ -539,6 +611,7 @@ export function computeTrustScoreV7(
   launchedTokenStats?: V7LaunchedTokenStats,
   fairscaleSubscore?: number,
   x402ActivityStats?: V7X402ActivityStats,
+  saidEngagementStats?: V7SaidEngagementStats,
 ): V7ScoreResult {
   const now = Date.now();
   const ageDays = Math.floor(
@@ -555,6 +628,7 @@ export function computeTrustScoreV7(
   const economic = computeEconomicSubscore(agent, activityStats, launchedTokenStats);
   const ecosystem = computeEcosystemSubscore(agent);
   const longevity = computeLongevitySubscore(ageDays);
+  const saidEngagement = computeSaidEngagementSubscore(saidEngagementStats);
 
   // Step 3: Type membership + blended weights
   const hasLaunchedToken = (launchedTokenStats?.tokenCount ?? 0) > 0;
@@ -576,6 +650,7 @@ export function computeTrustScoreV7(
     W.activity * activity +
     W.economic * economic +
     W.ecosystem * ecosystem +
+    W.said_engagement * saidEngagement +
     0.1 * fairscaleToTraction;
   const traction = Math.max(0, Math.min(100, tractionRaw * 10));
 
@@ -606,6 +681,7 @@ export function computeTrustScoreV7(
     ecosystem,
     longevity,
     fairscale,
+    said_engagement: Math.round(saidEngagement * 10) / 10,
     type: dominantType(typeMembership),
     type_membership: {
       new: Math.round(typeMembership.new * 1000) / 1000,
@@ -615,7 +691,7 @@ export function computeTrustScoreV7(
     demonstrated_delivery: delivery,
     ceiling_applied: ceiling,
     badges: buildBadges(agent, dominantType(typeMembership), delivery, activityStats, launchedTokenStats),
-    sources: buildSources({ fairscale }, anchorStats, activityStats, launchedTokenStats, x402ActivityStats),
+    sources: buildSources({ fairscale }, anchorStats, activityStats, launchedTokenStats, x402ActivityStats, saidEngagementStats),
     computedAt: new Date().toISOString(),
     methodology_version: METHODOLOGY_VERSION_V7,
   };

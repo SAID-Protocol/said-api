@@ -633,3 +633,46 @@ model AgentX402Activity {
   @@index([providerUniqueBuyers])
   @@index([syncedAt])
 }
+
+// Per-wallet rollup of calls into the SAID program itself, broken down
+// by Anchor instruction discriminator. Distinguishes "agent that
+// actually uses SAID" (submits feedback, anchors receipts, etc.) from
+// "agent that registered once and never came back."
+//
+// Populated by scripts/sync-said-engagement.ts which walks each
+// verified wallet's tx history via Alchemy and filters for
+// invocations of SAID_PROGRAM_ID (5dpw6KEQPn248pnkkaYyWfHwu2nfb3LUMbTucb6LaA8G).
+//
+// Used by reputation-engine-v7.ts computeSaidEngagementSubscore to
+// produce a 0-10 sub-signal that gets meaningful weight in the
+// composite — specifically to defeat the "registered + verified
+// + profile filled = silver" trap that v0.7 exhibits without this
+// signal.
+model AgentSaidEngagement {
+  wallet                  String   @id
+
+  // Specific instruction counts (per Anchor discriminator)
+  registerCount           Int      @default(0)
+  getVerifiedCount        Int      @default(0)
+  submitFeedbackCount     Int      @default(0)
+  anchorReceiptCount      Int      @default(0)
+  linkWalletCount         Int      @default(0)
+  unlinkWalletCount       Int      @default(0)
+  transferAuthorityCount  Int      @default(0)
+  attestationCount        Int      @default(0)
+  updateMetadataCount     Int      @default(0)
+  // Calls into SAID program with a discriminator we don't recognize
+  otherSaidCount          Int      @default(0)
+  // Sum of the above (also used as a denominator)
+  totalSaidInstructions   Int      @default(0)
+
+  firstSaidInteractionAt  DateTime?
+  lastSaidInteractionAt   DateTime?
+
+  // How far back we scanned (so we don't re-scan history we've covered)
+  scannedUpToSignature    String?
+  syncedAt                DateTime @default(now())
+
+  @@index([totalSaidInstructions])
+  @@index([syncedAt])
+}

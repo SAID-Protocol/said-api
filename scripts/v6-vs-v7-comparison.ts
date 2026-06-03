@@ -31,6 +31,7 @@ import {
   type V7ActivityStats,
   type V7LaunchedTokenStats,
   type V7X402ActivityStats,
+  type V7SaidEngagementStats,
 } from '../src/reputation-engine-v7.js';
 import {
   getActivityStatsForWallet,
@@ -51,6 +52,8 @@ interface Row {
   delta: number;
   v7Delivery: string;
   v7Type: string;
+  v7SaidEng: number;
+  v7Ceiling: string;
 }
 
 async function loadAnchorStats(agentPda: string | null): Promise<AnchorStatsInput & V7AnchorStats> {
@@ -73,7 +76,7 @@ async function scoreAgent(wallet: string): Promise<Row | null> {
   });
   if (!agent) return null;
 
-  const [anchorStats, activity, launched, cachedScore, x402] = await Promise.all([
+  const [anchorStats, activity, launched, cachedScore, x402, saidEng] = await Promise.all([
     loadAnchorStats(agent.pda),
     getActivityStatsForWallet(prisma, agent.wallet) as Promise<
       (ActivityStatsInput & V7ActivityStats) | null
@@ -83,6 +86,7 @@ async function scoreAgent(wallet: string): Promise<Row | null> {
     >,
     prisma.agentScore.findUnique({ where: { wallet }, select: { fairscale: true } }),
     prisma.agentX402Activity.findUnique({ where: { wallet } }),
+    prisma.agentSaidEngagement.findUnique({ where: { wallet } }),
   ]);
 
   const fairscale = cachedScore?.fairscale ?? 0;
@@ -94,6 +98,19 @@ async function scoreAgent(wallet: string): Promise<Row | null> {
         buyerTxCount: x402.buyerTxCount,
       }
     : undefined;
+  const saidEngStats: V7SaidEngagementStats | undefined = saidEng
+    ? {
+        registerCount: saidEng.registerCount,
+        getVerifiedCount: saidEng.getVerifiedCount,
+        submitFeedbackCount: saidEng.submitFeedbackCount,
+        anchorReceiptCount: saidEng.anchorReceiptCount,
+        linkWalletCount: saidEng.linkWalletCount,
+        attestationCount: saidEng.attestationCount,
+        updateMetadataCount: saidEng.updateMetadataCount,
+        otherSaidCount: saidEng.otherSaidCount,
+        totalSaidInstructions: saidEng.totalSaidInstructions,
+      }
+    : undefined;
 
   const v6 = computeTrustScore(agent, anchorStats, activity ?? undefined, launched, fairscale);
   const v7 = computeTrustScoreV7(
@@ -103,6 +120,7 @@ async function scoreAgent(wallet: string): Promise<Row | null> {
     launched,
     fairscale,
     x402Stats,
+    saidEngStats,
   );
 
   return {
@@ -113,8 +131,10 @@ async function scoreAgent(wallet: string): Promise<Row | null> {
     v7Score: v7.score,
     v7Tier: v7.tier,
     delta: v7.score - v6.score,
-    v7Delivery: v7.demonstratedDelivery?.path ?? 'none',
-    v7Type: v7.dominantType ?? '?',
+    v7Delivery: v7.demonstrated_delivery?.path ?? 'none',
+    v7Type: v7.type ?? '?',
+    v7SaidEng: v7.said_engagement,
+    v7Ceiling: v7.ceiling_applied?.name ?? 'none',
   };
 }
 
@@ -128,13 +148,22 @@ async function run() {
   console.log(`Scoring ${agents.length} agents (v6 + v7 in parallel per agent)\n`);
 
   const x402Count = await prisma.agentX402Activity.count();
+  const saidCount = await prisma.agentSaidEngagement.count();
   if (x402Count === 0) {
     console.log(
-      '⚠️  AgentX402Activity table is EMPTY. paid_service delivery will not activate for any agent.',
+      '⚠️  AgentX402Activity table is EMPTY. paid_service delivery will not activate.',
     );
-    console.log('   Run scripts/sync-x402-activity.ts first to populate it.\n');
+    console.log('   Run scripts/sync-x402-activity.ts first.\n');
   } else {
-    console.log(`AgentX402Activity has ${x402Count} rows.\n`);
+    console.log(`AgentX402Activity has ${x402Count} rows.`);
+  }
+  if (saidCount === 0) {
+    console.log(
+      '⚠️  AgentSaidEngagement table is EMPTY. said_engagement sub-signal will be 0 for everyone.',
+    );
+    console.log('   Run scripts/sync-said-engagement.ts first.\n');
+  } else {
+    console.log(`AgentSaidEngagement has ${saidCount} rows.\n`);
   }
 
   const startedAt = Date.now();
@@ -202,16 +231,45 @@ async function run() {
 
   // Top 20 by v0.7 score
   console.log('Top 20 by v0.7 score:');
-  console.log(`  ${'name'.padEnd(25)} ${'v6'.padStart(4)} ${'v6_tier'.padEnd(10)} ${'v7'.padStart(4)} ${'v7_tier'.padEnd(10)} ${'Δ'.padStart(5)}  v7_delivery       type`);
+  console.log(
+    `  ${'name'.padEnd(25)} ${'v6'.padStart(4)} ${'v6_tier'.padEnd(10)} ${'v7'.padStart(4)} ${'v7_tier'.padEnd(10)} ${'Δ'.padStart(5)}  ${'delivery'.padEnd(16)} ${'said'.padStart(5)} ${'type'.padEnd(9)} ceiling`,
+  );
   const topV7 = [...rows].sort((a, b) => b.v7Score - a.v7Score).slice(0, 20);
   for (const r of topV7) {
     console.log(
-      `  ${r.name.slice(0, 25).padEnd(25)} ${String(r.v6Score).padStart(4)} ${r.v6Tier.padEnd(10)} ${String(r.v7Score).padStart(4)} ${r.v7Tier.padEnd(10)} ${(r.delta > 0 ? '+' : '') + r.delta} ${r.v7Delivery.padEnd(17)} ${r.v7Type}`,
+      `  ${r.name.slice(0, 25).padEnd(25)} ${String(r.v6Score).padStart(4)} ${r.v6Tier.padEnd(10)} ${String(r.v7Score).padStart(4)} ${r.v7Tier.padEnd(10)} ${((r.delta > 0 ? '+' : '') + r.delta).padStart(5)}  ${r.v7Delivery.padEnd(16)} ${String(r.v7SaidEng).padStart(5)} ${r.v7Type.padEnd(9)} ${r.v7Ceiling}`,
     );
   }
   console.log();
 
-  // Biggest movers (v7 above v6)
+  // Active demonstrated-delivery list
+  const delivAgents = rows.filter((r) => r.v7Delivery !== 'none').sort((a, b) => b.v7Score - a.v7Score);
+  console.log(`Agents with demonstrated_delivery active (${delivAgents.length}):`);
+  for (const r of delivAgents) {
+    console.log(`  ${r.name.padEnd(28)} v7=${r.v7Score} ${r.v7Tier.padEnd(8)} path=${r.v7Delivery}`);
+  }
+  console.log();
+
+  // SAID engagement leaders
+  const saidLeaders = [...rows].sort((a, b) => b.v7SaidEng - a.v7SaidEng).slice(0, 15);
+  console.log('Top 15 by said_engagement subscore:');
+  for (const r of saidLeaders) {
+    console.log(`  ${r.name.padEnd(28)} said=${r.v7SaidEng}/10  v7=${r.v7Score}  ${r.v7Tier}`);
+  }
+  console.log();
+
+  // Ceiling activations
+  const capped = rows.filter((r) => r.v7Ceiling !== 'none');
+  const capByName: Record<string, number> = {};
+  for (const r of capped) capByName[r.v7Ceiling] = (capByName[r.v7Ceiling] ?? 0) + 1;
+  console.log('Structural ceiling activations:');
+  for (const [name, n] of Object.entries(capByName).sort((a, b) => b[1] - a[1])) {
+    console.log(`  ${name.padEnd(22)} ${n} agents (${((n / rows.length) * 100).toFixed(1)}%)`);
+  }
+  if (Object.keys(capByName).length === 0) console.log('  (none)');
+  console.log();
+
+  // Biggest movers
   console.log('Biggest UPWARD movers (v7 - v6 ≥ 10):');
   const upMovers = [...rows].filter((r) => r.delta >= 10).sort((a, b) => b.delta - a.delta).slice(0, 15);
   if (upMovers.length === 0) {
@@ -219,20 +277,19 @@ async function run() {
   } else {
     for (const r of upMovers) {
       console.log(
-        `  ${r.name.slice(0, 25).padEnd(25)} v6=${r.v6Score} → v7=${r.v7Score} (+${r.delta})  delivery=${r.v7Delivery}  type=${r.v7Type}`,
+        `  ${r.name.slice(0, 25).padEnd(25)} v6=${r.v6Score} → v7=${r.v7Score} (+${r.delta})  delivery=${r.v7Delivery}  said=${r.v7SaidEng}  type=${r.v7Type}`,
       );
     }
   }
   console.log();
 
-  // Biggest movers (v7 below v6) — ceiling activations etc.
   console.log('Biggest DOWNWARD movers (v6 - v7 ≥ 10):');
   const dnMovers = [...rows].filter((r) => r.delta <= -10).sort((a, b) => a.delta - b.delta).slice(0, 15);
   if (dnMovers.length === 0) {
     console.log('  (none)');
   } else {
     for (const r of dnMovers) {
-      console.log(`  ${r.name.slice(0, 25).padEnd(25)} v6=${r.v6Score} → v7=${r.v7Score} (${r.delta})  type=${r.v7Type}`);
+      console.log(`  ${r.name.slice(0, 25).padEnd(25)} v6=${r.v6Score} → v7=${r.v7Score} (${r.delta})  said=${r.v7SaidEng}  type=${r.v7Type}  ceiling=${r.v7Ceiling}`);
     }
   }
 
