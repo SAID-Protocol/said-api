@@ -602,6 +602,78 @@ model LaunchedToken {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// UPSTREAM SIGNAL CACHES (carried forward from v0.7)
+// ═══════════════════════════════════════════════════════════════════
+// These tables are populated by external sync workers:
+//   - sync-x402-activity.ts   → AgentX402Activity (from x402scan tRPC)
+//   - sync-said-engagement.ts → AgentSaidEngagement (from Alchemy RPC)
+//
+// In v0.8, they're upstream feeders for the event log: a periodic job
+// reads new/updated rows and emits corresponding ReputationEvent rows
+// via scripts/v8-backfill-events.ts. The v0.8 scoring layer never reads
+// these tables directly — only via emitted events.
+
+model AgentX402Activity {
+  wallet                  String   @id
+
+  // Provider side (this wallet is paid for offering an x402 endpoint)
+  providerTxCount         Int      @default(0)
+  providerAmountAtomic    BigInt   @default(0)
+  providerUniqueBuyers    Int      @default(0)
+  providerFacilitators    String[] @default([])
+  providerLastSeenAt      DateTime?
+
+  // Buyer side (this wallet pays other x402 endpoints)
+  buyerTxCount            Int      @default(0)
+  buyerAmountAtomic       BigInt   @default(0)
+  buyerUniqueSellers      Int      @default(0)
+  buyerFacilitators       String[] @default([])
+  buyerLastSeenAt         DateTime?
+
+  syncedAt                DateTime @default(now())
+
+  @@index([providerUniqueBuyers])
+  @@index([syncedAt])
+}
+
+model AgentSaidEngagement {
+  wallet                  String   @id
+
+  registerCount           Int      @default(0)
+  getVerifiedCount        Int      @default(0)
+  registerAndStakeCount   Int      @default(0)
+  sponsorRegisterCount    Int      @default(0)
+  sponsorVerifyCount      Int      @default(0)
+  updateAgentCount        Int      @default(0)
+
+  submitAnchorCount       Int      @default(0)
+  validateWorkCount       Int      @default(0)
+  submitFeedbackCount     Int      @default(0)
+
+  stakeCount              Int      @default(0)
+  addStakeCount           Int      @default(0)
+  unstakeLifecycleCount   Int      @default(0)
+
+  linkWalletCount         Int      @default(0)
+  unlinkWalletCount       Int      @default(0)
+  transferAuthorityCount  Int      @default(0)
+
+  slashAgentCount         Int      @default(0)
+
+  otherSaidCount          Int      @default(0)
+  totalSaidInstructions   Int      @default(0)
+
+  firstSaidInteractionAt  DateTime?
+  lastSaidInteractionAt   DateTime?
+  scannedUpToSignature    String?
+  syncedAt                DateTime @default(now())
+
+  @@index([totalSaidInstructions])
+  @@index([submitAnchorCount])
+  @@index([syncedAt])
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // REPUTATION v0.8 — see docs/reputation-v0.8.md for full design
 // ═══════════════════════════════════════════════════════════════════
 
@@ -614,6 +686,13 @@ model LaunchedToken {
 // (the seller delivered) and `payments` (the buyer paid).
 model ReputationEvent {
   id              String   @id @default(cuid())
+
+  // Idempotency key — set by the producer (backfill script, live ingest
+  // hook, sync worker). Format is "<source>:<deterministic_id>", e.g.,
+  // "fb:cm123abc", "x402:wallet:provider", "anchor:tx_hash:axis".
+  // Lets us re-run backfills without double-counting. Null is allowed
+  // for genuinely one-off system events.
+  sourceKey       String?  @unique
 
   // Subject — the agent whose reputation this affects
   subjectWallet   String
