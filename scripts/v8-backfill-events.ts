@@ -236,10 +236,16 @@ async function backfillX402(): Promise<BackfillCounts> {
   for (const x of rows) {
     counts.scanned++;
 
-    // Provider side — affects both `payments` and `delivery`
+    // Provider side — affects both `payments` and `delivery`.
+    //
+    // Weight policy: scale linearly by unique counterparties. The batched
+    // synthetic event stands in for the N actual transactions we don't
+    // have per-row data for. This puts batched and per-row events on the
+    // same evidence scale (one unique payer ≈ one endorsement). Without
+    // this, agents with batched signals are massively underrepresented
+    // vs. agents with per-row Feedback rows.
     if (x.providerUniqueBuyers > 0 && x.providerLastSeenAt) {
-      // Log-scaled weight: 5 buyers → ~1.5, 50 → ~3, 500 → ~5
-      const weight = Math.max(0.5, Math.log2(x.providerUniqueBuyers + 1) * 0.6);
+      const weight = x.providerUniqueBuyers; // raw count — one event per real customer
       const r1 = await emitEvent(prisma, {
         sourceKey: `x402:provider:payments:${x.wallet}`,
         subjectWallet: x.wallet,
@@ -267,9 +273,12 @@ async function backfillX402(): Promise<BackfillCounts> {
       r2.emitted ? counts.emitted++ : counts.skipped++;
     }
 
-    // Buyer side — affects `payments` only (weaker signal)
+    // Buyer side — affects `payments` only. Lower per-counterparty weight
+    // because consuming a service is a weaker reputation signal than
+    // attracting customers (cost is lower; it's "I paid for something",
+    // not "people paid me").
     if (x.buyerUniqueSellers > 0 && x.buyerLastSeenAt) {
-      const weight = Math.max(0.2, Math.log2(x.buyerUniqueSellers + 1) * 0.3);
+      const weight = x.buyerUniqueSellers * 0.4; // weaker than provider side
       const r = await emitEvent(prisma, {
         sourceKey: `x402:buyer:${x.wallet}`,
         subjectWallet: x.wallet,
@@ -311,8 +320,12 @@ async function backfillSaidEngagement(): Promise<BackfillCounts> {
 
     for (const m of mappings) {
       if (m.count <= 0) continue;
-      // Log-scaled weight: each additional event after the first contributes less
-      const weight = Math.max(m.perItemWeight, Math.log2(m.count + 1) * m.perItemWeight);
+      // Linear weight: count × perItemWeight. The batched synthetic event
+      // stands in for `count` actual on-chain events. Putting batched and
+      // per-row events on the same evidence scale prevents prolific
+      // anchor/stake users from being silently underrepresented vs.
+      // agents with feedback rows (which are stored per-row).
+      const weight = m.count * m.perItemWeight;
       const r = await emitEvent(prisma, {
         sourceKey: `said:${m.suffix}:${s.wallet}`,
         subjectWallet: s.wallet,
