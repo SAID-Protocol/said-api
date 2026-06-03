@@ -1,26 +1,37 @@
 /**
- * COCM — cluster-discount for the trust graph (reputation v0.8 Phase 3b).
+ * COCM — collusion-cluster discount for reputation v0.8 (Phase 3b).
  *
- * The problem this solves, observed directly in our data: a ring of ~8
- * agents (EgGjpCckE54f…, 6cQkUCsQHJGJ…, 5i1hAmy2gSVQ… and friends) endorse
- * each OTHER — they appear in both the top-inbound and top-outbound edge
- * lists. Uniform EigenTrust rewards that mutual-admiration loop; seeds
- * can't reach it. We need to downweight collusive intra-cluster edges so a
- * sybil farm of size k earns far less than k× the reputation.
+ * Two consumers, one detector:
+ *   1. Graph path (v8-compute-eigentrust): discount intra-cluster EDGE
+ *      weights before EigenTrust. Useful at cluster boundaries.
+ *   2. Posterior path (v8-compute-signals): COLLAPSE collusive feedback
+ *      toward a single signal before it inflates an agent's Beta posterior.
+ *      This is the lever that actually moves tiers — see the note below.
  *
- * Why not the naive "Louvain, then flat-discount every intra-cluster edge"
- * the design doc sketches:
- *   Louvain groups Xona's 145 buyers into one community (a dense star).
- *   A flat discount would crush the legitimate hub we just rescued. The
- *   distinction that matters is RECIPROCITY, not cluster membership:
- *     - sybil ring:  A→B and B→A both exist (mutual endorsement)
- *     - payment star: buyer→Xona only; Xona never pays the buyer back
- *   So we scale each community's discount by its internal reciprocity. A
- *   perfectly reciprocal cluster gets the full discount; a one-directional
- *   star (reciprocity 0) is left untouched.
+ * The problem, observed in our data: a ~35-agent cluster (EgGjpCck…,
+ * 6cQkUCsQ…, 5i1hAmy2… and friends) leave each OTHER positive feedback —
+ * high internal reciprocity — and ride it to silver. Genuine agents
+ * (Xona) earn trust one-directionally (buyers pay her; she doesn't pay
+ * them back), so reciprocity cleanly separates collusion from legitimacy.
  *
- * Pure module — no DB. Takes directed edges, returns a discounted edge
- * list plus a report. The caller re-runs EigenTrust on the result.
+ * Why edge-discount alone doesn't work, and collapse does:
+ *   - EigenTrust row-normalizes outgoing edges, so scaling ALL of a ring
+ *     member's intra-edges by the same factor cancels out. The graph
+ *     barely moves.
+ *   - A ring member's silver tier comes from their feedback POSTERIOR, not
+ *     the graph. And a Beta mean saturates: 50 endorsements → mean ~0.96,
+ *     and a 0.3× discount only nudges it. But effectiveSamples (= α+β−prior)
+ *     gates the tier (silver needs ≥10), and THAT scales linearly. So we
+ *     collapse a collusive cluster's feedback toward a single signal:
+ *     effectiveSamples crater, and the ring drops through the sample-gate.
+ *
+ * Reciprocity drives the magnitude of both operations:
+ *   effectiveDiscount = 1 − (1 − baseDiscount)·reciprocity   (edge path)
+ *   collapse          = lerp(fullSum → singleSignal, reciprocity)  (posterior path)
+ *   reciprocity 0 (one-directional star) → untouched.
+ *   reciprocity 1 (tight ring)           → full discount / full collapse.
+ *
+ * Pure module — no DB.
  */
 import Graph from 'graphology';
 import louvain from 'graphology-communities-louvain';
@@ -32,27 +43,10 @@ export interface RawEdge {
   weight: number;
 }
 
-export interface ClusterReport {
-  community: number;
-  size: number;
-  intraDirectedEdges: number;
-  reciprocity: number; // 0..1 — fraction of intra edges whose reverse also exists
-  appliedDiscount: number; // multiplier actually applied to this cluster's intra edges (1 = untouched)
-  members: string[]; // up to a few, for the log
-}
-
-export interface CocmResult {
-  edges: RawEdge[]; // discounted edge list (same length/order as input)
-  numCommunities: number;
-  discountedClusters: ClusterReport[]; // clusters that received < 1.0 discount, worst first
-  intraEdgesDiscounted: number;
-  weightRemovedTotal: number;
-}
-
 export interface CocmParams {
   /** Floor multiplier a maximally-collusive (reciprocity=1) cluster's edges are scaled to. */
   baseDiscount: number; // default 0.3
-  /** Minimum cluster size to be eligible for discount — a 2-node back-and-forth is plausibly legit. */
+  /** Minimum cluster size to be eligible for discount/collapse — a 2-node back-and-forth is plausibly legit. */
   minClusterSize: number; // default 3
 }
 
@@ -65,14 +59,29 @@ function pairKey(a: string, b: string): string {
   return `${a}|${b}`;
 }
 
-/**
- * Detect communities (undirected Louvain on collapsed weights) and apply a
- * reciprocity-scaled discount to intra-cluster edges.
- */
-export function applyCocmDiscount(edges: RawEdge[], params: Partial<CocmParams> = {}): CocmResult {
-  const { baseDiscount, minClusterSize } = { ...DEFAULT_COCM_PARAMS, ...params };
+// ── Detection ───────────────────────────────────────────────────────
 
-  // 1. Build an undirected, weight-collapsed graph for community detection.
+export interface ClusterDetection {
+  /** node wallet → community id */
+  communityOf: Map<string, number>;
+  /** community id → internal directed-edge reciprocity in [0,1] */
+  reciprocityOf: Map<number, number>;
+  /** community id → member count */
+  sizeOf: Map<number, number>;
+  /** community id → member wallets */
+  membersOf: Map<number, string[]>;
+  /** communities eligible for discount/collapse (size ≥ minClusterSize) */
+  flagged: Set<number>;
+  numCommunities: number;
+}
+
+/**
+ * Run undirected Louvain on the (weight-collapsed) graph, then measure each
+ * community's internal directed reciprocity. No mutation of the input.
+ */
+export function detectClusters(edges: RawEdge[], params: Partial<CocmParams> = {}): ClusterDetection {
+  const { minClusterSize } = { ...DEFAULT_COCM_PARAMS, ...params };
+
   const g = new Graph({ type: 'undirected', multi: false });
   for (const e of edges) {
     if (e.fromWallet === e.toWallet) continue;
@@ -87,61 +96,113 @@ export function applyCocmDiscount(edges: RawEdge[], params: Partial<CocmParams> 
   }
 
   if (g.order === 0) {
-    return { edges, numCommunities: 0, discountedClusters: [], intraEdgesDiscounted: 0, weightRemovedTotal: 0 };
+    return {
+      communityOf: new Map(),
+      reciprocityOf: new Map(),
+      sizeOf: new Map(),
+      membersOf: new Map(),
+      flagged: new Set(),
+      numCommunities: 0,
+    };
   }
 
-  // 2. Louvain → node → community id.
   const communities = louvain(g, { getEdgeWeight: 'weight' }) as Record<string, number>;
-  const commOf = new Map<string, number>(Object.entries(communities));
-  const numCommunities = new Set(commOf.values()).size;
+  const communityOf = new Map<string, number>(Object.entries(communities));
 
-  // 3. Per-community structure: members + directed intra-edge set (for reciprocity).
-  const members = new Map<number, string[]>();
-  for (const [node, c] of commOf) {
-    const arr = members.get(c) ?? [];
+  const membersOf = new Map<number, string[]>();
+  for (const [node, c] of communityOf) {
+    const arr = membersOf.get(c) ?? [];
     arr.push(node);
-    members.set(c, arr);
+    membersOf.set(c, arr);
   }
+  const sizeOf = new Map<number, number>();
+  for (const [c, arr] of membersOf) sizeOf.set(c, arr.length);
 
-  const directedIntra = new Map<number, Set<string>>(); // community → set of "from|to"
+  // Directed intra-community edge sets, for reciprocity.
+  const directedIntra = new Map<number, Set<string>>();
   for (const e of edges) {
     if (e.fromWallet === e.toWallet) continue;
-    const ca = commOf.get(e.fromWallet);
-    const cb = commOf.get(e.toWallet);
+    const ca = communityOf.get(e.fromWallet);
+    const cb = communityOf.get(e.toWallet);
     if (ca === undefined || ca !== cb) continue;
     const set = directedIntra.get(ca) ?? new Set<string>();
     set.add(pairKey(e.fromWallet, e.toWallet));
     directedIntra.set(ca, set);
   }
 
-  // 4. Compute each community's reciprocity → effective discount multiplier.
-  //    effectiveDiscount = 1 - (1 - baseDiscount) * reciprocity
-  //      reciprocity 0  → 1.0   (no discount; legit star)
-  //      reciprocity 1  → baseDiscount (full discount; tight ring)
-  const discountOf = new Map<number, number>();
   const reciprocityOf = new Map<number, number>();
   for (const [c, set] of directedIntra) {
-    const size = members.get(c)?.length ?? 0;
-    const total = set.size;
     let mutual = 0;
     for (const key of set) {
       const [a, b] = key.split('|');
       if (set.has(pairKey(b, a))) mutual++;
     }
-    const reciprocity = total > 0 ? mutual / total : 0;
-    reciprocityOf.set(c, reciprocity);
-    const eligible = size >= minClusterSize;
-    discountOf.set(c, eligible ? 1 - (1 - baseDiscount) * reciprocity : 1);
+    reciprocityOf.set(c, set.size > 0 ? mutual / set.size : 0);
   }
 
-  // 5. Apply discount to intra-cluster edges; track what was removed.
+  const flagged = new Set<number>();
+  for (const [c, size] of sizeOf) {
+    if (size >= minClusterSize) flagged.add(c);
+  }
+
+  return {
+    communityOf,
+    reciprocityOf,
+    sizeOf,
+    membersOf,
+    flagged,
+    numCommunities: sizeOf.size,
+  };
+}
+
+// ── Graph-path: edge discount ───────────────────────────────────────
+
+export interface ClusterReport {
+  community: number;
+  size: number;
+  intraDirectedEdges: number;
+  reciprocity: number;
+  appliedDiscount: number; // multiplier applied to this cluster's intra edges (1 = untouched)
+  members: string[];
+}
+
+export interface CocmResult {
+  edges: RawEdge[];
+  numCommunities: number;
+  discountedClusters: ClusterReport[];
+  intraEdgesDiscounted: number;
+  weightRemovedTotal: number;
+}
+
+/**
+ * Detect communities and apply a reciprocity-scaled discount to
+ * intra-cluster edge weights. Used by the EigenTrust graph path.
+ */
+export function applyCocmDiscount(edges: RawEdge[], params: Partial<CocmParams> = {}): CocmResult {
+  const { baseDiscount, minClusterSize } = { ...DEFAULT_COCM_PARAMS, ...params };
+  const det = detectClusters(edges, { minClusterSize });
+
+  const discountOf = new Map<number, number>();
+  for (const c of det.flagged) {
+    const recip = det.reciprocityOf.get(c) ?? 0;
+    discountOf.set(c, 1 - (1 - baseDiscount) * recip);
+  }
+
+  // Count directed intra edges per community for reporting.
+  const intraCount = new Map<number, number>();
+  for (const e of edges) {
+    if (e.fromWallet === e.toWallet) continue;
+    const ca = det.communityOf.get(e.fromWallet);
+    if (ca === undefined || ca !== det.communityOf.get(e.toWallet)) continue;
+    intraCount.set(ca, (intraCount.get(ca) ?? 0) + 1);
+  }
+
   let intraEdgesDiscounted = 0;
   let weightRemovedTotal = 0;
   const discountedEdges = edges.map((e) => {
     if (e.fromWallet === e.toWallet) return e;
-    const ca = commOf.get(e.fromWallet);
-    const cb = commOf.get(e.toWallet);
-    if (ca === undefined || ca !== cb) return e;
+    const ca = det.communityOf.get(e.fromWallet);
+    if (ca === undefined || ca !== det.communityOf.get(e.toWallet)) return e;
     const mult = discountOf.get(ca) ?? 1;
     if (mult >= 1) return e;
     intraEdgesDiscounted++;
@@ -150,26 +211,91 @@ export function applyCocmDiscount(edges: RawEdge[], params: Partial<CocmParams> 
     return { ...e, weight: newWeight };
   });
 
-  // 6. Build the report, worst (lowest multiplier) first.
   const discountedClusters: ClusterReport[] = [];
   for (const [c, mult] of discountOf) {
     if (mult >= 1) continue;
     discountedClusters.push({
       community: c,
-      size: members.get(c)?.length ?? 0,
-      intraDirectedEdges: directedIntra.get(c)?.size ?? 0,
-      reciprocity: reciprocityOf.get(c) ?? 0,
+      size: det.sizeOf.get(c) ?? 0,
+      intraDirectedEdges: intraCount.get(c) ?? 0,
+      reciprocity: det.reciprocityOf.get(c) ?? 0,
       appliedDiscount: mult,
-      members: (members.get(c) ?? []).slice(0, 6),
+      members: (det.membersOf.get(c) ?? []).slice(0, 6),
     });
   }
   discountedClusters.sort((a, b) => a.appliedDiscount - b.appliedDiscount);
 
   return {
     edges: discountedEdges,
-    numCommunities,
+    numCommunities: det.numCommunities,
     discountedClusters,
     intraEdgesDiscounted,
     weightRemovedTotal,
+  };
+}
+
+// ── Posterior-path: feedback collapse ───────────────────────────────
+
+export interface CollapseResult {
+  /** Effective contribution after collapse — replaces the raw collusive sum. */
+  effectiveCollusiveWeight: number;
+  /** How much raw weight was removed (collusiveWeight − effective). */
+  weightRemoved: number;
+  /** Distinct collusive raters folded into one synthetic signal. */
+  collusiveActors: number;
+}
+
+/**
+ * Collapse a subject's same-cluster (collusive) feedback toward a single
+ * signal, scaled by the cluster's reciprocity.
+ *
+ *   effective = collusiveWeight·(1 − reciprocity) + singleSignal·reciprocity
+ *
+ * Reciprocity gates this: a one-directional star (legitimate hub endorsed
+ * by many independent raters who don't endorse each other) has reciprocity
+ * 0 and is left COMPLETELY untouched — Louvain groups it into one community
+ * by size, but size alone is not collusion. Only mutual-endorsement rings
+ * (reciprocity ≥ minReciprocity) are collapsed.
+ *
+ * @param subject        the agent receiving feedback
+ * @param actorWeights   rater wallet → raw feedback weight for this subject
+ * @param det            cluster detection result
+ * @param minReciprocity collapse only clusters at or above this reciprocity
+ * @returns null if the subject's cluster isn't collusive enough, has no
+ *          collusive raters, or nothing would be removed (caller leaves the
+ *          accumulator untouched)
+ */
+export function collapseCollusiveFeedback(
+  subject: string,
+  actorWeights: Map<string, number>,
+  det: ClusterDetection,
+  minReciprocity = 0.3,
+): CollapseResult | null {
+  const subjComm = det.communityOf.get(subject);
+  if (subjComm === undefined || !det.flagged.has(subjComm)) return null;
+
+  // Reciprocity gate — a legit star (reciprocity 0) is never collapsed.
+  const recip = det.reciprocityOf.get(subjComm) ?? 0;
+  if (recip < minReciprocity) return null;
+
+  let collusiveWeight = 0;
+  let collusiveActors = 0;
+  let singleSignal = 0;
+  for (const [actor, w] of actorWeights) {
+    if (det.communityOf.get(actor) === subjComm) {
+      collusiveWeight += w;
+      collusiveActors++;
+      if (w > singleSignal) singleSignal = w;
+    }
+  }
+  if (collusiveActors === 0 || collusiveWeight <= 0) return null;
+
+  const effective = collusiveWeight * (1 - recip) + singleSignal * recip;
+  if (effective >= collusiveWeight - 1e-9) return null; // nothing meaningful to remove
+
+  return {
+    effectiveCollusiveWeight: effective,
+    weightRemoved: Math.max(0, collusiveWeight - effective),
+    collusiveActors,
   };
 }

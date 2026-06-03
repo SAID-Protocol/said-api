@@ -23,15 +23,33 @@
  *   LIMIT=10000          # cap events processed (dry run / smoke test)
  *   WALLET=<wallet>      # only this subject (for debugging)
  *   SKIP_CLEAR=1         # don't truncate existing rows (incremental, advanced)
+ *   COCM=true            # Phase 3b: collapse collusive (reciprocal-cluster)
+ *                        # feedback toward a single signal before it inflates
+ *                        # the Beta posterior
+ *   COCM_MIN_CLUSTER=3   # min feedback-cluster size to collapse
  */
 import { PrismaClient } from '@prisma/client';
 import { applyEvent, halfLifeFor, shannonEntropy, updatePosterior } from '../src/reputation-v0.8/decay.js';
 import type { EventKind } from '../src/reputation-v0.8/kinds.js';
+import {
+  detectClusters,
+  collapseCollusiveFeedback,
+  type RawEdge,
+  type ClusterDetection,
+} from '../src/reputation-v0.8/cocm.js';
 
 const prisma = new PrismaClient();
 const LIMIT = process.env.LIMIT ? Number(process.env.LIMIT) : undefined;
 const WALLET = process.env.WALLET ?? null;
 const SKIP_CLEAR = process.env.SKIP_CLEAR === '1';
+// Phase 3b (posterior path): collapse collusive feedback toward a single
+// signal before it inflates a Beta posterior. Off by default.
+const COCM = process.env.COCM === 'true';
+const COCM_MIN_CLUSTER = Number(process.env.COCM_MIN_CLUSTER ?? 3);
+const COCM_MIN_RECIPROCITY = Number(process.env.COCM_MIN_RECIPROCITY ?? 0.3);
+// Endorsement kinds eligible for collapse. Positive-only — collapsing
+// negative feedback would help sybils, not hurt them.
+const COLLAPSE_KINDS = new Set<string>(['feedback_pos']);
 
 interface SignalKey {
   subjectWallet: string;
@@ -83,6 +101,27 @@ async function run() {
     ...(LIMIT ? { take: LIMIT } : {}),
   });
   console.log(`Loaded ${events.length} events. Building accumulators in memory...`);
+
+  // Detect collusive feedback clusters from the feedback graph (rater →
+  // subject). Reciprocity within these clusters drives how hard we collapse
+  // their feedback in the finalize pass below.
+  let detection: ClusterDetection | null = null;
+  if (COCM) {
+    const fbEdges: RawEdge[] = [];
+    for (const ev of events) {
+      if (COLLAPSE_KINDS.has(ev.kind) && ev.actorWallet && ev.actorWallet !== ev.subjectWallet) {
+        fbEdges.push({ fromWallet: ev.actorWallet, toWallet: ev.subjectWallet, edgeType: 'feedback', weight: ev.weight });
+      }
+    }
+    detection = detectClusters(fbEdges, { minClusterSize: COCM_MIN_CLUSTER });
+    const flaggedSizes = [...detection.flagged]
+      .map((c) => detection!.sizeOf.get(c) ?? 0)
+      .sort((a, b) => b - a);
+    console.log(
+      `COCM on: feedback graph ${fbEdges.length} edges, ${detection.numCommunities} communities, ` +
+        `${detection.flagged.size} flagged (sizes: ${flaggedSizes.slice(0, 5).join(', ')}…)`,
+    );
+  }
 
   // Accumulators keyed by (subjectWallet, axis, kind). Cold-start prior (α=2, β=2)
   // matches the schema default; ensures new accumulators see the same prior
@@ -150,6 +189,46 @@ async function run() {
     if (processed % 5000 === 0) {
       console.log(`  ${processed}/${events.length} processed, ${accs.size} accumulators so far`);
     }
+  }
+
+  // ── COCM finalize: collapse collusive feedback ───────────────────
+  // A ring member's silver tier rides mutual feedback inflating their
+  // delivery posterior. Collapse same-cluster feedback toward a single
+  // signal: α drops, and effectiveSamples (the tier sample-gate) craters.
+  if (COCM && detection) {
+    let collapsedAccs = 0;
+    let weightRemovedTotal = 0;
+    for (const [k, acc] of accs) {
+      const [subjectWallet, , kind] = k.split('|');
+      if (!COLLAPSE_KINDS.has(kind)) continue;
+      const res = collapseCollusiveFeedback(subjectWallet, acc.actorWeights, detection, COCM_MIN_RECIPROCITY);
+      if (!res) continue;
+
+      // feedback_pos is positive-only, so α − prior == Σ raw feedback weight.
+      const fullSum = Math.max(0, acc.alpha - COLD_START_ALPHA);
+      const removed = Math.min(res.weightRemoved, fullSum);
+      acc.alpha -= removed;
+      if (fullSum > 0) acc.decayedValue *= (fullSum - removed) / fullSum; // cosmetic; composite uses α/β
+
+      // Fold the collusive raters into one synthetic actor so uniqueActors
+      // and entropy reflect the collapse.
+      const subjComm = detection.communityOf.get(subjectWallet);
+      const kept = new Map<string, number>();
+      for (const [actor, w] of acc.actorWeights) {
+        if (detection.communityOf.get(actor) === subjComm) continue; // drop collusive
+        kept.set(actor, w);
+      }
+      if (res.effectiveCollusiveWeight > 0) {
+        kept.set(`cocm:collapsed:${subjComm}`, res.effectiveCollusiveWeight);
+      }
+      acc.actorWeights = kept;
+
+      collapsedAccs++;
+      weightRemovedTotal += removed;
+    }
+    console.log(
+      `COCM: collapsed ${collapsedAccs} feedback accumulator(s), removed ${weightRemovedTotal.toFixed(1)} collusive weight.`,
+    );
   }
 
   console.log(`\nWriting ${accs.size} ReputationSignal rows...`);
