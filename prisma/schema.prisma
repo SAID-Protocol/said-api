@@ -651,28 +651,42 @@ model AgentX402Activity {
 model AgentSaidEngagement {
   wallet                  String   @id
 
-  // Specific instruction counts (per Anchor discriminator)
-  registerCount           Int      @default(0)
-  getVerifiedCount        Int      @default(0)
-  submitFeedbackCount     Int      @default(0)
-  anchorReceiptCount      Int      @default(0)
+  // ── Identity lifecycle (every verified agent has these → 0 score weight)
+  registerCount           Int      @default(0) // register_agent
+  getVerifiedCount        Int      @default(0) // get_verified
+  registerAndStakeCount   Int      @default(0) // register_and_stake — economic commitment at registration
+  sponsorRegisterCount    Int      @default(0) // sponsor_register — sponsored agents
+  sponsorVerifyCount      Int      @default(0) // sponsor_verify
+  updateAgentCount        Int      @default(0) // update_agent — metadata update
+
+  // ── Active protocol participation (the meaningful signals)
+  submitAnchorCount       Int      @default(0) // submit_anchor — proof-of-work commit (strongest signal)
+  validateWorkCount       Int      @default(0) // validate_work — agent validating ANOTHER agent's work
+  submitFeedbackCount     Int      @default(0) // submit_feedback — peer endorsement
+
+  // ── Economic commitment
+  stakeCount              Int      @default(0) // stake — initial stake (separate from register_and_stake)
+  addStakeCount           Int      @default(0) // add_stake — top up stake post-registration
+  unstakeLifecycleCount   Int      @default(0) // aggregate: request/complete/cancel/emergency unstake
+
+  // ── Wallet linking
   linkWalletCount         Int      @default(0)
   unlinkWalletCount       Int      @default(0)
   transferAuthorityCount  Int      @default(0)
-  attestationCount        Int      @default(0)
-  updateMetadataCount     Int      @default(0)
-  // Calls into SAID program with a discriminator we don't recognize
+
+  // ── Negative signal
+  slashAgentCount         Int      @default(0) // slash_agent — agent was slashed
+
+  // ── Catch-all for any SAID program instruction we don't recognize
   otherSaidCount          Int      @default(0)
-  // Sum of the above (also used as a denominator)
   totalSaidInstructions   Int      @default(0)
 
   firstSaidInteractionAt  DateTime?
   lastSaidInteractionAt   DateTime?
-
-  // How far back we scanned (so we don't re-scan history we've covered)
   scannedUpToSignature    String?
   syncedAt                DateTime @default(now())
 
   @@index([totalSaidInstructions])
+  @@index([submitAnchorCount])
   @@index([syncedAt])
 }

@@ -90,13 +90,28 @@ export interface V7LaunchedTokenStats {
  * identity sub-signal is high.
  */
 export interface V7SaidEngagementStats {
+  // Identity lifecycle (every verified agent has these → 0 score weight)
   registerCount: number;
   getVerifiedCount: number;
+  registerAndStakeCount: number;
+  sponsorRegisterCount: number;
+  sponsorVerifyCount: number;
+  updateAgentCount: number;
+  // Active protocol participation (the meaningful signals)
+  submitAnchorCount: number;
+  validateWorkCount: number;
   submitFeedbackCount: number;
-  anchorReceiptCount: number;
+  // Economic commitment
+  stakeCount: number;
+  addStakeCount: number;
+  unstakeLifecycleCount: number;
+  // Wallet linking
   linkWalletCount: number;
-  attestationCount: number;
-  updateMetadataCount: number;
+  unlinkWalletCount: number;
+  transferAuthorityCount: number;
+  // Negative
+  slashAgentCount: number;
+  // Catch-all
   otherSaidCount: number;
   totalSaidInstructions: number;
 }
@@ -322,31 +337,43 @@ function computeEcosystemSubscore(agent: AgentLike): number {
 /**
  * Reward agents who actually use SAID program infrastructure.
  *
- * Weighting rationale:
- *   - anchored receipts (4 pts max) = on-chain proof-of-work; strongest single signal
- *   - outgoing peer feedback (3 pts max) = active participation in reputation graph
- *   - attestations (2 pts max) = curating other agents
- *   - layer-2 verifies / link-wallets (1 pt max) = lifecycle but bounded
- *   - generic/other SAID instructions (0.5 pts) = catch-all
+ * Instruction names are verbatim from programs/said/src/lib.rs in
+ * SAID-Protocol/said. The weighting reflects what each instruction
+ * *means* about the agent — not all SAID calls are equal.
  *
- * register_agent intentionally NOT rewarded — every verified agent
- * registered once. It's a precondition, not a signal.
+ * Weighting (max contribution shown, log-scaled so a prolific power
+ * user can't eclipse everyone):
+ *   - submit_anchor      → 4 pts max  : on-chain proof-of-work commit
+ *   - validate_work      → 3 pts max  : validating ANOTHER agent's task
+ *   - submit_feedback    → 2 pts max  : peer endorsement (outgoing)
+ *   - stake events       → 1.5 pts    : capital commitment (stake/add_stake/register_and_stake)
+ *   - update_agent       → 0.5 pts    : maintaining presence
+ *   - link_wallet        → 0.3 pts    : wallet lifecycle
+ *   - other SAID calls   → 0.5 pts    : catch-all for sponsor variants etc.
  *
- * Log scaling so 1→10 anchors swings 2 points but 100→1000 only swings
- * ~1 more; rewards meaningful usage without making 1 prolific user
- * eclipse everyone else.
+ * Intentionally NOT rewarded (0 pts):
+ *   - register_agent, get_verified — every verified agent has these.
+ *     Counting them would just measure "did you complete onboarding."
+ *   - sponsor_register, sponsor_verify — counted in "other" because
+ *     someone else paid; not a signal *about* this agent's engagement.
+ *
+ * slash_agent is *negative* and applied as a flat penalty.
  */
 function computeSaidEngagementSubscore(stats: V7SaidEngagementStats | undefined): number {
   if (!stats || stats.totalSaidInstructions === 0) return 0;
   const log2 = (n: number) => (n <= 0 ? 0 : Math.log2(n + 1));
   let raw = 0;
-  raw += Math.min(4, log2(stats.anchorReceiptCount) * 1.0);
-  raw += Math.min(3, log2(stats.submitFeedbackCount) * 0.8);
-  raw += Math.min(2, log2(stats.attestationCount) * 0.7);
-  raw += Math.min(1, log2(stats.getVerifiedCount) * 0.5);
-  raw += Math.min(1, log2(stats.linkWalletCount) * 0.5);
-  raw += Math.min(0.5, log2(stats.updateMetadataCount) * 0.25);
+  raw += Math.min(4, log2(stats.submitAnchorCount) * 1.0);
+  raw += Math.min(3, log2(stats.validateWorkCount) * 0.9);
+  raw += Math.min(2, log2(stats.submitFeedbackCount) * 0.8);
+  const stakeEvents =
+    stats.stakeCount + stats.addStakeCount + stats.registerAndStakeCount;
+  raw += Math.min(1.5, log2(stakeEvents) * 0.6);
+  raw += Math.min(0.5, log2(stats.updateAgentCount) * 0.25);
+  raw += Math.min(0.3, log2(stats.linkWalletCount) * 0.2);
   raw += Math.min(0.5, log2(stats.otherSaidCount) * 0.2);
+  // Negative signal: being slashed at least once knocks ~2 pts off.
+  raw -= Math.min(3, stats.slashAgentCount * 2);
   return Math.max(0, Math.min(10, raw));
 }
 

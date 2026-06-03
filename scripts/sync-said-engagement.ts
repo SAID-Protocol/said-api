@@ -4,35 +4,28 @@
  * instruction discriminator, and persist per-wallet aggregate counts
  * to AgentSaidEngagement.
  *
+ * Source-of-truth for instruction names: SAID-Protocol/said
+ * programs/said/src/lib.rs. There are 21 instructions; this script
+ * tracks the 20 relevant ones (initialize_treasury is admin-only).
+ *
  * What this fuels:
  *   The v0.7.1 said_engagement sub-signal in reputation-engine-v7.ts.
  *   Lets us distinguish an agent that actually USES SAID (anchors
- *   receipts, submits feedback) from one that only registered and
- *   filled out a profile.
- *
- * Why this matters:
- *   In the first v0.7 comparison run, ~36% of verified agents landed
- *   in silver based purely on "registered + verified + filled profile
- *   + minimal generic on-chain activity." That's exactly the
- *   "registration tourist" failure mode this sub-signal kills.
- *
- * Strategy:
- *   For each wallet, page through signatures via Alchemy until we
- *   either (a) reach the previously-scanned signature (incremental
- *   resume) or (b) hit our scan budget. For each batch of signatures,
- *   call getParsedTransactions and inspect both top-level instructions
- *   and inner instructions for any with programId == SAID_PROGRAM_ID.
- *   Classify the instruction by the first 8 bytes of its data (Anchor
- *   discriminator).
+ *   receipts, validates work, submits feedback, stakes) from one
+ *   that only registered and filled out a profile.
  *
  * Usage:
  *   DATABASE_URL=...  ALCHEMY_SOLANA_RPC_URL=... \
  *     npx tsx scripts/sync-said-engagement.ts
  *
  * Optional env:
- *   LIMIT=200                # cap on agents processed
- *   CONCURRENCY=4            # parallel wallet workers
- *   MAX_SIGS_PER_WALLET=1000 # scan budget per wallet (oldest-newest)
+ *   LIMIT=200                    # cap on agents processed
+ *   CONCURRENCY=2                # parallel wallet workers (default lowered to 2
+ *                                # to be polite to Alchemy's 2300 CUPS plan)
+ *   MAX_SIGS_PER_WALLET=1000     # scan budget per wallet (oldest-newest)
+ *   PARSED_TX_CHUNK=100          # how many tx sigs to parse per batch — keep
+ *                                # ≤100 to avoid 413 Payload Too Large from
+ *                                # Alchemy on high-volume wallets
  */
 import { PrismaClient } from '@prisma/client';
 import { Connection, PublicKey } from '@solana/web3.js';
@@ -48,50 +41,73 @@ const SOLANA_RPC_URL =
   process.env.SOLANA_RPC_URL ||
   'https://api.mainnet-beta.solana.com';
 const LIMIT = process.env.LIMIT ? Number(process.env.LIMIT) : null;
-const CONCURRENCY = Number(process.env.CONCURRENCY ?? 4);
+const CONCURRENCY = Number(process.env.CONCURRENCY ?? 2);
 const MAX_SIGS_PER_WALLET = Number(process.env.MAX_SIGS_PER_WALLET ?? 1000);
-const SIG_PAGE = 1000; // Alchemy maxes at 1000 per getSignaturesForAddress call
+const SIG_PAGE = 1000;
+const PARSED_TX_CHUNK = Number(process.env.PARSED_TX_CHUNK ?? 100);
 
-// Compute Anchor discriminators on startup: first 8 bytes of
-// sha256("global:<instruction_name>"). Source: Anchor framework.
+// Compute Anchor discriminators: first 8 bytes of
+// sha256("global:<instruction_name>"). All names below are copied
+// verbatim from programs/said/src/lib.rs in SAID-Protocol/said.
 function discriminatorFor(instructionName: string): string {
   const hash = createHash('sha256').update(`global:${instructionName}`).digest();
   return hash.subarray(0, 8).toString('hex');
 }
 
-const KNOWN_INSTRUCTIONS: Record<string, string> = {
+// All 20 user-callable instructions (initialize_treasury excluded — admin-only).
+const KNOWN_INSTRUCTIONS = {
+  // Identity lifecycle
   register_agent: discriminatorFor('register_agent'),
   get_verified: discriminatorFor('get_verified'),
+  register_and_stake: discriminatorFor('register_and_stake'),
+  sponsor_register: discriminatorFor('sponsor_register'),
+  sponsor_verify: discriminatorFor('sponsor_verify'),
+  update_agent: discriminatorFor('update_agent'),
+  // Active protocol participation
+  submit_anchor: discriminatorFor('submit_anchor'),
+  validate_work: discriminatorFor('validate_work'),
   submit_feedback: discriminatorFor('submit_feedback'),
-  anchor_receipt: discriminatorFor('anchor_receipt'),
+  // Economic commitment
+  stake: discriminatorFor('stake'),
+  add_stake: discriminatorFor('add_stake'),
+  request_unstake: discriminatorFor('request_unstake'),
+  complete_unstake: discriminatorFor('complete_unstake'),
+  cancel_unstake: discriminatorFor('cancel_unstake'),
+  emergency_unstake: discriminatorFor('emergency_unstake'),
+  // Wallet linking
   link_wallet: discriminatorFor('link_wallet'),
   unlink_wallet: discriminatorFor('unlink_wallet'),
   transfer_authority: discriminatorFor('transfer_authority'),
-  attest: discriminatorFor('attest'),
-  attest_agent: discriminatorFor('attest_agent'),
-  create_attestation: discriminatorFor('create_attestation'),
-  update_metadata: discriminatorFor('update_metadata'),
-  update_agent: discriminatorFor('update_agent'),
-};
+  // Admin / negative
+  withdraw_fees: discriminatorFor('withdraw_fees'),
+  slash_agent: discriminatorFor('slash_agent'),
+} as const;
 
-// Reverse map for fast lookup: discriminator hex → instruction name
-const DISCRIMINATOR_TO_NAME = new Map<string, string>();
+// Reverse lookup: discriminator hex → instruction name
+const DISCRIMINATOR_TO_NAME = new Map<string, keyof typeof KNOWN_INSTRUCTIONS>();
 for (const [name, disc] of Object.entries(KNOWN_INSTRUCTIONS)) {
-  DISCRIMINATOR_TO_NAME.set(disc, name);
+  DISCRIMINATOR_TO_NAME.set(disc, name as keyof typeof KNOWN_INSTRUCTIONS);
 }
 
 interface InstructionCounts {
-  register: number;
-  getVerified: number;
-  submitFeedback: number;
-  anchorReceipt: number;
-  linkWallet: number;
-  unlinkWallet: number;
-  transferAuthority: number;
-  attestation: number;
-  updateMetadata: number;
-  other: number;
-  total: number;
+  registerCount: number;
+  getVerifiedCount: number;
+  registerAndStakeCount: number;
+  sponsorRegisterCount: number;
+  sponsorVerifyCount: number;
+  updateAgentCount: number;
+  submitAnchorCount: number;
+  validateWorkCount: number;
+  submitFeedbackCount: number;
+  stakeCount: number;
+  addStakeCount: number;
+  unstakeLifecycleCount: number;
+  linkWalletCount: number;
+  unlinkWalletCount: number;
+  transferAuthorityCount: number;
+  slashAgentCount: number;
+  otherSaidCount: number;
+  totalSaidInstructions: number;
   firstAt: Date | null;
   lastAt: Date | null;
   lastSigScanned: string | null;
@@ -99,27 +115,30 @@ interface InstructionCounts {
 
 function emptyCounts(): InstructionCounts {
   return {
-    register: 0,
-    getVerified: 0,
-    submitFeedback: 0,
-    anchorReceipt: 0,
-    linkWallet: 0,
-    unlinkWallet: 0,
-    transferAuthority: 0,
-    attestation: 0,
-    updateMetadata: 0,
-    other: 0,
-    total: 0,
+    registerCount: 0,
+    getVerifiedCount: 0,
+    registerAndStakeCount: 0,
+    sponsorRegisterCount: 0,
+    sponsorVerifyCount: 0,
+    updateAgentCount: 0,
+    submitAnchorCount: 0,
+    validateWorkCount: 0,
+    submitFeedbackCount: 0,
+    stakeCount: 0,
+    addStakeCount: 0,
+    unstakeLifecycleCount: 0,
+    linkWalletCount: 0,
+    unlinkWalletCount: 0,
+    transferAuthorityCount: 0,
+    slashAgentCount: 0,
+    otherSaidCount: 0,
+    totalSaidInstructions: 0,
     firstAt: null,
     lastAt: null,
     lastSigScanned: null,
   };
 }
 
-/**
- * Decode an instruction's data field and return its discriminator hex,
- * or null if the data is too short / un-decodable.
- */
 function discriminatorOf(data: string | undefined | null): string | null {
   if (!data) return null;
   try {
@@ -132,45 +151,70 @@ function discriminatorOf(data: string | undefined | null): string | null {
 }
 
 function classifyAndIncrement(counts: InstructionCounts, discHex: string | null): void {
-  counts.total++;
+  counts.totalSaidInstructions++;
   if (!discHex) {
-    counts.other++;
+    counts.otherSaidCount++;
     return;
   }
   const name = DISCRIMINATOR_TO_NAME.get(discHex);
   switch (name) {
     case 'register_agent':
-      counts.register++;
+      counts.registerCount++;
       break;
     case 'get_verified':
-      counts.getVerified++;
+      counts.getVerifiedCount++;
+      break;
+    case 'register_and_stake':
+      counts.registerAndStakeCount++;
+      break;
+    case 'sponsor_register':
+      counts.sponsorRegisterCount++;
+      break;
+    case 'sponsor_verify':
+      counts.sponsorVerifyCount++;
+      break;
+    case 'update_agent':
+      counts.updateAgentCount++;
+      break;
+    case 'submit_anchor':
+      counts.submitAnchorCount++;
+      break;
+    case 'validate_work':
+      counts.validateWorkCount++;
       break;
     case 'submit_feedback':
-      counts.submitFeedback++;
+      counts.submitFeedbackCount++;
       break;
-    case 'anchor_receipt':
-      counts.anchorReceipt++;
+    case 'stake':
+      counts.stakeCount++;
+      break;
+    case 'add_stake':
+      counts.addStakeCount++;
+      break;
+    case 'request_unstake':
+    case 'complete_unstake':
+    case 'cancel_unstake':
+    case 'emergency_unstake':
+      counts.unstakeLifecycleCount++;
       break;
     case 'link_wallet':
-      counts.linkWallet++;
+      counts.linkWalletCount++;
       break;
     case 'unlink_wallet':
-      counts.unlinkWallet++;
+      counts.unlinkWalletCount++;
       break;
     case 'transfer_authority':
-      counts.transferAuthority++;
+      counts.transferAuthorityCount++;
       break;
-    case 'attest':
-    case 'attest_agent':
-    case 'create_attestation':
-      counts.attestation++;
+    case 'slash_agent':
+      counts.slashAgentCount++;
       break;
-    case 'update_metadata':
-    case 'update_agent':
-      counts.updateMetadata++;
+    case 'withdraw_fees':
+      // admin-only, not relevant to engagement signal
+      counts.otherSaidCount++;
       break;
     default:
-      counts.other++;
+      counts.otherSaidCount++;
   }
 }
 
@@ -190,46 +234,44 @@ async function scanWallet(conn: Connection, wallet: string): Promise<Instruction
     if (sigs.length === 0) break;
     if (newestSig === null) newestSig = sigs[0].signature;
 
-    // Batch fetch parsed transactions — getParsedTransactions accepts an
-    // array of signatures and returns the same length array of results.
-    const txs = await conn.getParsedTransactions(
-      sigs.map((s) => s.signature),
-      { maxSupportedTransactionVersion: 0 },
-    );
+    // Process signatures in smaller chunks for getParsedTransactions to
+    // avoid 413 Payload Too Large on high-volume wallets like Xona.
+    for (let off = 0; off < sigs.length; off += PARSED_TX_CHUNK) {
+      const chunk = sigs.slice(off, off + PARSED_TX_CHUNK);
+      const txs = await conn.getParsedTransactions(
+        chunk.map((s) => s.signature),
+        { maxSupportedTransactionVersion: 0 },
+      );
 
-    for (let i = 0; i < txs.length; i++) {
-      const tx = txs[i];
-      if (!tx) continue;
-      const sig = sigs[i];
-      const blockTime = sig.blockTime ? new Date(sig.blockTime * 1000) : null;
+      for (let i = 0; i < txs.length; i++) {
+        const tx = txs[i];
+        if (!tx) continue;
+        const sig = chunk[i];
+        const blockTime = sig.blockTime ? new Date(sig.blockTime * 1000) : null;
 
-      // Top-level instructions
-      const topIxs = tx.transaction.message.instructions;
-      // Plus all inner instructions
-      const innerIxs = tx.meta?.innerInstructions?.flatMap((ii) => ii.instructions) ?? [];
+        const topIxs = tx.transaction.message.instructions;
+        const innerIxs =
+          tx.meta?.innerInstructions?.flatMap((ii) => ii.instructions) ?? [];
 
-      for (const ix of [...topIxs, ...innerIxs]) {
-        const pidStr = 'programId' in ix ? ix.programId.toBase58() : null;
-        if (pidStr !== SAID_PROGRAM_ID_STR) continue;
+        for (const ix of [...topIxs, ...innerIxs]) {
+          const pidStr = 'programId' in ix ? ix.programId.toBase58() : null;
+          if (pidStr !== SAID_PROGRAM_ID_STR) continue;
 
-        // Raw (un-parsed Anchor) instruction has a `data` base58 field.
-        // Parsed instructions (rare for Anchor without IDL) have a
-        // `parsed` field instead — count as "other" since we can't see
-        // the discriminator easily.
-        const rawData =
-          'data' in ix && typeof ix.data === 'string' ? ix.data : null;
-        const disc = discriminatorOf(rawData);
-        classifyAndIncrement(counts, disc);
+          const rawData =
+            'data' in ix && typeof ix.data === 'string' ? ix.data : null;
+          const disc = discriminatorOf(rawData);
+          classifyAndIncrement(counts, disc);
 
-        if (blockTime) {
-          if (!counts.firstAt || blockTime < counts.firstAt) counts.firstAt = blockTime;
-          if (!counts.lastAt || blockTime > counts.lastAt) counts.lastAt = blockTime;
+          if (blockTime) {
+            if (!counts.firstAt || blockTime < counts.firstAt) counts.firstAt = blockTime;
+            if (!counts.lastAt || blockTime > counts.lastAt) counts.lastAt = blockTime;
+          }
         }
       }
     }
 
     scannedSigs += sigs.length;
-    if (sigs.length < SIG_PAGE) break; // exhausted history
+    if (sigs.length < SIG_PAGE) break;
     before = sigs[sigs.length - 1].signature;
   }
 
@@ -238,22 +280,27 @@ async function scanWallet(conn: Connection, wallet: string): Promise<Instruction
 }
 
 async function persist(wallet: string, counts: InstructionCounts): Promise<void> {
-  // Don't write rows for agents with zero SAID activity — keeps the
-  // table sparse. Engine treats missing as zero.
-  if (counts.total === 0) return;
+  if (counts.totalSaidInstructions === 0) return;
 
   const data = {
-    registerCount: counts.register,
-    getVerifiedCount: counts.getVerified,
-    submitFeedbackCount: counts.submitFeedback,
-    anchorReceiptCount: counts.anchorReceipt,
-    linkWalletCount: counts.linkWallet,
-    unlinkWalletCount: counts.unlinkWallet,
-    transferAuthorityCount: counts.transferAuthority,
-    attestationCount: counts.attestation,
-    updateMetadataCount: counts.updateMetadata,
-    otherSaidCount: counts.other,
-    totalSaidInstructions: counts.total,
+    registerCount: counts.registerCount,
+    getVerifiedCount: counts.getVerifiedCount,
+    registerAndStakeCount: counts.registerAndStakeCount,
+    sponsorRegisterCount: counts.sponsorRegisterCount,
+    sponsorVerifyCount: counts.sponsorVerifyCount,
+    updateAgentCount: counts.updateAgentCount,
+    submitAnchorCount: counts.submitAnchorCount,
+    validateWorkCount: counts.validateWorkCount,
+    submitFeedbackCount: counts.submitFeedbackCount,
+    stakeCount: counts.stakeCount,
+    addStakeCount: counts.addStakeCount,
+    unstakeLifecycleCount: counts.unstakeLifecycleCount,
+    linkWalletCount: counts.linkWalletCount,
+    unlinkWalletCount: counts.unlinkWalletCount,
+    transferAuthorityCount: counts.transferAuthorityCount,
+    slashAgentCount: counts.slashAgentCount,
+    otherSaidCount: counts.otherSaidCount,
+    totalSaidInstructions: counts.totalSaidInstructions,
     firstSaidInteractionAt: counts.firstAt,
     lastSaidInteractionAt: counts.lastAt,
     scannedUpToSignature: counts.lastSigScanned,
@@ -268,16 +315,20 @@ async function persist(wallet: string, counts: InstructionCounts): Promise<void>
 }
 
 async function run() {
-  console.log(`Loading verified SAID agents (alchemy=${SOLANA_RPC_URL.includes('alchemy')})...`);
+  console.log(
+    `Loading verified SAID agents (rpc=${
+      SOLANA_RPC_URL.includes('alchemy') ? 'alchemy' : 'public'
+    })...`,
+  );
   const agents = await prisma.agent.findMany({
     where: { isVerified: true },
     select: { wallet: true },
     ...(LIMIT ? { take: LIMIT } : {}),
   });
   console.log(
-    `Scanning ${agents.length} agents (concurrency=${CONCURRENCY}, max_sigs/wallet=${MAX_SIGS_PER_WALLET})\n`,
+    `Scanning ${agents.length} agents (concurrency=${CONCURRENCY}, max_sigs/wallet=${MAX_SIGS_PER_WALLET}, parsed_tx_chunk=${PARSED_TX_CHUNK})\n`,
   );
-  console.log('Known Anchor discriminators:');
+  console.log('Known SAID Anchor discriminators (from programs/said/src/lib.rs):');
   for (const [name, disc] of Object.entries(KNOWN_INSTRUCTIONS)) {
     console.log(`  ${name.padEnd(22)} ${disc}`);
   }
@@ -286,7 +337,7 @@ async function run() {
   const startedAt = Date.now();
   let processed = 0;
   let withActivity = 0;
-  let errors = 0;
+  const failedWallets: Array<{ wallet: string; reason: string }> = [];
   const tallies: Record<string, number> = {};
   const conn = new Connection(SOLANA_RPC_URL, 'confirmed');
 
@@ -300,21 +351,22 @@ async function run() {
         try {
           const counts = await scanWallet(conn, wallet);
           await persist(wallet, counts);
-          if (counts.total > 0) withActivity++;
+          if (counts.totalSaidInstructions > 0) withActivity++;
           for (const [k, v] of Object.entries(counts)) {
-            if (typeof v === 'number' && k !== 'total') {
+            if (typeof v === 'number' && k !== 'totalSaidInstructions') {
               tallies[k] = (tallies[k] ?? 0) + v;
             }
           }
         } catch (err: any) {
-          errors++;
-          console.error(`  ${wallet}: ${err?.message ?? err}`);
+          const reason = err?.message ? String(err.message).slice(0, 120) : String(err);
+          failedWallets.push({ wallet, reason });
+          console.error(`  ${wallet}: ${reason}`);
         }
         processed++;
         if (processed % 100 === 0) {
           const el = Math.round((Date.now() - startedAt) / 1000);
           console.log(
-            `  ${processed}/${agents.length} (${el}s elapsed, with_activity=${withActivity}, errors=${errors})`,
+            `  ${processed}/${agents.length} (${el}s elapsed, with_activity=${withActivity}, errors=${failedWallets.length})`,
           );
         }
       }
@@ -322,23 +374,71 @@ async function run() {
   );
 
   const elapsed = Math.round((Date.now() - startedAt) / 1000);
-  console.log(`\nDone in ${elapsed}s. processed=${processed} with_activity=${withActivity} errors=${errors}\n`);
+  console.log(
+    `\nDone in ${elapsed}s. processed=${processed} with_activity=${withActivity} errors=${failedWallets.length}\n`,
+  );
+
   console.log('Aggregate counts across all scanned agents:');
-  for (const [k, v] of Object.entries(tallies).sort((a, b) => b[1] - a[1])) {
-    console.log(`  ${k.padEnd(22)} ${v}`);
+  const ordered = [
+    'submitAnchorCount',
+    'validateWorkCount',
+    'submitFeedbackCount',
+    'registerAndStakeCount',
+    'stakeCount',
+    'addStakeCount',
+    'unstakeLifecycleCount',
+    'sponsorRegisterCount',
+    'sponsorVerifyCount',
+    'updateAgentCount',
+    'linkWalletCount',
+    'unlinkWalletCount',
+    'transferAuthorityCount',
+    'slashAgentCount',
+    'registerCount',
+    'getVerifiedCount',
+    'otherSaidCount',
+  ];
+  for (const k of ordered) {
+    const v = tallies[k] ?? 0;
+    console.log(`  ${k.padEnd(24)} ${v}`);
   }
 
-  // Top 10 agents by total SAID engagement
   const top = await prisma.agentSaidEngagement.findMany({
-    orderBy: { totalSaidInstructions: 'desc' },
-    take: 10,
+    orderBy: [
+      { submitAnchorCount: 'desc' },
+      { validateWorkCount: 'desc' },
+      { totalSaidInstructions: 'desc' },
+    ],
+    take: 15,
   });
   if (top.length > 0) {
-    console.log(`\nTop 10 agents by total SAID instructions:`);
+    console.log(`\nTop 15 agents by submit_anchor (then validate_work, then total):`);
+    console.log(
+      `  ${'wallet'.padEnd(46)} anchor  valid  feedback  stake_evts  other  total`,
+    );
     for (const t of top) {
+      const stakeEvts = t.registerAndStakeCount + t.stakeCount + t.addStakeCount;
       console.log(
-        `  ${t.wallet}  total=${t.totalSaidInstructions}  anchors=${t.anchorReceiptCount}  feedback=${t.submitFeedbackCount}  other=${t.otherSaidCount}`,
+        `  ${t.wallet.padEnd(46)} ${String(t.submitAnchorCount).padStart(6)}  ${String(t.validateWorkCount).padStart(5)}  ${String(t.submitFeedbackCount).padStart(8)}  ${String(stakeEvts).padStart(10)}  ${String(t.otherSaidCount).padStart(5)}  ${t.totalSaidInstructions}`,
       );
+    }
+  }
+
+  if (failedWallets.length > 0) {
+    console.log(`\n${failedWallets.length} wallets failed (re-run separately):`);
+    const byReason: Record<string, string[]> = {};
+    for (const f of failedWallets) {
+      const key = f.reason.includes('413')
+        ? '413 Payload Too Large'
+        : f.reason.includes('429')
+          ? '429 rate limited'
+          : f.reason.slice(0, 40);
+      (byReason[key] ??= []).push(f.wallet);
+    }
+    for (const [reason, wallets] of Object.entries(byReason)) {
+      console.log(`  ${reason}: ${wallets.length} wallet(s)`);
+      for (const w of wallets.slice(0, 10)) console.log(`    ${w}`);
+      if (wallets.length > 10) console.log(`    ... +${wallets.length - 10} more`);
     }
   }
 
