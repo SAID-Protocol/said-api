@@ -608,6 +608,83 @@ app.get('/api/agents', async (c) => {
   return c.json({ agents: agentsOut, total, limit: parseInt(limit || '50'), offset: parseInt(offset || '0') });
 });
 
+// ── Top agents leaderboard, ranked by reputation v0.8 ───────────────
+// GET /api/agents/top?by=reputation|trust&limit=20&verified=true
+//
+// Ranks by ReputationPosterior — NOT the stored Agent.reputationScore. That
+// field is the feedback-driven v0.6 value (Xona's is 0, the atelierai sybil
+// cluster's is inflated), so ordering by it puts the wrong agents on top.
+//   by=reputation → order by compositeScore (the headline v8 score)
+//   by=trust      → order by eigentrustScore (graph trust; Xona = 1.0)
+app.get('/api/agents/top', async (c) => {
+  const by = c.req.query('by') === 'trust' ? 'trust' : 'reputation';
+  const limit = Math.min(parseInt(c.req.query('limit') || '20'), 100);
+  const verifiedOnly = c.req.query('verified') === 'true';
+
+  try {
+    // One posterior row per wallet (identity axis exists for every agent),
+    // ordered by the requested v8 metric. Over-fetch when filtering to verified.
+    const orderBy = by === 'trust' ? { eigentrustScore: 'desc' as const } : { compositeScore: 'desc' as const };
+    const topRows = await prisma.reputationPosterior.findMany({
+      where: { axis: 'identity' },
+      orderBy,
+      take: verifiedOnly ? limit * 5 : limit,
+      select: { subjectWallet: true },
+    });
+    const wallets = topRows.map((r) => r.subjectWallet);
+
+    const [repMap, agents] = await Promise.all([
+      getV8ReputationBatch(prisma, wallets),
+      prisma.agent.findMany({
+        where: { wallet: { in: wallets }, ...(verifiedOnly ? { isVerified: true } : {}) },
+        include: {
+          _count: { select: { feedbackReceived: true } },
+          trustScore: {
+            select: {
+              score: true, tier: true, badges: true, sources: true, identity: true,
+              activity: true, economic: true, ecosystem: true, longevity: true,
+              fairscale: true, computedAt: true,
+            },
+          },
+        },
+      }),
+    ]);
+    const agentByWallet = new Map(agents.map((a) => [a.wallet, a]));
+
+    const TS_SKELETON = {
+      score: 0, tier: 'unranked', badges: [] as string[], sources: [] as string[],
+      identity: 0, activity: 0, economic: 0, ecosystem: 0, longevity: 0, fairscale: 0,
+      computedAt: null as Date | null,
+    };
+
+    // Preserve the v8 ranking order; skip wallets with no agent record.
+    const out: any[] = [];
+    for (const w of wallets) {
+      const a = agentByWallet.get(w);
+      const rep = repMap.get(w);
+      if (!a || !rep || !rep.found) continue;
+      const v8Score100 = Math.round(rep.compositeScore * 100);
+      out.push({
+        ...a,
+        reputationScore: Number((rep.compositeScore * 100).toFixed(1)),
+        trustScore: { ...TS_SKELETON, ...((a as any).trustScore ?? {}), tier: rep.tier, score: v8Score100 },
+        reputation: {
+          tier: rep.tier,
+          compositeScore: Number(rep.compositeScore.toFixed(4)),
+          eigentrustScore: Number(rep.eigentrustScore.toFixed(4)),
+          scored: true,
+        },
+      });
+      if (out.length >= limit) break;
+    }
+
+    return c.json({ agents: out, by, limit, count: out.length });
+  } catch (err) {
+    console.error('[/api/agents/top] failed', err);
+    return c.json({ agents: [], by, limit, count: 0, error: 'ranking_unavailable' });
+  }
+});
+
 // Get single agent profile
 app.get('/api/agents/:wallet', async (c) => {
   const wallet = c.req.param('wallet');
