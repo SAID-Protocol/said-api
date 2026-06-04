@@ -299,3 +299,56 @@ export function collapseCollusiveFeedback(
     collusiveActors,
   };
 }
+
+/**
+ * Mutual-pair feedback collapse — the sharper, partition-immune variant.
+ *
+ * A rater R of subject X is COLLUSIVE iff X also left feedback for R (the
+ * pair mutually endorse). Genuine feedback is one-directional — a happy
+ * customer endorses X; X doesn't review them back — so legit hubs have zero
+ * mutual raters and are untouched. A mutual-admiration RING is dense with
+ * mutual pairs, so its members' feedback collapses hard.
+ *
+ * Unlike the Louvain-community variant, this doesn't care how the graph is
+ * partitioned: it looks only at the direct X↔R reciprocal relationship, so
+ * cross-sub-cluster back-scratching can't escape it.
+ *
+ * The whole mutual group collapses to the value of a SINGLE signal (the
+ * doc's "feedback from a clustered ring collapses toward the value of a
+ * single signal") — N mutual endorsements count as one.
+ *
+ * @param actorWeights   rater wallet → raw feedback weight for this subject
+ * @param subjectEndorsed wallets THIS subject left feedback for (the X→· set)
+ * @param minMutual      need at least this many mutual raters to collapse
+ *                       (a single reciprocal pair is plausibly legit)
+ * @returns null if fewer than minMutual mutual raters (leave untouched)
+ */
+export function collapseMutualFeedback(
+  actorWeights: Map<string, number>,
+  subjectEndorsed: Set<string>,
+  minMutual = 2,
+): CollapseResult | null {
+  if (subjectEndorsed.size === 0) return null;
+
+  let collusiveWeight = 0;
+  let collusiveActors = 0;
+  let singleSignal = 0;
+  for (const [actor, w] of actorWeights) {
+    if (subjectEndorsed.has(actor)) {
+      collusiveWeight += w;
+      collusiveActors++;
+      if (w > singleSignal) singleSignal = w;
+    }
+  }
+  if (collusiveActors < minMutual || collusiveWeight <= 0) return null;
+
+  // Full collapse: the mutual group is worth one endorsement.
+  const effective = singleSignal;
+  if (effective >= collusiveWeight - 1e-9) return null;
+
+  return {
+    effectiveCollusiveWeight: effective,
+    weightRemoved: Math.max(0, collusiveWeight - effective),
+    collusiveActors,
+  };
+}

@@ -26,27 +26,21 @@
  *   COCM=true            # Phase 3b: collapse collusive (reciprocal-cluster)
  *                        # feedback toward a single signal before it inflates
  *                        # the Beta posterior
- *   COCM_MIN_CLUSTER=3   # min feedback-cluster size to collapse
+ *   COCM_MIN_MUTUAL=2    # min mutual raters before a subject's feedback collapses
  */
 import { PrismaClient } from '@prisma/client';
 import { applyEvent, halfLifeFor, shannonEntropy, updatePosterior } from '../src/reputation-v0.8/decay.js';
 import type { EventKind } from '../src/reputation-v0.8/kinds.js';
-import {
-  detectClusters,
-  collapseCollusiveFeedback,
-  type RawEdge,
-  type ClusterDetection,
-} from '../src/reputation-v0.8/cocm.js';
+import { collapseMutualFeedback } from '../src/reputation-v0.8/cocm.js';
 
 const prisma = new PrismaClient();
 const LIMIT = process.env.LIMIT ? Number(process.env.LIMIT) : undefined;
 const WALLET = process.env.WALLET ?? null;
 const SKIP_CLEAR = process.env.SKIP_CLEAR === '1';
-// Phase 3b (posterior path): collapse collusive feedback toward a single
-// signal before it inflates a Beta posterior. Off by default.
+// Phase 3b (posterior path): collapse mutually-endorsed (collusive) feedback
+// toward a single signal before it inflates a Beta posterior. Off by default.
 const COCM = process.env.COCM === 'true';
-const COCM_MIN_CLUSTER = Number(process.env.COCM_MIN_CLUSTER ?? 3);
-const COCM_MIN_RECIPROCITY = Number(process.env.COCM_MIN_RECIPROCITY ?? 0.3);
+const COCM_MIN_MUTUAL = Number(process.env.COCM_MIN_MUTUAL ?? 2);
 // Endorsement kinds eligible for collapse. Positive-only — collapsing
 // negative feedback would help sybils, not hurt them.
 const COLLAPSE_KINDS = new Set<string>(['feedback_pos']);
@@ -102,25 +96,22 @@ async function run() {
   });
   console.log(`Loaded ${events.length} events. Building accumulators in memory...`);
 
-  // Detect collusive feedback clusters from the feedback graph (rater →
-  // subject). Reciprocity within these clusters drives how hard we collapse
-  // their feedback in the finalize pass below.
-  let detection: ClusterDetection | null = null;
+  // Build the directed feedback map: who each subject ENDORSED (X → set of
+  // wallets X left feedback for). A rater R of X is collusive iff R is in
+  // gave[X] — i.e., X reviewed R back (mutual endorsement). This is immune
+  // to how the graph clusters; it's the direct reciprocal relationship.
+  const gave = new Map<string, Set<string>>();
   if (COCM) {
-    const fbEdges: RawEdge[] = [];
+    let fbEdges = 0;
     for (const ev of events) {
       if (COLLAPSE_KINDS.has(ev.kind) && ev.actorWallet && ev.actorWallet !== ev.subjectWallet) {
-        fbEdges.push({ fromWallet: ev.actorWallet, toWallet: ev.subjectWallet, edgeType: 'feedback', weight: ev.weight });
+        const set = gave.get(ev.actorWallet) ?? new Set<string>();
+        set.add(ev.subjectWallet);
+        gave.set(ev.actorWallet, set);
+        fbEdges++;
       }
     }
-    detection = detectClusters(fbEdges, { minClusterSize: COCM_MIN_CLUSTER });
-    const flaggedSizes = [...detection.flagged]
-      .map((c) => detection!.sizeOf.get(c) ?? 0)
-      .sort((a, b) => b - a);
-    console.log(
-      `COCM on: feedback graph ${fbEdges.length} edges, ${detection.numCommunities} communities, ` +
-        `${detection.flagged.size} flagged (sizes: ${flaggedSizes.slice(0, 5).join(', ')}…)`,
-    );
+    console.log(`COCM on: ${fbEdges} feedback edges, ${gave.size} distinct raters (mutual-pair collapse, min_mutual=${COCM_MIN_MUTUAL}).`);
   }
 
   // Accumulators keyed by (subjectWallet, axis, kind). Cold-start prior (α=2, β=2)
@@ -191,17 +182,20 @@ async function run() {
     }
   }
 
-  // ── COCM finalize: collapse collusive feedback ───────────────────
+  // ── COCM finalize: collapse mutual (collusive) feedback ──────────
   // A ring member's silver tier rides mutual feedback inflating their
-  // delivery posterior. Collapse same-cluster feedback toward a single
-  // signal: α drops, and effectiveSamples (the tier sample-gate) craters.
-  if (COCM && detection) {
+  // delivery posterior. Collapse the mutually-endorsed raters toward a
+  // single signal: α drops, and effectiveSamples (the tier sample-gate)
+  // craters. Legit hubs have no mutual raters and are untouched.
+  if (COCM) {
     let collapsedAccs = 0;
     let weightRemovedTotal = 0;
     for (const [k, acc] of accs) {
       const [subjectWallet, , kind] = k.split('|');
       if (!COLLAPSE_KINDS.has(kind)) continue;
-      const res = collapseCollusiveFeedback(subjectWallet, acc.actorWeights, detection, COCM_MIN_RECIPROCITY);
+      const subjectEndorsed = gave.get(subjectWallet);
+      if (!subjectEndorsed) continue;
+      const res = collapseMutualFeedback(acc.actorWeights, subjectEndorsed, COCM_MIN_MUTUAL);
       if (!res) continue;
 
       // feedback_pos is positive-only, so α − prior == Σ raw feedback weight.
@@ -210,16 +204,15 @@ async function run() {
       acc.alpha -= removed;
       if (fullSum > 0) acc.decayedValue *= (fullSum - removed) / fullSum; // cosmetic; composite uses α/β
 
-      // Fold the collusive raters into one synthetic actor so uniqueActors
-      // and entropy reflect the collapse.
-      const subjComm = detection.communityOf.get(subjectWallet);
+      // Fold the mutual raters into one synthetic actor so uniqueActors and
+      // entropy reflect the collapse.
       const kept = new Map<string, number>();
       for (const [actor, w] of acc.actorWeights) {
-        if (detection.communityOf.get(actor) === subjComm) continue; // drop collusive
+        if (subjectEndorsed.has(actor)) continue; // drop mutual (collusive)
         kept.set(actor, w);
       }
       if (res.effectiveCollusiveWeight > 0) {
-        kept.set(`cocm:collapsed:${subjComm}`, res.effectiveCollusiveWeight);
+        kept.set(`cocm:collapsed:${subjectWallet}`, res.effectiveCollusiveWeight);
       }
       acc.actorWeights = kept;
 
