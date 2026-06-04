@@ -45,25 +45,34 @@ const UNRANKED = (wallet: string): V8Reputation => ({
   computedAt: null,
 });
 
+// A single ReputationPosterior row, narrowed to what the read path needs.
+interface PostRow {
+  axis: string;
+  posteriorMean: number;
+  lowerBound95: number;
+  sampleSize: number;
+  compositeScore: number;
+  eigentrustScore: number;
+  computedAt: Date | null;
+}
+
+const POST_SELECT = {
+  axis: true,
+  posteriorMean: true,
+  lowerBound95: true,
+  sampleSize: true,
+  compositeScore: true,
+  eigentrustScore: true,
+  computedAt: true,
+} as const;
+
 /**
- * Read an agent's v0.8 reputation from ReputationPosterior. compositeScore
- * and eigentrustScore are stored per-axis but identical across a subject's
- * rows, so we take them off any row; tier is re-derived from
- * (composite, total samples, identity mean) since tier isn't a stored column.
+ * Build a V8Reputation from a subject's posterior rows. compositeScore and
+ * eigentrustScore are stored per-axis but identical across rows, so we take
+ * them off any row; tier is re-derived from (composite, total samples,
+ * identity mean) since tier isn't a stored column.
  */
-export async function getV8Reputation(prisma: PrismaClient, wallet: string): Promise<V8Reputation> {
-  const rows = await prisma.reputationPosterior.findMany({
-    where: { subjectWallet: wallet },
-    select: {
-      axis: true,
-      posteriorMean: true,
-      lowerBound95: true,
-      sampleSize: true,
-      compositeScore: true,
-      eigentrustScore: true,
-      computedAt: true,
-    },
-  });
+function buildFromRows(wallet: string, rows: PostRow[]): V8Reputation {
   if (rows.length === 0) return UNRANKED(wallet);
 
   const compositeScore = rows[0].compositeScore;
@@ -86,8 +95,44 @@ export async function getV8Reputation(prisma: PrismaClient, wallet: string): Pro
   }
 
   const tier = assignTier(compositeScore, totalSamples, identityMean);
-
   return { wallet, found: true, compositeScore, tier, totalSamples, eigentrustScore, axes, computedAt };
+}
+
+/** Read one agent's v0.8 reputation from ReputationPosterior. */
+export async function getV8Reputation(prisma: PrismaClient, wallet: string): Promise<V8Reputation> {
+  const rows = await prisma.reputationPosterior.findMany({
+    where: { subjectWallet: wallet },
+    select: POST_SELECT,
+  });
+  return buildFromRows(wallet, rows);
+}
+
+/**
+ * Batch version for list/leaderboard endpoints — one query for all wallets,
+ * grouped in memory. Wallets with no rows map to the unranked default.
+ */
+export async function getV8ReputationBatch(
+  prisma: PrismaClient,
+  wallets: string[],
+): Promise<Map<string, V8Reputation>> {
+  const out = new Map<string, V8Reputation>();
+  if (wallets.length === 0) return out;
+
+  const rows = await prisma.reputationPosterior.findMany({
+    where: { subjectWallet: { in: wallets } },
+    select: { ...POST_SELECT, subjectWallet: true },
+  });
+
+  const byWallet = new Map<string, PostRow[]>();
+  for (const r of rows) {
+    const arr = byWallet.get(r.subjectWallet) ?? [];
+    arr.push(r);
+    byWallet.set(r.subjectWallet, arr);
+  }
+  for (const w of wallets) {
+    out.set(w, buildFromRows(w, byWallet.get(w) ?? []));
+  }
+  return out;
 }
 
 /**

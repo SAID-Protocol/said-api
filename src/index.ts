@@ -186,7 +186,7 @@ app.use('/*', async (c, next) => {
 
 import { EventEmitter } from 'events';
 import { createScoreRoutes, initScoreWorker } from './score-engine.js';
-import { getV8Reputation, legacyTrustTier } from './reputation-v0.8/read.js';
+import { getV8Reputation, getV8ReputationBatch, legacyTrustTier } from './reputation-v0.8/read.js';
 const sseEmitter = new EventEmitter();
 sseEmitter.setMaxListeners(100); // support up to 100 concurrent SSE clients
 
@@ -564,8 +564,31 @@ app.get('/api/agents', async (c) => {
   });
   
   const total = await prisma.agent.count({ where });
-  
-  return c.json({ agents, total, limit: parseInt(limit || '50'), offset: parseInt(offset || '0') });
+
+  // Reputation v0.8 overlay — one batched read for the whole page, then
+  // override trustScore.tier/.score + reputationScore so lists/leaderboard
+  // render the v8 tier. Resilient: on failure the v0.6 values are returned.
+  // NOTE: DB ordering above is still the v0.6 score; v8-ordered leaderboard
+  // is a follow-up (needs composite denormalized onto Agent or a join).
+  let agentsOut: any[] = agents;
+  try {
+    const repMap = await getV8ReputationBatch(prisma, agents.map((a) => a.wallet));
+    agentsOut = agents.map((a) => {
+      const rep = repMap.get(a.wallet);
+      if (!rep || !rep.found) return { ...a, reputation: { tier: 'unranked', compositeScore: 0, scored: false } };
+      const v8Score100 = Math.round(rep.compositeScore * 100);
+      return {
+        ...a,
+        reputationScore: Number((rep.compositeScore * 100).toFixed(1)),
+        trustScore: a.trustScore ? { ...a.trustScore, tier: rep.tier, score: v8Score100 } : { tier: rep.tier, score: v8Score100 },
+        reputation: { tier: rep.tier, compositeScore: Number(rep.compositeScore.toFixed(4)), scored: true },
+      };
+    });
+  } catch (err) {
+    console.error('[/api/agents] v8 reputation batch overlay failed, serving v0.6', err);
+  }
+
+  return c.json({ agents: agentsOut, total, limit: parseInt(limit || '50'), offset: parseInt(offset || '0') });
 });
 
 // Get single agent profile
@@ -615,9 +638,30 @@ app.get('/api/agents/:wallet', async (c) => {
     fairscaleSubscore,
   );
 
+  // Reputation v0.8 is the source of truth. Overlay the v8 tier + score onto
+  // the fields the frontend already reads (trustScore.tier / .score and the
+  // reputationScore stat), and expose a clean `reputation` block. Resilient:
+  // if the v8 read fails or the agent isn't scored, we keep the v0.6 values.
+  let trustScoreOut: any = liveTrustScore;
+  let reputationScoreOut = agent.reputationScore;
+  let reputationBlock = { tier: 'unranked', compositeScore: 0, scored: false };
+  try {
+    const rep = await getV8Reputation(prisma, wallet);
+    if (rep.found) {
+      const v8Score100 = Math.round(rep.compositeScore * 100);
+      trustScoreOut = { ...liveTrustScore, tier: rep.tier, score: v8Score100 };
+      reputationScoreOut = Number((rep.compositeScore * 100).toFixed(1));
+      reputationBlock = { tier: rep.tier, compositeScore: Number(rep.compositeScore.toFixed(4)), scored: true };
+    }
+  } catch (err) {
+    console.error('[/api/agents/:wallet] v8 reputation read failed, serving v0.6', wallet, err);
+  }
+
   return c.json({
     ...agent,
-    trustScore: liveTrustScore,
+    reputationScore: reputationScoreOut,
+    trustScore: trustScoreOut,
+    reputation: reputationBlock,
     anchorStats,
     activityStats,
     launchedTokens,
