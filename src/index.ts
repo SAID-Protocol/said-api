@@ -573,6 +573,23 @@ app.get('/api/agents', async (c) => {
   let agentsOut: any[] = agents;
   try {
     const repMap = await getV8ReputationBatch(prisma, agents.map((a) => a.wallet));
+    // Complete v0.6 trustScore skeleton — used when an agent has v8 data but
+    // no cached AgentScore row, so the overlaid object always has the full
+    // shape (badges/sources arrays etc.) and the frontend never hits
+    // `undefined.join()` / `.length` on a partial object.
+    const TRUSTSCORE_SKELETON = {
+      score: 0,
+      tier: 'unranked',
+      badges: [] as string[],
+      sources: [] as string[],
+      identity: 0,
+      activity: 0,
+      economic: 0,
+      ecosystem: 0,
+      longevity: 0,
+      fairscale: 0,
+      computedAt: null as Date | null,
+    };
     agentsOut = agents.map((a) => {
       const rep = repMap.get(a.wallet);
       if (!rep || !rep.found) return { ...a, reputation: { tier: 'unranked', compositeScore: 0, scored: false } };
@@ -580,7 +597,7 @@ app.get('/api/agents', async (c) => {
       return {
         ...a,
         reputationScore: Number((rep.compositeScore * 100).toFixed(1)),
-        trustScore: a.trustScore ? { ...a.trustScore, tier: rep.tier, score: v8Score100 } : { tier: rep.tier, score: v8Score100 },
+        trustScore: { ...TRUSTSCORE_SKELETON, ...(a.trustScore ?? {}), tier: rep.tier, score: v8Score100 },
         reputation: { tier: rep.tier, compositeScore: Number(rep.compositeScore.toFixed(4)), scored: true },
       };
     });
