@@ -186,6 +186,7 @@ app.use('/*', async (c, next) => {
 
 import { EventEmitter } from 'events';
 import { createScoreRoutes, initScoreWorker } from './score-engine.js';
+import { getV8Reputation, legacyTrustTier } from './reputation-v0.8/read.js';
 const sseEmitter = new EventEmitter();
 sseEmitter.setMaxListeners(100); // support up to 100 concurrent SSE clients
 
@@ -5841,15 +5842,33 @@ app.get('/api/verify/:wallet', async (c) => {
     }, 404);
   }
 
-  // Compute trust tier for easy gating decisions
-  const trustTier =
+  // Legacy 3-tier baseline (resilient fallback if the v8 read fails).
+  const legacyTier =
     agent.isVerified && agent.reputationScore >= 70
       ? 'high'
       : agent.isVerified || agent.reputationScore >= 40
         ? 'medium'
         : 'low';
-  
-  // Compute detailed trust score
+
+  // Reputation v0.8 is the source of truth. `tier` is the 5-tier the frontend
+  // renders; `trustTier` (high/med/low) is kept, mapped from v8 when scored.
+  let v8Tier: string = 'unranked';
+  let v8Composite = 0;
+  let scored = false;
+  let trustTier: string = legacyTier;
+  try {
+    const rep = await getV8Reputation(prisma, wallet);
+    if (rep.found) {
+      v8Tier = rep.tier;
+      v8Composite = rep.compositeScore;
+      scored = true;
+      trustTier = legacyTrustTier(rep.tier);
+    }
+  } catch (err) {
+    console.error('[/api/verify] v8 reputation read failed, serving legacy tier', wallet, err);
+  }
+
+  // Compute detailed trust score (v0.6 overlay — retained during coexistence)
   const trustScore = computeTrustScore(agent);
 
   return c.json({
@@ -5865,9 +5884,12 @@ app.get('/api/verify/:wallet', async (c) => {
       image: agent.image,
     },
     reputation: {
+      tier: v8Tier,
+      compositeScore: Number(v8Composite.toFixed(4)),
       score: agent.reputationScore,
       feedbackCount: agent._count.feedbackReceived,
       trustTier,
+      scored,
     },
     trustScore,
     endpoints: {
@@ -6409,17 +6431,46 @@ app.get('/api/trust/:wallet', async (c) => {
   });
 
   if (!agent) {
-    return c.json({ wallet, trustTier: 'none', registered: false });
+    return c.json({ wallet, tier: 'unranked', trustTier: 'none', registered: false });
   }
 
-  const trustTier =
+  // Legacy 3-tier from the agent we already have — used as the resilient
+  // baseline so the response can never regress / 500 if the v8 read fails.
+  const legacyTier =
     agent.isVerified && agent.reputationScore >= 70
       ? 'high'
       : agent.isVerified || agent.reputationScore >= 40
         ? 'medium'
         : 'low';
 
-  return c.json({ wallet, trustTier, registered: true, verified: agent.isVerified });
+  // Reputation v0.8 is the source of truth. `tier` is the 5-tier the frontend
+  // renders (unranked|bronze|silver|gold|platinum). `trustTier` (high/med/low)
+  // is kept, mapped from the v8 tier when scored, falling back to legacy.
+  let tier: string = 'unranked';
+  let compositeScore = 0;
+  let scored = false;
+  let trustTier: string = legacyTier;
+  try {
+    const rep = await getV8Reputation(prisma, wallet);
+    if (rep.found) {
+      tier = rep.tier;
+      compositeScore = rep.compositeScore;
+      scored = true;
+      trustTier = legacyTrustTier(rep.tier);
+    }
+  } catch (err) {
+    console.error('[/api/trust] v8 reputation read failed, serving legacy tier', wallet, err);
+  }
+
+  return c.json({
+    wallet,
+    tier,
+    compositeScore: Number(compositeScore.toFixed(4)),
+    trustTier,
+    registered: true,
+    verified: agent.isVerified,
+    scored,
+  });
 });
 
 // ============ ATTESTATIONS ============
