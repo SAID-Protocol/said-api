@@ -224,6 +224,50 @@ export function computeComposite(
   return Math.max(0, Math.min(1, composite));
 }
 
+/**
+ * Composite from bare per-axis means — same blend as computeComposite, but
+ * takes a plain `{axis: mean}` map. Used by the EigenTrust step (Phase 3c)
+ * to RE-derive the graph-free base composite from the stored posterior
+ * means, so applying the graph bonus stays idempotent across re-runs (the
+ * means never change; the stored compositeScore would compound).
+ */
+export function compositeFromMeans(
+  means: Partial<Record<Axis, number>>,
+  weights: Record<Axis, number> = AXIS_WEIGHTS_DEFAULT,
+): number {
+  const neutral = PRIOR_ALPHA / PRIOR_TOTAL;
+  let composite = 0;
+  let totalWeight = 0;
+  for (const axis of AXES) {
+    const w = weights[axis] ?? 0;
+    composite += w * (means[axis] ?? neutral);
+    totalWeight += w;
+  }
+  if (totalWeight > 0 && Math.abs(totalWeight - 1) > 0.001) composite /= totalWeight;
+  return Math.max(0, Math.min(1, composite));
+}
+
+/** Phase 3c default — graph bonus weight (additive, never a penalty). */
+export const GRAPH_BONUS_WEIGHT = 0.15;
+
+/**
+ * Fold EigenTrust into the composite as a BONUS that never penalizes.
+ *
+ *   composite' = clamp(base + bonusWeight · max(0, eigentrust))
+ *
+ * Because eigentrust ≥ 0, the bonus is always ≥ 0 — an agent with no graph
+ * footprint (eigentrust 0: SlimeBot, every new legit agent) is unchanged,
+ * while the network's most-trusted agent (Xona, normalized eigentrust 1.0)
+ * gets the full bonus. Graph presence only ever helps.
+ */
+export function applyGraphBonus(
+  baseComposite: number,
+  eigentrust: number,
+  bonusWeight: number = GRAPH_BONUS_WEIGHT,
+): number {
+  return Math.max(0, Math.min(1, baseComposite + bonusWeight * Math.max(0, eigentrust)));
+}
+
 export function assignTier(
   composite: number,
   totalSamples: number,

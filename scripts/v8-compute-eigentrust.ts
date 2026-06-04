@@ -23,6 +23,9 @@
  *   COCM_DISCOUNT=0.3                      # floor multiplier for a fully
  *                                          # reciprocal cluster's edges
  *   COCM_MIN_CLUSTER=3                     # min cluster size to discount
+ *   GRAPH_BONUS_WEIGHT=0.15                # Phase 3c: fold eigentrust into
+ *                                          # composite as an additive,
+ *                                          # never-penalty bonus. 0 disables.
  */
 import { PrismaClient } from '@prisma/client';
 import {
@@ -31,7 +34,8 @@ import {
   DEFAULT_EIGENTRUST_PARAMS,
 } from '../src/reputation-v0.8/graph.js';
 import { applyCocmDiscount, type RawEdge } from '../src/reputation-v0.8/cocm.js';
-import { AXES } from '../src/reputation-v0.8/axes.js';
+import { compositeFromMeans, applyGraphBonus, assignTier, GRAPH_BONUS_WEIGHT } from '../src/reputation-v0.8/posteriors.js';
+import { AXES, type Axis } from '../src/reputation-v0.8/axes.js';
 
 const prisma = new PrismaClient();
 
@@ -45,6 +49,9 @@ const EPSILON = Number(process.env.EPSILON ?? DEFAULT_EIGENTRUST_PARAMS.epsilon)
 const COCM = process.env.COCM === 'true';
 const COCM_DISCOUNT = Number(process.env.COCM_DISCOUNT ?? 0.3);
 const COCM_MIN_CLUSTER = Number(process.env.COCM_MIN_CLUSTER ?? 3);
+// Phase 3c — graph bonus weight folded into composite (additive, never a
+// penalty). Set to 0 to write eigentrustScore only and leave composite alone.
+const GRAPH_BONUS = process.env.GRAPH_BONUS_WEIGHT !== undefined ? Number(process.env.GRAPH_BONUS_WEIGHT) : GRAPH_BONUS_WEIGHT;
 
 async function run() {
   console.log('EigenTrust computation starting');
@@ -140,16 +147,42 @@ async function run() {
   console.log(`\nMax raw eigentrust mass: ${maxScore.toExponential(3)}`);
   console.log('(Scores normalized to [0, 1] for storage and reporting.)');
 
+  // Phase 3c — load the stable per-axis means so we can RE-derive the
+  // graph-free base composite for each subject and fold in the graph bonus
+  // idempotently (re-deriving from means avoids compounding the bonus on
+  // re-runs; the stored compositeScore already includes any prior bonus).
+  const meansBySubject = new Map<string, Partial<Record<Axis, number>>>();
+  if (GRAPH_BONUS > 0) {
+    const meanRows = await prisma.reputationPosterior.findMany({
+      select: { subjectWallet: true, axis: true, posteriorMean: true },
+    });
+    for (const r of meanRows) {
+      const m = meansBySubject.get(r.subjectWallet) ?? {};
+      m[r.axis as Axis] = r.posteriorMean;
+      meansBySubject.set(r.subjectWallet, m);
+    }
+  }
+
   // Write back to ReputationPosterior. We update every axis row for each
   // subject — eigentrustScore is per-agent, not per-axis, so it's
-  // duplicated across rows (same pattern as compositeScore).
-  console.log('\nUpdating ReputationPosterior.eigentrustScore...');
+  // duplicated across rows (same pattern as compositeScore). When
+  // GRAPH_BONUS > 0 we also fold the bonus into compositeScore. Graph-absent
+  // subjects (not in result.scores) keep their base composite — their bonus
+  // would be 0 anyway.
+  console.log(
+    `\nUpdating eigentrustScore${GRAPH_BONUS > 0 ? ` + composite (graph bonus w=${GRAPH_BONUS})` : ''}...`,
+  );
   let updated = 0;
   for (const [wallet, rawScore] of result.scores) {
     const normalized = normalize(rawScore);
+    const data: { eigentrustScore: number; compositeScore?: number } = { eigentrustScore: normalized };
+    if (GRAPH_BONUS > 0) {
+      const base = compositeFromMeans(meansBySubject.get(wallet) ?? {});
+      data.compositeScore = applyGraphBonus(base, normalized, GRAPH_BONUS);
+    }
     const r = await prisma.reputationPosterior.updateMany({
       where: { subjectWallet: wallet },
-      data: { eigentrustScore: normalized },
+      data,
     });
     updated += r.count;
   }
@@ -213,6 +246,50 @@ async function run() {
       const name = divNames.get(r.subjectWallet) ?? '(unknown)';
       console.log(
         `    ${name.slice(0, 28).padEnd(28)} composite=${r.compositeScore.toFixed(3)} eigentrust=${r.eigentrustScore.toFixed(4)} samples=${r.sampleSize}`,
+      );
+    }
+  }
+
+  // ── Post-bonus tier distribution (Phase 3c) ──────────────────────
+  // compositeScore now includes the graph bonus for graph-present agents,
+  // so re-derive tiers here to show the final picture. Tier isn't a stored
+  // column — it's computed from composite + total samples + identity mean.
+  if (GRAPH_BONUS > 0) {
+    const tierRows = await prisma.reputationPosterior.findMany({
+      select: { subjectWallet: true, axis: true, posteriorMean: true, compositeScore: true, sampleSize: true },
+    });
+    const bySubject = new Map<string, { composite: number; samples: number; identity: number }>();
+    for (const r of tierRows) {
+      const cur = bySubject.get(r.subjectWallet) ?? { composite: r.compositeScore, samples: 0, identity: 0.5 };
+      cur.composite = r.compositeScore; // same across a subject's rows
+      cur.samples += r.sampleSize;
+      if (r.axis === 'identity') cur.identity = r.posteriorMean;
+      bySubject.set(r.subjectWallet, cur);
+    }
+    const tierCounts: Record<string, number> = { platinum: 0, gold: 0, silver: 0, bronze: 0, unranked: 0 };
+    const scored: Array<{ wallet: string; composite: number; samples: number; tier: string }> = [];
+    for (const [wallet, s] of bySubject) {
+      const tier = assignTier(s.composite, s.samples, s.identity);
+      tierCounts[tier]++;
+      scored.push({ wallet, composite: s.composite, samples: s.samples, tier });
+    }
+    console.log('\n── Tier distribution (after graph bonus) ─────────────');
+    const total = scored.length || 1;
+    for (const t of ['platinum', 'gold', 'silver', 'bronze', 'unranked']) {
+      console.log(`  ${t.padEnd(10)} ${String(tierCounts[t]).padStart(5)} (${((tierCounts[t] / total) * 100).toFixed(1)}%)`);
+    }
+    scored.sort((a, b) => b.composite - a.composite);
+    const topComposite = scored.slice(0, 15);
+    const tcNames = await prisma.agent.findMany({
+      where: { wallet: { in: topComposite.map((t) => t.wallet) } },
+      select: { wallet: true, name: true },
+    });
+    const tcMap = new Map(tcNames.map((a) => [a.wallet, a.name ?? '(unnamed)']));
+    console.log('\n── Top 15 by composite (after graph bonus) ───────────');
+    console.log(`  ${'name'.padEnd(28)} ${'composite'.padStart(10)} ${'samples'.padStart(8)} tier`);
+    for (const t of topComposite) {
+      console.log(
+        `  ${(tcMap.get(t.wallet) ?? '(unknown)').slice(0, 28).padEnd(28)} ${t.composite.toFixed(4).padStart(10)} ${String(t.samples).padStart(8)} ${t.tier}`,
       );
     }
   }
