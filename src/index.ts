@@ -277,6 +277,13 @@ app.get('/.well-known/x402', (c) => {
         freeTier: '10 messages/day per sender',
         chains: ['solana', 'base', 'polygon', 'avalanche', 'sei'],
       },
+      {
+        url: 'https://api.saidprotocol.com/api/trust/deep?wallet=<wallet>',
+        method: 'GET',
+        description: 'Full reputation v0.8 dossier for an agent: per-axis Beta posteriors with 95% lower bound (underwriting-grade confidence), EigenTrust graph score, composite, tier, and total evidence. Free tier (tier + score) at /api/trust/:wallet.',
+        price: '$0.01 USDC',
+        chains: ['solana', 'base', 'polygon', 'avalanche', 'sei'],
+      },
     ],
     contact: {
       twitter: '@saidinfra',
@@ -8741,8 +8748,41 @@ app.use('/xchain/*', async (c, next) => {
 // Includes built-in free tier: 10 messages/day per agent
 app.use('*', createX402Middleware());
 console.log(`✅ x402 payment gate active on POST /xchain/message ($0.01 USDC via Coinbase x402 SDK)`);
+console.log(`✅ x402 payment gate active on GET /api/trust/deep ($0.01 USDC — reputation v0.8 dossier)`);
 console.log(`✅ Free tier: ${FREE_MESSAGES_PER_DAY} messages/day per agent`);
 console.log(`✅ Supported payment chains: ${Object.keys(CHAINS).join(', ')}`);
+
+// GET /api/trust/deep?wallet=<wallet> — PAID ($0.01 USDC via x402).
+// Full reputation v0.8 dossier. Registered AFTER the x402 middleware so it's
+// gated; the priced-routes map entry (GET /api/trust/deep) requires payment.
+// The free /api/trust/:wallet and /api/agents/:wallet stay free.
+app.get('/api/trust/deep', async (c) => {
+  const wallet = c.req.query('wallet');
+  if (!wallet) return c.json({ error: 'wallet query param required' }, 400);
+  try {
+    const rep = await getV8Reputation(prisma, wallet);
+    const round4 = (n: number) => Number(n.toFixed(4));
+    const axes = Object.fromEntries(
+      Object.entries(rep.axes).map(([axis, v]) => [
+        axis,
+        { posteriorMean: round4(v.posteriorMean), lowerBound95: round4(v.lowerBound95), sampleSize: v.sampleSize },
+      ]),
+    );
+    return c.json({
+      wallet,
+      scored: rep.found,
+      composite: round4(rep.compositeScore),
+      tier: rep.tier,
+      totalSamples: rep.totalSamples,
+      eigentrustScore: round4(rep.eigentrustScore),
+      computedAt: rep.computedAt,
+      axes, // per-axis: posteriorMean, lowerBound95 (the 95% confidence floor), sampleSize
+    });
+  } catch (err) {
+    console.error('[/api/trust/deep] failed', wallet, err);
+    return c.json({ error: 'reputation_unavailable' }, 500);
+  }
+});
 
 // GET /xchain/message — return 402 challenge for x402scan discovery
 app.get('/xchain/message', (c) => {
