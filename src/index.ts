@@ -530,13 +530,17 @@ app.get('/api/agents', async (c) => {
     where.isVerified = true;
   }
   
-  const orderBy: any = sort === 'newest' 
-    ? { registeredAt: 'desc' }
+  // Every sort gets a unique `id` tiebreaker: the primary sort keys are
+  // non-unique (thousands of agents share a reputationScore) and mutate under
+  // the score refresher, so without a tiebreaker offset pagination serves some
+  // rows twice and never serves others — the registry can't be enumerated.
+  const orderBy: any = sort === 'newest'
+    ? [{ registeredAt: 'desc' }, { id: 'asc' }]
     : sort === 'name'
-    ? { name: 'asc' }
+    ? [{ name: 'asc' }, { id: 'asc' }]
     : sort === 'trust'
-    ? { trustScore: { score: 'desc' } }
-    : { reputationScore: 'desc' };
+    ? [{ trustScore: { score: 'desc' } }, { id: 'asc' }]
+    : [{ reputationScore: 'desc' }, { id: 'asc' }];
   
   const agents = await prisma.agent.findMany({
     where,
