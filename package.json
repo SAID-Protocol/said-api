@@ -20,7 +20,7 @@
     "v8:edges": "tsx scripts/v8-build-edges.ts",
     "v8:eigentrust": "tsx scripts/v8-compute-eigentrust.ts",
     "v8:recompute": "npm run v8:signals && npm run v8:posteriors && npm run v8:edges && npm run v8:eigentrust",
-    "v8:refresh": "npm run v8:sync-x402-activity ; npm run v8:sync-said-engagement ; npm run v8:backfill && npm run v8:sync-x402-pertx && COCM=true npm run v8:signals && npm run v8:posteriors && npm run v8:edges && COCM=true npm run v8:eigentrust"
+    "v8:refresh": "npm run v8:sync-x402-activity && npm run v8:sync-said-engagement && npm run v8:backfill && npm run v8:sync-x402-pertx && COCM=true npm run v8:signals && npm run v8:posteriors && npm run v8:edges && COCM=true npm run v8:eigentrust"
   },
   "keywords": [
     "said",
