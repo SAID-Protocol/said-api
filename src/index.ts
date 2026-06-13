@@ -7637,10 +7637,15 @@ async function syncAgentsFromChain(): Promise<{ synced: number; updated: number;
               x402Wallet: sanitize(card.x402Wallet) || undefined,
               serviceTypes: card.serviceTypes || [],
               skills: card.capabilities || card.skills || [],
-              registrationSource: card.platform === 'spawnr.io' ? 'spawnr' 
-                : card.platform === 'clawpump' ? 'clawpump' 
+              registrationSource: card.platform === 'spawnr.io' ? 'spawnr'
+                : card.platform === 'clawpump' ? 'clawpump'
                 : 'on-chain-sync',
-              sponsored: true,
+              // Agents reaching this insert were discovered on-chain, not created
+              // through SAID's sponsor-funded API flow (which writes the DB row at
+              // registration time, so it would already exist). SAID did not pay
+              // their rent/fee, so they are not sponsored — marking them sponsored
+              // here corrupted ring/cohort analytics.
+              sponsored: false,
             }
           });
           stats.synced++;

@@ -1,9 +1,45 @@
 import { Hono } from 'hono';
 import { PrismaClient } from '@prisma/client';
+import { PublicKey } from '@solana/web3.js';
+import nacl from 'tweetnacl';
+import bs58 from 'bs58';
 import type { AgentCard, A2AMessage, A2ATask, DiscoveryQuery } from './a2a-types.js';
 
 const prisma = new PrismaClient();
 const a2a = new Hono();
+
+// When true, the relay rejects messages without a valid sender signature.
+// Defaults to false so existing unsigned callers keep working; unsigned messages
+// are still accepted but flagged unauthenticated and stripped of borrowed trust.
+const A2A_REQUIRE_SIGNATURE = process.env.A2A_REQUIRE_SIGNATURE === 'true';
+
+// Messages older than this (vs the signed timestamp) are rejected to prevent replay.
+const A2A_SIGNATURE_MAX_AGE_MS = 5 * 60 * 1000;
+
+/**
+ * Verifies that `signature` is an ed25519 signature by `fromWallet` over the
+ * canonical A2A payload. Returns false on any malformed input — never throws.
+ */
+function verifyA2ASignature(
+  fromWallet: string,
+  toWallet: string,
+  message: string,
+  timestamp: unknown,
+  signature: unknown,
+): boolean {
+  if (typeof signature !== 'string' || typeof timestamp !== 'number') return false;
+  if (Math.abs(Date.now() - timestamp) > A2A_SIGNATURE_MAX_AGE_MS) return false;
+  try {
+    const payload = `SAID-A2A:${fromWallet}:${toWallet}:${timestamp}:${message}`;
+    return nacl.sign.detached.verify(
+      new TextEncoder().encode(payload),
+      bs58.decode(signature),
+      new PublicKey(fromWallet).toBytes(),
+    );
+  } catch {
+    return false;
+  }
+}
 
 // ═══════════════════════════════════════════════════════
 // 1. AGENT CARD (Discovery)
@@ -76,35 +112,45 @@ a2a.post('/:wallet/message', async (c) => {
   
   try {
     const body = await c.req.json();
-    const { from: fromWallet, message, context, signature } = body;
-    
+    const { from: fromWallet, message, context, signature, timestamp } = body;
+
     if (!fromWallet || !message) {
       return c.json({ error: 'Missing required fields: from, message' }, 400);
     }
-    
+
     // Verify sender is SAID-registered
     const sender = await prisma.agent.findUnique({
       where: { wallet: fromWallet },
       select: { isVerified: true }
     });
-    
+
     if (!sender) {
       return c.json({ error: 'Sender not registered on SAID' }, 403);
     }
-    
+
     // Verify recipient exists
     const recipient = await prisma.agent.findUnique({
       where: { wallet: toWallet },
       select: { wallet: true }
     });
-    
+
     if (!recipient) {
       return c.json({ error: 'Recipient not found' }, 404);
     }
-    
-    // Store message
+
+    // Authenticate the claimed sender. Without a valid signature anyone could
+    // post as any registered wallet and borrow its verification + reputation;
+    // unauthenticated messages are still accepted (unless A2A_REQUIRE_SIGNATURE)
+    // but must not carry the sender's trust — see the inbox enrichment below.
+    const authenticated = verifyA2ASignature(fromWallet, toWallet, message, timestamp, signature);
+    if (A2A_REQUIRE_SIGNATURE && !authenticated) {
+      return c.json({ error: 'Valid sender signature required' }, 401);
+    }
+
+    // Store message. The signature is persisted only when valid, so a non-null
+    // signature is the authoritative marker that this message was authenticated.
     const taskId = `task_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
+
     const msg = await prisma.a2AMessage.create({
       data: {
         fromWallet,
@@ -112,8 +158,8 @@ a2a.post('/:wallet/message', async (c) => {
         message,
         context: context ? JSON.stringify(context) : null,
         taskId,
-        fromVerified: sender.isVerified,
-        signature: signature || null,
+        fromVerified: authenticated && sender.isVerified,
+        signature: authenticated ? (signature as string) : null,
         status: 'created',
         progress: 0,
       }
@@ -161,26 +207,34 @@ a2a.get('/:wallet/inbox', async (c) => {
         progress: true,
         result: true,
         fromVerified: true,
+        signature: true,
         createdAt: true,
       }
     });
-    
-    // Enrich with sender info
+
+    // Enrich with sender info. Only an authenticated message (one stored with a
+    // verified signature) may carry the sender's real verification + reputation;
+    // an unauthenticated message has an unproven `from`, so it is shown as such
+    // with no borrowed trust, even though we still resolve the display name.
     const enriched = await Promise.all(messages.map(async (msg) => {
       const sender = await prisma.agent.findUnique({
         where: { wallet: msg.fromWallet },
         select: { name: true, isVerified: true, reputationScore: true }
       });
-      
+
+      const authenticated = msg.signature != null;
+      const { signature: _signature, ...rest } = msg;
+
       return {
-        ...msg,
+        ...rest,
         context: msg.context ? JSON.parse(msg.context) : null,
         result: msg.result ? JSON.parse(msg.result) : null,
+        authenticated,
         from: {
           wallet: msg.fromWallet,
           name: sender?.name || 'Unknown',
-          verified: sender?.isVerified || false,
-          reputation: sender?.reputationScore || 0,
+          verified: authenticated && (sender?.isVerified || false),
+          reputation: authenticated ? sender?.reputationScore || 0 : 0,
         }
       };
     }));
