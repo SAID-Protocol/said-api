@@ -5801,6 +5801,59 @@ app.post('/api/register/prepare', async (c) => {
   });
 });
 
+// ============ INFERENCE PROVIDERS ============
+// Inference providers (UsePod, IDLE compute, etc.) are scored exactly like any
+// other agent: they register as agents carrying a compute serviceType, and the
+// v0.8 engine tiers them bronze/silver/gold/platinum off the same posteriors.
+// This endpoint is the discoverable, ranked provider view Chris/UsePod asked
+// for, with a ready-to-embed tier badge per provider.
+const PROVIDER_SERVICE_TYPES = ['INFERENCE', 'COMPUTE'];
+
+app.get('/api/providers', async (c) => {
+  const { serviceType, limit, offset } = c.req.query();
+  const types = serviceType ? [serviceType] : PROVIDER_SERVICE_TYPES;
+  const baseUrl = 'https://api.saidprotocol.com';
+
+  const agents = await prisma.agent.findMany({
+    where: { serviceTypes: { hasSome: types } },
+    orderBy: [{ reputationScore: 'desc' }, { id: 'asc' }],
+    take: Math.min(parseInt(limit || '100'), 500),
+    skip: parseInt(offset || '0'),
+    select: {
+      name: true, wallet: true, isVerified: true, reputationScore: true,
+      serviceTypes: true, website: true, mcpEndpoint: true, a2aEndpoint: true,
+    },
+  });
+
+  // One batched v0.8 read for all providers; the engine is the source of truth
+  // for the tier, falling back to unranked when a provider has no posteriors yet.
+  const reps = await getV8ReputationBatch(prisma, agents.map((a) => a.wallet));
+
+  const providers = agents.map((a) => {
+    const rep = reps.get(a.wallet);
+    const scored = !!rep?.found;
+    const tier = scored ? rep!.tier : 'unranked';
+    return {
+      name: a.name || 'Provider',
+      wallet: a.wallet,
+      isVerified: a.isVerified,
+      serviceTypes: a.serviceTypes,
+      website: a.website,
+      endpoint: a.mcpEndpoint || a.a2aEndpoint || null,
+      tier,
+      scored,
+      compositeScore: scored ? rep!.compositeScore : null,
+      badge: `${baseUrl}/api/badge/${a.wallet}.svg?style=tier`,
+    };
+  });
+
+  return c.json({
+    providerServiceTypes: types,
+    count: providers.length,
+    providers,
+  });
+});
+
 // ============ SVG BADGE ============
 
 function generateBadgeSvg(agent: { name: string; isVerified: boolean; reputationScore: number; wallet: string; tier?: string; scored?: boolean }, style: string = 'default'): string {
