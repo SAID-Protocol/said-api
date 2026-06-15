@@ -5803,11 +5803,23 @@ app.post('/api/register/prepare', async (c) => {
 
 // ============ SVG BADGE ============
 
-function generateBadgeSvg(agent: { name: string; isVerified: boolean; reputationScore: number; wallet: string }, style: string = 'default'): string {
+function generateBadgeSvg(agent: { name: string; isVerified: boolean; reputationScore: number; wallet: string; tier?: string; scored?: boolean }, style: string = 'default'): string {
   const name = agent.name || 'Agent';
   const score = Math.round(agent.reputationScore);
   const shortWallet = agent.wallet.slice(0, 4) + '...' + agent.wallet.slice(-4);
-  
+
+  // v0.8 tier (bronze/silver/gold/platinum) is the source of truth Chris/UsePod asked for.
+  const t = (agent.tier || 'unranked').toLowerCase();
+  const TIER_COLORS: Record<string, string> = {
+    platinum: '#67e8f9',
+    gold: '#fbbf24',
+    silver: '#cbd5e1',
+    bronze: '#cd7f32',
+    unranked: '#888',
+  };
+  const tierColor = TIER_COLORS[t] || '#888';
+  const tierLabel = agent.scored ? t.toUpperCase() : 'UNRANKED';
+
   if (style === 'minimal') {
     // Minimal shield-style badge
     return `<svg xmlns="http://www.w3.org/2000/svg" width="120" height="28" viewBox="0 0 120 28">
@@ -5824,9 +5836,26 @@ function generateBadgeSvg(agent: { name: string; isVerified: boolean; reputation
 </svg>`;
   }
   
+  if (style === 'tier') {
+    // Compact tier badge: SAID | ● TIER  (the "simple badge" for providers)
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="140" height="28" viewBox="0 0 140 28">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#1a1a1a"/>
+      <stop offset="100%" style="stop-color:#2a2a2a"/>
+    </linearGradient>
+  </defs>
+  <rect width="140" height="28" rx="4" fill="url(#bg)"/>
+  <text x="8" y="18" fill="#fff" font-family="system-ui,-apple-system,sans-serif" font-size="11" font-weight="600">SAID</text>
+  <rect x="42" y="0" width="1" height="28" fill="#444"/>
+  <circle cx="54" cy="14" r="4" fill="${tierColor}"/>
+  <text x="64" y="18" fill="${tierColor}" font-family="system-ui,-apple-system,sans-serif" font-size="11" font-weight="700">${tierLabel}</text>
+</svg>`;
+  }
+
   if (style === 'score') {
-    // Badge with reputation score
-    const scoreColor = score >= 70 ? '#22c55e' : score >= 40 ? '#f59e0b' : '#888';
+    // Badge with reputation score; color follows the v0.8 tier when scored.
+    const scoreColor = agent.scored ? tierColor : '#888';
     return `<svg xmlns="http://www.w3.org/2000/svg" width="160" height="28" viewBox="0 0 160 28">
   <defs>
     <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="0%">
@@ -5861,11 +5890,14 @@ function generateBadgeSvg(agent: { name: string; isVerified: boolean; reputation
   <rect x="0" y="0" width="4" height="56" rx="2" fill="url(#accent)"/>
   <text x="16" y="24" fill="#fff" font-family="system-ui,-apple-system,sans-serif" font-size="14" font-weight="700">${escapeXml(name.slice(0, 20))}</text>
   <text x="16" y="42" fill="#888" font-family="monospace" font-size="10">${shortWallet}</text>
-  <g transform="translate(170, 12)">
-    <rect width="40" height="18" rx="4" fill="${agent.isVerified ? '#22c55e' : '#333'}"/>
-    <text x="20" y="13" fill="${agent.isVerified ? '#fff' : '#888'}" font-family="system-ui,-apple-system,sans-serif" font-size="9" font-weight="600" text-anchor="middle">${agent.isVerified ? 'VERIFIED' : 'REG'}</text>
+  <g transform="translate(158, 9)">
+    <rect width="52" height="16" rx="4" fill="${agent.isVerified ? '#22c55e' : '#333'}"/>
+    <text x="26" y="12" fill="${agent.isVerified ? '#fff' : '#888'}" font-family="system-ui,-apple-system,sans-serif" font-size="9" font-weight="600" text-anchor="middle">${agent.isVerified ? 'VERIFIED' : 'REG'}</text>
   </g>
-  <text x="170" y="46" fill="#666" font-family="system-ui,-apple-system,sans-serif" font-size="9">SAID Protocol</text>
+  <g transform="translate(158, 31)">
+    <rect width="52" height="16" rx="4" fill="none" stroke="${tierColor}" stroke-width="1"/>
+    <text x="26" y="12" fill="${tierColor}" font-family="system-ui,-apple-system,sans-serif" font-size="9" font-weight="700" text-anchor="middle">${tierLabel}</text>
+  </g>
 </svg>`;
 }
 
@@ -5874,15 +5906,18 @@ function escapeXml(str: string): string {
 }
 
 // SVG badge endpoint
-app.get('/api/badge/:wallet.svg', async (c) => {
-  const wallet = (c.req.param('wallet') || '').replace('.svg', '');
+// The `:wallet{.+\.svg}` regex param is required: a plain `:wallet.svg` route
+// leaves c.req.param('wallet') undefined in Hono, so every badge resolved to an
+// empty wallet and rendered "Not Found".
+app.get('/api/badge/:wallet{.+\\.svg}', async (c) => {
+  const wallet = (c.req.param('wallet') || '').replace(/\.svg$/, '');
   const style = c.req.query('style') || 'default';
-  
+
   const agent = await prisma.agent.findUnique({
     where: { wallet },
     select: { name: true, wallet: true, isVerified: true, reputationScore: true }
   });
-  
+
   if (!agent) {
     // Return a "not found" badge
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="120" height="28" viewBox="0 0 120 28">
@@ -5893,10 +5928,25 @@ app.get('/api/badge/:wallet.svg', async (c) => {
     c.header('Cache-Control', 'public, max-age=300');
     return c.body(svg);
   }
-  
+
+  // v0.8 reputation is the source of truth for the tier; fall back gracefully.
+  let tier = 'unranked';
+  let scored = false;
+  try {
+    const rep = await getV8Reputation(prisma, wallet);
+    if (rep.found) {
+      tier = rep.tier;
+      scored = true;
+    }
+  } catch {
+    // keep unranked
+  }
+
   const svg = generateBadgeSvg({
     ...agent,
-    name: agent.name || 'Agent'
+    name: agent.name || 'Agent',
+    tier,
+    scored,
   }, style);
   c.header('Content-Type', 'image/svg+xml');
   c.header('Cache-Control', 'public, max-age=300');
@@ -5930,6 +5980,7 @@ app.get('/api/badge/:wallet', async (c) => {
       default: `${baseUrl}/api/badge/${wallet}.svg`,
       minimal: `${baseUrl}/api/badge/${wallet}.svg?style=minimal`,
       score: `${baseUrl}/api/badge/${wallet}.svg?style=score`,
+      tier: `${baseUrl}/api/badge/${wallet}.svg?style=tier`,
     },
     embed: {
       markdown: `[![SAID ${agent.isVerified ? 'Verified' : 'Registered'}](${baseUrl}/api/badge/${wallet}.svg)](${profileUrl})`,
