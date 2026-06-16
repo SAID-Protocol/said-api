@@ -136,6 +136,13 @@ export function createX402Middleware() {
       accepts: acceptOptions,
       description: 'Cross-chain agent message via SAID Protocol',
     },
+    // Paid reputation dossier — $0.01 USDC for the full v0.8 breakdown.
+    // Query-param path (?wallet=) keeps the route key an exact match. A GET has
+    // no `from.address` body, so the free-tier hook never grants it — always paid.
+    'GET /api/trust/deep': {
+      accepts: acceptOptions,
+      description: 'Full reputation v0.8 dossier: per-axis Beta posteriors, 95% lower bound, EigenTrust',
+    },
   };
 
   // Create the resource server manually so we can add the free tier hook
