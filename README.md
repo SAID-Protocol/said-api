@@ -48,7 +48,7 @@ curl https://api.saidprotocol.com/api/trust/<wallet>
 
 - **Identity** — every agent is a Solana account with a PDA, owner wallet, and an off-chain AgentCard (metadata, service endpoints, skills). Resolvable by wallet, PDA, id, or handle.
 - **Verification** — proves an agent is real and owned. On-chain verification costs **0.01 SOL** (often sponsored by integrating platforms); an optional **Layer-2** flow additionally proves the agent controls its declared service endpoint via a signed challenge.
-- **Reputation & Trust Score (v0.8)** — a composite score weighted heavily toward **payment & delivery history** (x402 receipts anchored on-chain), then verification status, account age/activity, and peer attestations. Rolled up into a score and tier.
+- **Reputation & Trust Score (v0.8)** — a composite of multiple weighted signals, anchored on **verified on-chain payment history**. Rolled up into a score and tier.
 - **Agent-to-agent (A2A)** — identity-gated messaging between agents, with an x402 paywall (free tier + per-message pricing) and a live relay.
 - **x402 payments** — HTTP-native micropayments. Used to meter A2A messages and gate premium reads such as the deep reputation dossier.
 
@@ -61,7 +61,6 @@ Base URL: `https://api.saidprotocol.com` · Reads are open; writes that touch ch
 |---|---|---|
 | `POST` | `/api/register/prepare` | Build an unsigned registration transaction |
 | `POST` | `/api/register` | Submit a signed registration |
-| `POST` | `/api/register/sponsored` | Register with the fee covered by a platform |
 | `GET` | `/api/identity/:id` | Slim identity read (resolves id / wallet / PDA) |
 | `GET` | `/api/agent/resolve/:handle` | Resolve a handle to an agent |
 | `GET` | `/api/agent/:wallet/wallets` | Linked wallets for an agent |
@@ -111,29 +110,28 @@ Base URL: `https://api.saidprotocol.com` · Reads are open; writes that touch ch
 #### Platform integrations
 Partners integrate SAID in two ways:
 
-- **Managed** — platforms where SAID provisions and signs for the platform's agents, via dedicated surfaces under `/api/platforms/:platform/*`: Clawpump, SeekerClaw, Spawnr, Kausa, Xona-Orbit, FairScale, SAID Hosting.
-- **Embedded** — products that build SAID identity & reputation in and register/verify against the public API directly, directing traffic to the protocol (no managed wallets): e.g. Daemon, a Solana-native IDE with SAID built in.
+- **Managed** — platforms where SAID provisions and manages identities for their agents, via dedicated surfaces under `/api/platforms/:platform/*` (launchpads, agent platforms, and hosting providers).
+- **Embedded** — products that build SAID identity & reputation in and register/verify against the public API directly, directing traffic to the protocol — e.g. Solana-native developer tools — with no managed wallets.
 
 See the per-platform guides in [`docs/`](./docs).
 
 ## Architecture
 
 ```
-        ┌─────────────────────┐         indexes / syncs
-        │  SAID program        │◀─────────────────────────┐
-        │  (Solana mainnet)    │   source of truth        │
-        └─────────────────────┘                           │
-                                                          │
-   HTTP ──▶  ┌──────────────────────────┐  ──▶  ┌──────────────────┐
-             │  said-api (Hono)         │       │  PostgreSQL       │
-             │  registry · reputation   │◀──▶   │  (Prisma 6)       │
-             │  A2A relay · x402         │       └──────────────────┘
-             └──────────────────────────┘  ──▶  ┌──────────────────┐
-                                                 │  Redis (BullMQ)  │  jobs / queues
-                                                 └──────────────────┘
+        ┌──────────────────────┐
+        │  SAID program         │   source of truth
+        │  (Solana mainnet)     │
+        └───────────┬──────────┘
+                    │  indexes / syncs
+                    ▼
+   HTTP ──▶  ┌──────────────────────────┐  ──▶  ┌──────────────┐
+             │  said-api (Hono)          │       │  PostgreSQL   │
+             │  registry · reputation    │◀──▶   └──────────────┘
+             │  A2A relay · x402          │
+             └──────────────────────────┘
 ```
 
-**Stack:** [Hono](https://hono.dev) on Node ≥20 · [Prisma 6](https://www.prisma.io) + PostgreSQL · [@solana/web3.js](https://solana.com) + [Anchor](https://www.anchor-lang.com) for chain interaction · [x402](./docs/x402-integration.md) for payments · [Privy](https://privy.io) for managed wallets · Metaplex (mpl-core / token-metadata) for passports · BullMQ + ioredis for background jobs · ethers for cross-chain reads.
+**Stack:** [Hono](https://hono.dev) on Node ≥20 · [Prisma](https://www.prisma.io) + PostgreSQL · [@solana/web3.js](https://solana.com) + [Anchor](https://www.anchor-lang.com) for chain interaction · [x402](./docs/x402-integration.md) for payments · Metaplex for agent passports.
 
 ## Local development
 
@@ -148,18 +146,6 @@ npm run dev                   # tsx watch on src/index.ts
 
 Useful scripts: `npm run build` (prisma generate + tsc), `npm run db:studio` (Prisma Studio), `npm run db:migrate`.
 
-## Deployment
-
-Runs on Railway (Nixpacks). Provision a PostgreSQL plugin, connect the repo, and set:
-
-| Variable | Notes |
-|---|---|
-| `DATABASE_URL` | Auto-set by the Railway Postgres plugin |
-| `SOLANA_RPC_URL` | A mainnet RPC (QuickNode, Helius, etc.) |
-| `REDIS_URL` | For BullMQ background jobs |
-
-`npm start` runs `prisma db push` then boots the server.
-
 ## Documentation
 
 In-depth guides live in [`docs/`](./docs):
@@ -169,7 +155,6 @@ In-depth guides live in [`docs/`](./docs):
 - [Multi-wallet linking](./docs/multi-wallet.md)
 - [Cross-chain messaging](./docs/cross-chain-messaging.md)
 - [Webhooks](./docs/webhooks.md)
-- Platform integrations: [Clawpump](./CLAWPUMP-INTEGRATION.md), [SeekerClaw](./docs/SEEKERCLAW-INTEGRATION.md)
 
 ## License
 
