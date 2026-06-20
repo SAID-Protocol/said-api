@@ -537,13 +537,19 @@ app.get('/api/agents', async (c) => {
     where.isVerified = true;
   }
   
-  const orderBy: any = sort === 'newest' 
-    ? { registeredAt: 'desc' }
+  // Every sort gets a unique `id` tiebreaker: the primary keys are non-unique
+  // (thousands of agents share a reputationScore) and mutate under the score
+  // refresher, so without a tiebreaker offset pagination duplicates some rows
+  // and never serves others.
+  const orderBy: any = sort === 'newest'
+    ? [{ registeredAt: 'desc' }, { id: 'asc' }]
     : sort === 'name'
-    ? { name: 'asc' }
+    ? [{ name: 'asc' }, { id: 'asc' }]
     : sort === 'trust'
-    ? { trustScore: { score: 'desc' } }
-    : { reputationScore: 'desc' };
+    ? [{ trustScore: { score: 'desc' } }, { id: 'asc' }]
+    : sort === 'active'
+    ? [{ lastActiveAt: { sort: 'desc', nulls: 'last' } }, { id: 'asc' }]
+    : [{ reputationScore: 'desc' }, { id: 'asc' }];
   
   const agents = await prisma.agent.findMany({
     where,
@@ -768,6 +774,85 @@ app.get('/api/agents/:wallet', async (c) => {
     launchedTokens,
     fairscale: fairscaleRaw,
   });
+});
+
+// ---------------------------------------------------------------------------
+// Partner-facing identity read. The slim, integration-friendly view of an
+// agent: a stable opaque `id`, a display name, verification status, and the
+// reputation tier/score — and NOTHING crypto by default. Partners (agent
+// frameworks, A2A relays, authz layers, marketplaces) consume this without
+// needing to know there's a Solana wallet behind it.
+//
+//   - Resolves by SAID id (cuid), wallet, OR pda — paste whatever you have.
+//   - Default response hides wallet/pda/owner/sync internals.
+//   - `?include=onchain` opts INTO the verifiable crypto anchor (wallet, pda,
+//     explorer link) for partners who want to audit on-chain — transparency
+//     stays a feature, but it's never forced into the default surface.
+//   - Fast path: serves the stored reputation with a lightweight v0.8 overlay;
+//     no per-request recompute (that's what /api/agents/:wallet is for).
+app.get('/api/identity/:id', async (c) => {
+  const ident = c.req.param('id');
+  const includeOnchain = c.req.query('include') === 'onchain';
+
+  const agent = await prisma.agent.findFirst({
+    where: { OR: [{ id: ident }, { wallet: ident }, { pda: ident }] },
+    include: { trustScore: true, _count: { select: { feedbackReceived: true } } },
+  });
+
+  if (!agent) {
+    return c.json({ error: 'Identity not found' }, 404);
+  }
+
+  // Reputation v0.8 is the source of truth; fall back to the stored v0.6
+  // tier/score if the agent has no posterior yet (too new / unscored).
+  let tier: string = agent.trustScore?.tier ?? 'unranked';
+  let score: number = agent.reputationScore ?? 0;
+  let scored = false;
+  try {
+    const rep = await getV8Reputation(prisma, agent.wallet);
+    if (rep.found) {
+      tier = rep.tier;
+      score = Number((rep.compositeScore * 100).toFixed(1));
+      scored = true;
+    }
+  } catch (err) {
+    console.error('[/api/identity/:id] v8 reputation read failed, serving stored', ident, err);
+  }
+
+  const body: any = {
+    id: agent.id,
+    name: agent.name,
+    description: agent.description,
+    image: agent.image,
+    verified: agent.isVerified,
+    reputation: {
+      score, // 0–100
+      tier, // unranked | bronze | silver | gold | platinum
+      badges: agent.trustScore?.badges ?? [],
+      feedbackCount: agent._count.feedbackReceived,
+      scored,
+    },
+    capabilities: {
+      serviceTypes: agent.serviceTypes ?? [],
+      skills: agent.skills ?? [],
+      a2a: agent.a2aEndpoint ?? null,
+      mcp: agent.mcpEndpoint ?? null,
+    },
+    registeredAt: agent.registeredAt,
+  };
+
+  // Opt-in verifiable anchor. The agent's identity is provable on-chain; we
+  // just don't lead with it. Partners who want to audit pass ?include=onchain.
+  if (includeOnchain) {
+    body.onchain = {
+      chain: 'solana',
+      wallet: agent.wallet,
+      pda: agent.pda,
+      explorer: `https://solscan.io/account/${agent.wallet}`,
+    };
+  }
+
+  return c.json(body);
 });
 
 // Get agent feedback
@@ -8118,7 +8203,7 @@ app.post('/api/wallet/link', async (c) => {
     
     // Build link_wallet instruction
     // Anchor discriminator: sha256("global:link_wallet")[0..8]
-    const discriminator = Buffer.from([200, 73, 238, 175, 165, 125, 153, 7]);
+    const discriminator = Buffer.from([86, 92, 31, 146, 228, 51, 209, 230]);
     
     const linkIx = {
       programId: SAID_PROGRAM_ID,
@@ -8219,7 +8304,7 @@ app.delete('/api/wallet/link', async (c) => {
     
     // Build unlink_wallet instruction
     // Anchor discriminator: sha256("global:unlink_wallet")[0..8]
-    const discriminator = Buffer.from([222, 157, 120, 224, 146, 221, 191, 198]);
+    const discriminator = Buffer.from([220, 121, 97, 13, 193, 137, 209, 159]);
     
     const unlinkIx = {
       programId: SAID_PROGRAM_ID,
@@ -8318,7 +8403,7 @@ app.post('/api/wallet/transfer-authority', async (c) => {
     
     // Build transfer_authority instruction
     // Anchor discriminator: sha256("global:transfer_authority")[0..8]
-    const discriminator = Buffer.from([101, 245, 179, 178, 230, 198, 76, 163]);
+    const discriminator = Buffer.from([48, 169, 76, 72, 229, 180, 55, 161]);
     
     const transferIx = {
       programId: SAID_PROGRAM_ID,

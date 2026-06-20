@@ -78,6 +78,7 @@ model Agent {
   @@index([reputationScore])
   @@index([isVerified])
   @@index([platformId])
+  @@index([lastActiveAt])
 }
 
 model Feedback {
