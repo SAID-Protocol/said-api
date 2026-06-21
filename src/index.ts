@@ -3990,213 +3990,20 @@ app.get('/api/platforms/spawnr/agents', async (c) => {
  */
 app.get('/api/badge/embed/:wallet', async (c) => {
   const wallet = c.req.param('wallet');
-  
+  const style = c.req.query('style') || 'passport';
+
   try {
-    const agent = await prisma.agent.findUnique({ where: { wallet } });
-    
-    if (!agent) {
-      // Return "Not Found" badge
-      const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SAID Badge</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: transparent;
-      padding: 16px;
-    }
-    .badge {
-      background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
-      border: 2px solid #404040;
-      border-radius: 12px;
-      padding: 20px;
-      max-width: 400px;
-      color: #fff;
-    }
-    .header {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 12px;
-    }
-    .logo {
-      width: 40px;
-      height: 40px;
-      background: #404040;
-      border-radius: 8px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: bold;
-      font-size: 18px;
-    }
-    .title {
-      font-size: 18px;
-      font-weight: 600;
-    }
-    .status {
-      display: inline-block;
-      padding: 4px 12px;
-      background: #404040;
-      color: #999;
-      border-radius: 6px;
-      font-size: 14px;
-      margin-top: 8px;
-    }
-    .footer {
-      margin-top: 12px;
-      font-size: 12px;
-      color: #888;
-      text-align: center;
-    }
-  </style>
-</head>
-<body>
-  <div class="badge">
-    <div class="header">
-      <div class="logo">S</div>
-      <div class="title">Agent Not Found</div>
-    </div>
-    <div class="status">⚠️ Not Registered</div>
-    <div class="footer">Powered by SAID Protocol</div>
-  </div>
-</body>
-</html>`;
-      return c.html(html);
-    }
-    
-    // Return verified/not verified badge
-    const isVerified = agent.isVerified;
-    const statusColor = isVerified ? '#10b981' : '#6b7280';
-    const statusBg = isVerified ? '#10b98120' : '#6b728020';
-    const statusText = isVerified ? '✓ SAID Verified' : 'Not Verified';
-    
+    const data = await loadBadgeData(wallet);
+    const svg = data
+      ? generateBadgeSvg(data, style)
+      : `<svg xmlns="http://www.w3.org/2000/svg" width="348" height="108" viewBox="0 0 348 108"><rect x="0.5" y="0.5" width="347" height="107" rx="16" fill="#0B0F19" stroke="rgba(255,255,255,0.08)"/><text x="174" y="58" fill="#71717a" font-family="Inter,system-ui,sans-serif" font-size="13" font-weight="600" text-anchor="middle">Agent not registered on SAID</text></svg>`;
+    const title = data ? `SAID · ${escapeXml(data.name)}` : 'SAID Badge';
     const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SAID Badge - ${agent.name || wallet.slice(0, 8)}</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      background: transparent;
-      padding: 16px;
-    }
-    .badge {
-      background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
-      border: 2px solid ${isVerified ? statusColor : '#404040'};
-      border-radius: 12px;
-      padding: 20px;
-      max-width: 400px;
-      color: #fff;
-      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-    }
-    .header {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 12px;
-    }
-    .logo {
-      width: 40px;
-      height: 40px;
-      background: ${isVerified ? statusColor : '#404040'};
-      border-radius: 8px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: bold;
-      font-size: 18px;
-    }
-    .info {
-      flex: 1;
-    }
-    .name {
-      font-size: 18px;
-      font-weight: 600;
-      margin-bottom: 4px;
-    }
-    .wallet {
-      font-size: 12px;
-      color: #888;
-      font-family: monospace;
-    }
-    .status {
-      display: inline-block;
-      padding: 6px 12px;
-      background: ${statusBg};
-      color: ${statusColor};
-      border: 1px solid ${statusColor};
-      border-radius: 6px;
-      font-size: 14px;
-      font-weight: 600;
-      margin-top: 12px;
-    }
-    .reputation {
-      margin-top: 12px;
-      padding: 12px;
-      background: #ffffff08;
-      border-radius: 8px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    .rep-label {
-      font-size: 13px;
-      color: #aaa;
-    }
-    .rep-score {
-      font-size: 20px;
-      font-weight: 700;
-      color: ${statusColor};
-    }
-    .footer {
-      margin-top: 12px;
-      font-size: 12px;
-      color: #888;
-      text-align: center;
-    }
-    .footer a {
-      color: ${statusColor};
-      text-decoration: none;
-    }
-  </style>
-</head>
-<body>
-  <div class="badge">
-    <div class="header">
-      <div class="logo">${isVerified ? '✓' : 'S'}</div>
-      <div class="info">
-        <div class="name">${agent.name || 'Agent'}</div>
-        <div class="wallet">${wallet.slice(0, 4)}...${wallet.slice(-4)}</div>
-      </div>
-    </div>
-    <div class="status">${statusText}</div>
-    <div class="reputation">
-      <div class="rep-label">Reputation Score</div>
-      <div class="rep-score">${Math.round(agent.reputationScore)}</div>
-    </div>
-    <div class="footer">
-      Powered by <a href="https://www.saidprotocol.com" target="_blank">SAID Protocol</a>
-    </div>
-  </div>
-</body>
-</html>`;
-    
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>${title}</title><style>*{margin:0;padding:0;box-sizing:border-box}html,body{background:transparent}body{display:inline-block;padding:8px}svg{max-width:100%;height:auto;display:block}</style></head><body>${svg}</body></html>`;
     return c.html(html);
-    
   } catch (error: any) {
     console.error('[Badge Embed Error]', error);
-    const html = `<!DOCTYPE html>
-<html><body style="font-family: sans-serif; padding: 20px; color: #666;">
-Error loading badge. Please try again later.
-</body></html>`;
+    const html = `<!DOCTYPE html><html><body style="font-family: sans-serif; padding: 20px; color: #666;">Error loading badge. Please try again later.</body></html>`;
     return c.html(html, 500);
   }
 });
@@ -5856,102 +5663,256 @@ app.get('/api/providers', async (c) => {
 
 // ============ SVG BADGE ============
 
-function generateBadgeSvg(agent: { name: string; isVerified: boolean; reputationScore: number; wallet: string; tier?: string; scored?: boolean }, style: string = 'default'): string {
-  const name = agent.name || 'Agent';
-  const score = Math.round(agent.reputationScore);
-  const shortWallet = agent.wallet.slice(0, 4) + '...' + agent.wallet.slice(-4);
+// ============ SAID VERIFIED BADGE (passport / tier / chip) ============
+// One coherent badge family, built on the live site tokens: midnight #0B0F19
+// canvas, Inter type, the deterministic identicon, and the v0.8 trust tiers.
+// Reputation is color-coded by tier; the higher the tier the more "pizzazz"
+// (silver = clean baseline, gold = metallic ring + ★ pill, platinum =
+// holographic ring + 👑 pill + sparkle cluster). Avatar resolves:
+// uploaded image → twitter avatar → identicon.
 
-  // v0.8 tier (bronze/silver/gold/platinum) is the source of truth Chris/UsePod asked for.
-  const t = (agent.tier || 'unranked').toLowerCase();
-  const TIER_COLORS: Record<string, string> = {
-    platinum: '#67e8f9',
-    gold: '#fbbf24',
-    silver: '#cbd5e1',
-    bronze: '#cd7f32',
-    unranked: '#888',
+type BadgeRenderData = {
+  name: string;
+  wallet: string;
+  isVerified: boolean;
+  tier: string;
+  score: number;
+  scored: boolean;
+  avatarHref: string | null;
+};
+
+const BADGE_TIER: Record<string, { solid: string; fillA: string; strokeA: string }> = {
+  platinum: { solid: '#C084FC', fillA: 'rgba(192,132,252,0.14)', strokeA: 'rgba(192,132,252,0.40)' },
+  gold:     { solid: '#FBBF24', fillA: 'rgba(251,191,36,0.14)',  strokeA: 'rgba(251,191,36,0.40)' },
+  silver:   { solid: '#A1A1AA', fillA: 'rgba(161,161,170,0.14)', strokeA: 'rgba(161,161,170,0.40)' },
+  bronze:   { solid: '#FB923C', fillA: 'rgba(251,146,60,0.14)',  strokeA: 'rgba(251,146,60,0.40)' },
+  unranked: { solid: '#71717A', fillA: 'rgba(113,113,122,0.12)', strokeA: 'rgba(113,113,122,0.34)' },
+};
+const BADGE_LEVEL: Record<string, number> = { platinum: 3, gold: 2, silver: 1, bronze: 1, unranked: 0 };
+
+const badgeTrunc = (s: string, n: number) => { s = s || 'Agent'; return s.length <= n ? s : s.slice(0, n - 1) + '…'; };
+const badgeShortWallet = (w: string) => w.slice(0, 5) + '…' + w.slice(-4);
+
+function badgeIdenticonInner(wallet: string): string {
+  return generateAvatarSVG(wallet).replace(/^<svg[^>]*>/, '').replace(/<\/svg>\s*$/, '');
+}
+
+function badgeAvatar(uid: string, wallet: string, avatarHref: string | null, x: number, y: number, size: number, rad: number): string {
+  const clip = `<clipPath id="cp-${uid}"><rect x="${x}" y="${y}" width="${size}" height="${size}" rx="${rad}"/></clipPath>`;
+  if (avatarHref) {
+    return clip + `<image href="${escapeXml(avatarHref)}" x="${x}" y="${y}" width="${size}" height="${size}" preserveAspectRatio="xMidYMid slice" clip-path="url(#cp-${uid})"/>`;
+  }
+  // deterministic identicon, inlined (no external fetch needed)
+  return clip + `<g clip-path="url(#cp-${uid})"><svg x="${x}" y="${y}" width="${size}" height="${size}" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid slice">${badgeIdenticonInner(wallet)}</svg></g>`;
+}
+
+function badgeRingPaint(uid: string, tier: string, solid: string): [string, string] {
+  if (tier === 'platinum') return [`<linearGradient id="rg-${uid}" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#E9D5FF"/><stop offset="32%" stop-color="#C084FC"/><stop offset="60%" stop-color="#818CF8"/><stop offset="100%" stop-color="#7DD3FC"/></linearGradient>`, `url(#rg-${uid})`];
+  if (tier === 'gold') return [`<linearGradient id="rg-${uid}" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#FDE68A"/><stop offset="50%" stop-color="#F59E0B"/><stop offset="100%" stop-color="#FBBF24"/></linearGradient>`, `url(#rg-${uid})`];
+  return ['', solid];
+}
+
+function badgeScorePaint(uid: string, tier: string, solid: string): [string, string] {
+  if (tier === 'platinum') return [`<linearGradient id="sg-${uid}" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#F3E8FF"/><stop offset="100%" stop-color="#A78BFA"/></linearGradient>`, `url(#sg-${uid})`];
+  if (tier === 'gold') return [`<linearGradient id="sg-${uid}" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#FEF3C7"/><stop offset="100%" stop-color="#F59E0B"/></linearGradient>`, `url(#sg-${uid})`];
+  return ['', solid];
+}
+
+function badgeSparkle(cx: number, cy: number, s: number, fill: string, op = 1): string {
+  return `<path d="M${cx} ${cy - s} C${cx} ${cy - s * 0.32} ${cx + s * 0.32} ${cy} ${cx + s} ${cy} C${cx + s * 0.32} ${cy} ${cx} ${cy + s * 0.32} ${cx} ${cy + s} C${cx} ${cy + s * 0.32} ${cx - s * 0.32} ${cy} ${cx - s} ${cy} C${cx - s * 0.32} ${cy} ${cx} ${cy - s * 0.32} ${cx} ${cy - s} Z" fill="${fill}" opacity="${op}"/>`;
+}
+
+function badgeStar5(cx: number, cy: number, r: number, fill: string, op = 1): string {
+  const pts: string[] = [];
+  for (let i = 0; i < 10; i++) {
+    const ang = -Math.PI / 2 + i * Math.PI / 5;
+    const rr = i % 2 === 0 ? r : r * 0.42;
+    pts.push(`${(cx + rr * Math.cos(ang)).toFixed(2)},${(cy + rr * Math.sin(ang)).toFixed(2)}`);
+  }
+  return `<polygon points="${pts.join(' ')}" fill="${fill}" opacity="${op}"/>`;
+}
+
+function badgeCrown(cx: number, base: number, w: number, fill: string): string {
+  const h = w * 0.9, gr = w * 0.22;
+  const d = `M${cx - w} ${base} L${cx - w} ${base - h * 0.5} L${cx - w * 0.42} ${base - h * 0.15} L${cx} ${base - h} L${cx + w * 0.42} ${base - h * 0.15} L${cx + w} ${base - h * 0.5} L${cx + w} ${base} Z`;
+  return `<path d="${d}" fill="${fill}"/><circle cx="${cx - w}" cy="${base - h * 0.5}" r="${gr.toFixed(2)}" fill="${fill}"/><circle cx="${cx}" cy="${base - h}" r="${(gr * 1.15).toFixed(2)}" fill="${fill}"/><circle cx="${cx + w}" cy="${base - h * 0.5}" r="${gr.toFixed(2)}" fill="${fill}"/>`;
+}
+
+function badgeCheckSeal(cx: number, cy: number, r: number, color: string): string {
+  const s = r * 0.55;
+  return `<circle cx="${cx}" cy="${cy}" r="${r + 1.5}" fill="#0B0F19"/><circle cx="${cx}" cy="${cy}" r="${r}" fill="${color}"/><path d="M${cx - s} ${cy} l${s * 0.7} ${s * 0.7} l${s * 1.3} -${s * 1.5}" stroke="#0B0F19" stroke-width="${r * 0.22}" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`;
+}
+
+function badgePillMark(lvl: number, cx: number, cy: number, ringP: string): string {
+  if (lvl === 3) return badgeCrown(cx - 1, cy + 3, cy < 11 ? 4.5 : 5, ringP);
+  if (lvl === 2) return badgeStar5(cx, cy, cy < 11 ? 4 : 4.2, ringP);
+  return `<circle cx="${cx}" cy="${cy}" r="3.2" fill="${ringP}"/>`;
+}
+
+function badgeChip(d: BadgeRenderData, uid: string): string {
+  const verified = d.isVerified;
+  const mark = verified
+    ? `<circle cx="84" cy="15" r="6" fill="#22c55e"/><path d="M81 15 l2 2 l4 -4.6" stroke="#0B0F19" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`
+    : `<circle cx="84" cy="15" r="5.2" fill="none" stroke="#71717A" stroke-width="1.4"/>`;
+  const labelColor = verified ? '#22c55e' : '#a1a1aa';
+  const labelText = verified ? 'Verified' : 'Registered';
+  const w = Math.round(95 + labelText.length * 6.6 + 10);
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="30" viewBox="0 0 ${w} 30">
+<rect x="0.5" y="0.5" width="${w - 1}" height="29" rx="8" fill="#0B0F19" stroke="rgba(255,255,255,0.09)"/>
+${badgeAvatar(uid, d.wallet, d.avatarHref, 6, 6, 18, 4)}
+<text x="32" y="19.5" fill="#f4f4f5" font-family="Inter,system-ui,sans-serif" font-size="12" font-weight="700" letter-spacing="-0.01em">SAID</text>
+<rect x="68" y="8" width="1" height="14" fill="rgba(255,255,255,0.12)"/>
+${mark}
+<text x="95" y="19.5" fill="${labelColor}" font-family="Inter,system-ui,sans-serif" font-size="12" font-weight="600" letter-spacing="-0.01em">${labelText}</text>
+</svg>`;
+}
+
+function badgeTierStyle(d: BadgeRenderData, uid: string): string {
+  const tier = BADGE_TIER[d.tier] ? d.tier : 'unranked';
+  const { solid, fillA, strokeA } = BADGE_TIER[tier];
+  const lvl = BADGE_LEVEL[tier] ?? 0;
+  const [ringDef, ringP] = badgeRingPaint(uid, tier, solid);
+  const label = d.scored ? tier.toUpperCase() : 'UNRANKED';
+  const pillw = 30 + label.length * 7.2;
+  const px = 208 - pillw;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="216" height="38" viewBox="0 0 216 38">
+<defs>${ringDef}</defs>
+<rect x="0.5" y="0.5" width="215" height="37" rx="9" fill="#0B0F19" stroke="rgba(255,255,255,0.09)"/>
+${badgeAvatar(uid, d.wallet, d.avatarHref, 7, 7, 24, 5)}
+<text x="40" y="17" fill="#f4f4f5" font-family="Inter,system-ui,sans-serif" font-size="12.5" font-weight="700" letter-spacing="-0.01em">${escapeXml(badgeTrunc(d.name, 16))}</text>
+<text x="40" y="30" fill="#8b8b93" font-family="ui-monospace,monospace" font-size="9.5">${badgeShortWallet(d.wallet)}</text>
+<g transform="translate(${px.toFixed(0)},9)">
+<rect width="${pillw.toFixed(0)}" height="20" rx="10" fill="${fillA}" stroke="${strokeA}"/>
+${badgePillMark(lvl, 13, 10, ringP)}
+<text x="24" y="14" fill="${solid}" font-family="Inter,system-ui,sans-serif" font-size="10" font-weight="700" letter-spacing="0.04em">${label}</text>
+</g></svg>`;
+}
+
+function badgePassport(d: BadgeRenderData, uid: string): string {
+  const tier = BADGE_TIER[d.tier] ? d.tier : 'unranked';
+  const { solid, fillA, strokeA } = BADGE_TIER[tier];
+  const lvl = BADGE_LEVEL[tier] ?? 0;
+  const [ringDef, ringP] = badgeRingPaint(uid, tier, solid);
+  const [scoreDef, scoreP] = badgeScorePaint(uid, tier, solid);
+  const glowTop = ({ 3: 0.20, 2: 0.15, 1: 0.06, 0: 0.04 } as Record<number, number>)[lvl];
+  const haloOp = ({ 3: 0.65, 2: 0.56, 1: 0.30, 0: 0.20 } as Record<number, number>)[lvl];
+  const ringW = lvl >= 2 ? 2.5 : 2;
+  const label = d.scored ? tier.toUpperCase() : 'UNRANKED';
+  const pillw = 34 + label.length * 7.4;
+
+  let flourish = '';
+  if (lvl === 3) flourish = badgeSparkle(150, 17, 3.2, '#E9D5FF', 0.95) + badgeSparkle(305, 22, 2.4, '#C084FC', 0.85) + badgeSparkle(214, 40, 2.0, '#93C5FD', 0.80);
+  else if (lvl === 2) flourish = badgeSparkle(300, 34, 2.6, '#FDE68A', 0.90);
+
+  const seal = d.isVerified ? badgeCheckSeal(72, 78, 9, ringP) : '';
+  const footer = d.isVerified ? 'Verified on SAID ✦' : 'Registered on SAID';
+
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="348" height="108" viewBox="0 0 348 108">
+<defs>
+<linearGradient id="glow-${uid}" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="${solid}" stop-opacity="${glowTop}"/><stop offset="55%" stop-color="${solid}" stop-opacity="0"/></linearGradient>
+<radialGradient id="rh-${uid}" cx="50%" cy="50%" r="50%"><stop offset="58%" stop-color="${solid}" stop-opacity="0"/><stop offset="100%" stop-color="${solid}" stop-opacity="${haloOp}"/></radialGradient>
+${ringDef}${scoreDef}
+</defs>
+<rect x="0.5" y="0.5" width="347" height="107" rx="16" fill="#0B0F19" stroke="rgba(255,255,255,0.08)"/>
+<rect x="1" y="1" width="346" height="64" rx="15" fill="url(#glow-${uid})"/>
+${flourish}
+<rect x="16" y="22" width="64" height="64" rx="15" fill="url(#rh-${uid})"/>
+${badgeAvatar(uid, d.wallet, d.avatarHref, 20, 26, 56, 12)}
+<rect x="18.5" y="24.5" width="59" height="59" rx="13" fill="none" stroke="${ringP}" stroke-width="${ringW}"/>
+${seal}
+<text x="92" y="44" fill="#f4f4f5" font-family="Inter,system-ui,sans-serif" font-size="16" font-weight="700" letter-spacing="-0.01em">${escapeXml(badgeTrunc(d.name, 18))}</text>
+<text x="92" y="64" fill="#8b8b93" font-family="ui-monospace,monospace" font-size="11">${badgeShortWallet(d.wallet)}</text>
+<g transform="translate(92,75)">
+<rect width="${pillw.toFixed(0)}" height="22" rx="11" fill="${fillA}" stroke="${strokeA}"/>
+${badgePillMark(lvl, 14, 11, ringP)}
+<text x="24" y="15" fill="${solid}" font-family="Inter,system-ui,sans-serif" font-size="10.5" font-weight="700" letter-spacing="0.04em">${label}</text>
+</g>
+<text x="330" y="40" fill="#5b5b63" font-family="Inter,system-ui,sans-serif" font-size="9" font-weight="600" letter-spacing="0.12em" text-anchor="end">TRUST SCORE</text>
+<text x="330" y="72" fill="${scoreP}" font-family="Inter,system-ui,sans-serif" font-size="30" font-weight="800" letter-spacing="-0.02em" text-anchor="end">${Math.round(d.score)}</text>
+<text x="330" y="94" fill="#5b5b63" font-family="Inter,system-ui,sans-serif" font-size="9.5" font-weight="600" text-anchor="end">${footer}</text>
+</svg>`;
+}
+
+function generateBadgeSvg(d: BadgeRenderData, style: string = 'passport'): string {
+  const uid = (d.wallet || 'said').replace(/[^A-Za-z0-9]/g, '').slice(0, 10) || 'said';
+  const s = style === 'minimal' ? 'chip' : style === 'score' ? 'tier' : style === 'default' ? 'passport' : style;
+  if (s === 'chip') return badgeChip(d, uid);
+  if (s === 'tier') return badgeTierStyle(d, uid);
+  return badgePassport(d, uid);
+}
+
+// --- avatar resolution: uploaded image → twitter avatar → identicon ----------
+// External images can't be referenced from an <img>-embedded SVG (browsers run
+// it in secure-static mode), so we fetch the picture server-side and inline it
+// as a base64 data-URI. Cached in-memory; capped by byte size; any failure
+// falls through to the deterministic identicon (which needs no fetch).
+const BADGE_PFP_TTL_MS = 60 * 60 * 1000;
+const BADGE_PFP_MAX_BYTES = 400_000;
+const badgePfpCache = new Map<string, { uri: string | null; exp: number }>();
+
+function badgeTwitterHandle(t?: string | null): string | null {
+  if (!t) return null;
+  const m = t.match(/(?:x\.com\/|twitter\.com\/|@)?([A-Za-z0-9_]{2,30})\/?$/);
+  return m ? m[1] : null;
+}
+
+async function resolveBadgeAvatar(image?: string | null, twitter?: string | null): Promise<string | null> {
+  const handle = badgeTwitterHandle(twitter);
+  const url = image || (handle ? `https://unavatar.io/x/${handle}` : null);
+  if (!url || !/^https?:\/\//.test(url)) return null; // → identicon
+  const now = Date.now();
+  const cached = badgePfpCache.get(url);
+  if (cached && cached.exp > now) return cached.uri;
+  let uri: string | null = null;
+  try {
+    const res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(4000) });
+    if (res.ok) {
+      const ct = (res.headers.get('content-type') || '').split(';')[0].trim();
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (ct.startsWith('image/') && buf.length > 0 && buf.length <= BADGE_PFP_MAX_BYTES) {
+        uri = `data:${ct};base64,${buf.toString('base64')}`;
+      }
+    }
+  } catch {
+    // network / timeout / oversize → identicon fallback
+  }
+  badgePfpCache.set(url, { uri, exp: now + BADGE_PFP_TTL_MS });
+  return uri;
+}
+
+async function loadBadgeData(wallet: string): Promise<BadgeRenderData | null> {
+  const agent = await prisma.agent.findUnique({
+    where: { wallet },
+    select: { name: true, wallet: true, isVerified: true, image: true, twitter: true, reputationScore: true },
+  });
+  if (!agent) return null;
+
+  // v0.8 reputation is the source of truth for tier + score; fall back to the
+  // stored v0.6 reputationScore if the agent has no posterior yet.
+  let tier = 'unranked';
+  let score = Math.round(agent.reputationScore ?? 0);
+  let scored = false;
+  try {
+    const rep = await getV8Reputation(prisma, wallet);
+    if (rep.found) {
+      tier = rep.tier;
+      score = Math.round(rep.compositeScore * 100);
+      scored = true;
+    }
+  } catch {
+    // keep stored values
+  }
+
+  const avatarHref = await resolveBadgeAvatar(agent.image, agent.twitter);
+  return {
+    name: agent.name || 'Agent',
+    wallet: agent.wallet,
+    isVerified: agent.isVerified,
+    tier,
+    score,
+    scored,
+    avatarHref,
   };
-  const tierColor = TIER_COLORS[t] || '#888';
-  const tierLabel = agent.scored ? t.toUpperCase() : 'UNRANKED';
-
-  if (style === 'minimal') {
-    // Minimal shield-style badge
-    return `<svg xmlns="http://www.w3.org/2000/svg" width="120" height="28" viewBox="0 0 120 28">
-  <defs>
-    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" style="stop-color:#1a1a1a"/>
-      <stop offset="100%" style="stop-color:#2a2a2a"/>
-    </linearGradient>
-  </defs>
-  <rect width="120" height="28" rx="4" fill="url(#bg)"/>
-  <text x="8" y="18" fill="#fff" font-family="system-ui,-apple-system,sans-serif" font-size="11" font-weight="600">SAID</text>
-  <rect x="42" y="0" width="1" height="28" fill="#444"/>
-  <text x="50" y="18" fill="${agent.isVerified ? '#22c55e' : '#888'}" font-family="system-ui,-apple-system,sans-serif" font-size="11" font-weight="500">${agent.isVerified ? '✓ Verified' : 'Registered'}</text>
-</svg>`;
-  }
-  
-  if (style === 'tier') {
-    // Compact tier badge: SAID | ● TIER  (the "simple badge" for providers)
-    return `<svg xmlns="http://www.w3.org/2000/svg" width="140" height="28" viewBox="0 0 140 28">
-  <defs>
-    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" style="stop-color:#1a1a1a"/>
-      <stop offset="100%" style="stop-color:#2a2a2a"/>
-    </linearGradient>
-  </defs>
-  <rect width="140" height="28" rx="4" fill="url(#bg)"/>
-  <text x="8" y="18" fill="#fff" font-family="system-ui,-apple-system,sans-serif" font-size="11" font-weight="600">SAID</text>
-  <rect x="42" y="0" width="1" height="28" fill="#444"/>
-  <circle cx="54" cy="14" r="4" fill="${tierColor}"/>
-  <text x="64" y="18" fill="${tierColor}" font-family="system-ui,-apple-system,sans-serif" font-size="11" font-weight="700">${tierLabel}</text>
-</svg>`;
-  }
-
-  if (style === 'score') {
-    // Badge with reputation score; color follows the v0.8 tier when scored.
-    const scoreColor = agent.scored ? tierColor : '#888';
-    return `<svg xmlns="http://www.w3.org/2000/svg" width="160" height="28" viewBox="0 0 160 28">
-  <defs>
-    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" style="stop-color:#1a1a1a"/>
-      <stop offset="100%" style="stop-color:#2a2a2a"/>
-    </linearGradient>
-  </defs>
-  <rect width="160" height="28" rx="4" fill="url(#bg)"/>
-  <text x="8" y="18" fill="#fff" font-family="system-ui,-apple-system,sans-serif" font-size="11" font-weight="600">SAID</text>
-  <rect x="42" y="0" width="1" height="28" fill="#444"/>
-  <text x="50" y="18" fill="${agent.isVerified ? '#22c55e' : '#888'}" font-family="system-ui,-apple-system,sans-serif" font-size="11">${agent.isVerified ? '✓' : '○'}</text>
-  <rect x="65" y="0" width="1" height="28" fill="#444"/>
-  <text x="73" y="18" fill="${scoreColor}" font-family="system-ui,-apple-system,sans-serif" font-size="11" font-weight="600">${score}/100</text>
-  <rect x="115" y="0" width="1" height="28" fill="#444"/>
-  <text x="123" y="18" fill="#666" font-family="monospace" font-size="9">${shortWallet}</text>
-</svg>`;
-  }
-  
-  // Default: Full badge with name
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="220" height="56" viewBox="0 0 220 56">
-  <defs>
-    <linearGradient id="bg" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" style="stop-color:#1a1a1a"/>
-      <stop offset="100%" style="stop-color:#0a0a0a"/>
-    </linearGradient>
-    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" style="stop-color:${agent.isVerified ? '#22c55e' : '#666'}"/>
-      <stop offset="100%" style="stop-color:${agent.isVerified ? '#16a34a' : '#555'}"/>
-    </linearGradient>
-  </defs>
-  <rect width="220" height="56" rx="8" fill="url(#bg)" stroke="#333" stroke-width="1"/>
-  <rect x="0" y="0" width="4" height="56" rx="2" fill="url(#accent)"/>
-  <text x="16" y="24" fill="#fff" font-family="system-ui,-apple-system,sans-serif" font-size="14" font-weight="700">${escapeXml(name.slice(0, 20))}</text>
-  <text x="16" y="42" fill="#888" font-family="monospace" font-size="10">${shortWallet}</text>
-  <g transform="translate(158, 9)">
-    <rect width="52" height="16" rx="4" fill="${agent.isVerified ? '#22c55e' : '#333'}"/>
-    <text x="26" y="12" fill="${agent.isVerified ? '#fff' : '#888'}" font-family="system-ui,-apple-system,sans-serif" font-size="9" font-weight="600" text-anchor="middle">${agent.isVerified ? 'VERIFIED' : 'REG'}</text>
-  </g>
-  <g transform="translate(158, 31)">
-    <rect width="52" height="16" rx="4" fill="none" stroke="${tierColor}" stroke-width="1"/>
-    <text x="26" y="12" fill="${tierColor}" font-family="system-ui,-apple-system,sans-serif" font-size="9" font-weight="700" text-anchor="middle">${tierLabel}</text>
-  </g>
-</svg>`;
 }
 
 function escapeXml(str: string): string {
@@ -5966,12 +5927,9 @@ app.get('/api/badge/:wallet{.+\\.svg}', async (c) => {
   const wallet = (c.req.param('wallet') || '').replace(/\.svg$/, '');
   const style = c.req.query('style') || 'default';
 
-  const agent = await prisma.agent.findUnique({
-    where: { wallet },
-    select: { name: true, wallet: true, isVerified: true, reputationScore: true }
-  });
+  const data = await loadBadgeData(wallet);
 
-  if (!agent) {
+  if (!data) {
     // Return a "not found" badge
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="120" height="28" viewBox="0 0 120 28">
   <rect width="120" height="28" rx="4" fill="#1a1a1a"/>
@@ -5982,25 +5940,7 @@ app.get('/api/badge/:wallet{.+\\.svg}', async (c) => {
     return c.body(svg);
   }
 
-  // v0.8 reputation is the source of truth for the tier; fall back gracefully.
-  let tier = 'unranked';
-  let scored = false;
-  try {
-    const rep = await getV8Reputation(prisma, wallet);
-    if (rep.found) {
-      tier = rep.tier;
-      scored = true;
-    }
-  } catch {
-    // keep unranked
-  }
-
-  const svg = generateBadgeSvg({
-    ...agent,
-    name: agent.name || 'Agent',
-    tier,
-    scored,
-  }, style);
+  const svg = generateBadgeSvg(data, style);
   c.header('Content-Type', 'image/svg+xml');
   c.header('Cache-Control', 'public, max-age=300');
   return c.body(svg);
@@ -6030,10 +5970,9 @@ app.get('/api/badge/:wallet', async (c) => {
       reputationScore: agent.reputationScore,
     },
     badges: {
-      default: `${baseUrl}/api/badge/${wallet}.svg`,
-      minimal: `${baseUrl}/api/badge/${wallet}.svg?style=minimal`,
-      score: `${baseUrl}/api/badge/${wallet}.svg?style=score`,
+      passport: `${baseUrl}/api/badge/${wallet}.svg`,
       tier: `${baseUrl}/api/badge/${wallet}.svg?style=tier`,
+      chip: `${baseUrl}/api/badge/${wallet}.svg?style=chip`,
     },
     embed: {
       markdown: `[![SAID ${agent.isVerified ? 'Verified' : 'Registered'}](${baseUrl}/api/badge/${wallet}.svg)](${profileUrl})`,
