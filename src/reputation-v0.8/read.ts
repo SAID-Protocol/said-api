@@ -66,13 +66,48 @@ const POST_SELECT = {
   computedAt: true,
 } as const;
 
+// ── Sustained-launch tier-floor ─────────────────────────────────────
+// A launched token still alive at high market cap ≥21 days later is strong,
+// hard-to-fake evidence of value. We floor the agent's tier accordingly,
+// because the composite (baseline-axis drag) caps even a real launcher at
+// silver. Mirrors the floor applied in the compute pipeline's report.
+const SUSTAIN_DAYS = 21;
+const TIER_RANK: Record<Tier, number> = {
+  unranked: 0,
+  bronze: 1,
+  silver: 2,
+  gold: 3,
+  platinum: 4,
+};
+
+async function getLaunchFloors(
+  prisma: PrismaClient,
+  wallets: string[],
+): Promise<Map<string, Tier>> {
+  const floors = new Map<string, Tier>();
+  if (wallets.length === 0) return floors;
+  const launches = await prisma.launchedToken.findMany({
+    where: { agentWallet: { in: wallets }, marketCapUsd: { gte: 1_000_000 } },
+    select: { agentWallet: true, marketCapUsd: true, launchedAt: true, detectedAt: true },
+  });
+  const cutoff = Date.now() - SUSTAIN_DAYS * 24 * 60 * 60 * 1000;
+  for (const l of launches) {
+    const launchedMs = (l.launchedAt ?? l.detectedAt).getTime();
+    if (launchedMs > cutoff) continue; // not sustained long enough yet
+    const t: Tier = (l.marketCapUsd ?? 0) >= 10_000_000 ? 'platinum' : 'gold';
+    const cur = floors.get(l.agentWallet);
+    if (!cur || TIER_RANK[t] > TIER_RANK[cur]) floors.set(l.agentWallet, t);
+  }
+  return floors;
+}
+
 /**
  * Build a V8Reputation from a subject's posterior rows. compositeScore and
  * eigentrustScore are stored per-axis but identical across rows, so we take
  * them off any row; tier is re-derived from (composite, total samples,
  * identity mean) since tier isn't a stored column.
  */
-function buildFromRows(wallet: string, rows: PostRow[]): V8Reputation {
+function buildFromRows(wallet: string, rows: PostRow[], floor: Tier | null = null): V8Reputation {
   if (rows.length === 0) return UNRANKED(wallet);
 
   const compositeScore = rows[0].compositeScore;
@@ -94,17 +129,19 @@ function buildFromRows(wallet: string, rows: PostRow[]): V8Reputation {
     }
   }
 
-  const tier = assignTier(compositeScore, totalSamples, identityMean);
+  let tier = assignTier(compositeScore, totalSamples, identityMean);
+  // Sustained-launch tier-floor: bump up if the agent has a qualifying launch.
+  if (floor && TIER_RANK[floor] > TIER_RANK[tier]) tier = floor;
   return { wallet, found: true, compositeScore, tier, totalSamples, eigentrustScore, axes, computedAt };
 }
 
 /** Read one agent's v0.8 reputation from ReputationPosterior. */
 export async function getV8Reputation(prisma: PrismaClient, wallet: string): Promise<V8Reputation> {
-  const rows = await prisma.reputationPosterior.findMany({
-    where: { subjectWallet: wallet },
-    select: POST_SELECT,
-  });
-  return buildFromRows(wallet, rows);
+  const [rows, floors] = await Promise.all([
+    prisma.reputationPosterior.findMany({ where: { subjectWallet: wallet }, select: POST_SELECT }),
+    getLaunchFloors(prisma, [wallet]),
+  ]);
+  return buildFromRows(wallet, rows, floors.get(wallet) ?? null);
 }
 
 /**
@@ -129,8 +166,9 @@ export async function getV8ReputationBatch(
     arr.push(r);
     byWallet.set(r.subjectWallet, arr);
   }
+  const floors = await getLaunchFloors(prisma, wallets);
   for (const w of wallets) {
-    out.set(w, buildFromRows(w, byWallet.get(w) ?? []));
+    out.set(w, buildFromRows(w, byWallet.get(w) ?? [], floors.get(w) ?? null));
   }
   return out;
 }
