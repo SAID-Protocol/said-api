@@ -21,6 +21,12 @@ import {
   type SignalInput,
 } from '../src/reputation-v0.8/posteriors.js';
 import { AXES, type Axis } from '../src/reputation-v0.8/axes.js';
+import {
+  LAUNCH_GOLD_FLOOR_USD,
+  LAUNCH_PLATINUM_FLOOR_USD,
+  LAUNCH_SUSTAIN_DAYS,
+  LAUNCH_FLOOR_ENABLED,
+} from '../src/reputation-v0.8/economics-env.js';
 
 const prisma = new PrismaClient();
 const WALLET = process.env.WALLET ?? null;
@@ -127,7 +133,9 @@ async function run() {
   // NOTE: this floors the tier in THIS report only. The live API computes
   // tier on `main` (read.ts) from the stored composite — the SAME floor
   // must be applied there for the served tier to match.
-  {
+  if (!LAUNCH_FLOOR_ENABLED) {
+    console.log('Sustained-launch tier-floor: DISABLED (thresholds unset) — skipping.\n');
+  } else {
     const DAY = 24 * 60 * 60 * 1000;
     const launches = await prisma.launchedToken.findMany({
       select: { agentWallet: true, marketCapUsd: true, launchedAt: true, detectedAt: true },
@@ -137,9 +145,9 @@ async function run() {
     for (const t of launches) {
       const mc = t.marketCapUsd ?? 0;
       const ageDays = (Date.now() - (t.launchedAt ?? t.detectedAt).getTime()) / DAY;
-      if (ageDays < 21) continue;
-      if (mc >= 10_000_000) platFloor.add(t.agentWallet);
-      else if (mc >= 1_000_000) goldFloor.add(t.agentWallet);
+      if (ageDays < LAUNCH_SUSTAIN_DAYS!) continue;
+      if (mc >= LAUNCH_PLATINUM_FLOOR_USD!) platFloor.add(t.agentWallet);
+      else if (mc >= LAUNCH_GOLD_FLOOR_USD!) goldFloor.add(t.agentWallet);
     }
     const RANK: Record<string, number> = { unranked: 0, bronze: 1, silver: 2, gold: 3, platinum: 4 };
     let floored = 0;

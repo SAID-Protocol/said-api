@@ -25,6 +25,14 @@
  */
 import { PrismaClient } from '@prisma/client';
 import { emitEvent } from '../src/reputation-v0.8/ingest.js';
+import {
+  LAUNCH_GOLD_FLOOR_USD,
+  LAUNCH_PLATINUM_FLOOR_USD,
+  LAUNCH_MID_USD,
+  LAUNCH_SURVIVAL_MIN_USD,
+  LAUNCH_SUSTAIN_DAYS,
+  LAUNCH_SURVIVAL_ENABLED,
+} from '../src/reputation-v0.8/economics-env.js';
 
 const prisma = new PrismaClient();
 const LIMIT = process.env.LIMIT ? Number(process.env.LIMIT) : undefined;
@@ -210,13 +218,18 @@ async function backfillLaunchedToken(): Promise<BackfillCounts> {
     // something weeks later is a hard-to-fake signal; a fresh or near-zero
     // one is not. (Calibrated to this market: $1M+ sustained is rare, $3M+
     // exceptional — see project context.)
-    const survived = mc >= 50_000 && ageDays >= 21;
+    // Survival gate + ladder breakpoints are env-driven (see economics-env.ts).
+    // When thresholds are unset the gate never passes → launches contribute the
+    // floor weight only (disabled, not exploitable). Weight magnitudes stay in
+    // code: they're meaningless without the hidden mcap bars they key off.
+    const survived =
+      LAUNCH_SURVIVAL_ENABLED && mc >= LAUNCH_SURVIVAL_MIN_USD! && ageDays >= LAUNCH_SUSTAIN_DAYS!;
     let weight: number;
-    if (!survived) weight = 0.3;              // too young to prove out, or dead
-    else if (mc >= 10_000_000) weight = 10.0; // exceptional
-    else if (mc >= 1_000_000) weight = 6.0;   // rare in this market
-    else if (mc >= 300_000) weight = 3.0;     // solid survivor
-    else weight = 1.5;                         // alive over $50K
+    if (!survived) weight = 0.3;                                            // too young to prove out, or dead
+    else if (LAUNCH_PLATINUM_FLOOR_USD !== null && mc >= LAUNCH_PLATINUM_FLOOR_USD) weight = 10.0; // exceptional
+    else if (LAUNCH_GOLD_FLOOR_USD !== null && mc >= LAUNCH_GOLD_FLOOR_USD) weight = 6.0;          // rare in this market
+    else if (LAUNCH_MID_USD !== null && mc >= LAUNCH_MID_USD) weight = 3.0;                        // solid survivor
+    else weight = 1.5;                                                      // alive above the survival floor
 
     const r = await emitEvent(prisma, {
       sourceKey: `token:${tok.mint}`,
