@@ -191,23 +191,32 @@ async function backfillLaunchedToken(): Promise<BackfillCounts> {
       mint: true,
       agentWallet: true,
       marketCapUsd: true,
+      launchedAt: true,
       detectedAt: true,
     },
     ...(LIMIT ? { take: LIMIT } : {}),
   });
+  const DAY = 24 * 60 * 60 * 1000;
   for (const tok of rows) {
     counts.scanned++;
-    // Weight scales by market cap. Threshold-based, log-flavored:
-    //   no mc data    → weight 0.5
-    //   ≥ $100K       → weight 1.0
-    //   ≥ $1M         → weight 2.0
-    //   ≥ $10M        → weight 4.0
-    let weight = 0.5;
     const mc = tok.marketCapUsd ?? 0;
-    if (mc >= 10_000_000) weight = 4.0;
-    else if (mc >= 1_000_000) weight = 2.0;
-    else if (mc >= 100_000) weight = 1.0;
-    else if (mc > 0) weight = 0.5;
+    // launchedAt is the true on-chain launch time; fall back to detectedAt
+    // (≈ now for freshly-detected launches, which correctly read as young).
+    const launchedAt = tok.launchedAt ?? tok.detectedAt;
+    const ageDays = (Date.now() - launchedAt.getTime()) / DAY;
+    // SURVIVAL gate: a launch only counts as real value if the token is
+    // still alive (mcap above a small floor) AND has lasted ≥21 days — i.e.
+    // it didn't rug. Graded by *sustained* market cap. A token still worth
+    // something weeks later is a hard-to-fake signal; a fresh or near-zero
+    // one is not. (Calibrated to this market: $1M+ sustained is rare, $3M+
+    // exceptional — see project context.)
+    const survived = mc >= 50_000 && ageDays >= 21;
+    let weight: number;
+    if (!survived) weight = 0.3;              // too young to prove out, or dead
+    else if (mc >= 10_000_000) weight = 10.0; // exceptional
+    else if (mc >= 1_000_000) weight = 6.0;   // rare in this market
+    else if (mc >= 300_000) weight = 3.0;     // solid survivor
+    else weight = 1.5;                         // alive over $50K
 
     const r = await emitEvent(prisma, {
       sourceKey: `token:${tok.mint}`,
@@ -215,8 +224,8 @@ async function backfillLaunchedToken(): Promise<BackfillCounts> {
       actorWallet: tok.agentWallet,
       kind: 'token_launched',
       weight,
-      occurredAt: tok.detectedAt,
-      metadata: { mint: tok.mint, marketCapUsd: mc },
+      occurredAt: launchedAt,
+      metadata: { mint: tok.mint, marketCapUsd: mc, ageDays: Math.round(ageDays), survived },
     });
     r.emitted ? counts.emitted++ : counts.skipped++;
   }
@@ -341,6 +350,88 @@ async function backfillSaidEngagement(): Promise<BackfillCounts> {
   return counts;
 }
 
+// ── AgentActivityStats → onchain_activity (economic axis) ───────────
+// Real on-chain economic footprint from the wallet-activity worker.
+// Counterparty breadth is the hard-to-fake core (a sybil can't cheaply
+// transact with thousands of *distinct* wallets); SOL volume + active
+// days refine it. Each component is independently capped so wash-trading
+// can't run the score up, and COCM/EigenTrust discount self-dealing
+// clusters downstream.
+async function backfillActivityStats(): Promise<BackfillCounts> {
+  const counts: BackfillCounts = { source: 'activity_stats', scanned: 0, emitted: 0, skipped: 0 };
+  const rows = await prisma.agentActivityStats.findMany({
+    ...(LIMIT ? { take: LIMIT } : {}),
+  });
+  for (const s of rows) {
+    counts.scanned++;
+    const volSol = Number(s.volumeSolLamports) / 1_000_000_000;
+    const cpWeight = Math.min(s.uniqueCounterparties / 50, 6); // breadth — capped at 6
+    const volWeight = Math.min(volSol / 20, 4);                // realized SOL volume — capped at 4
+    const dayWeight = Math.min(s.activeDays / 10, 2);          // sustained activity — capped at 2
+    const weight = cpWeight + volWeight + dayWeight;           // total ≈ 12 max
+    if (weight <= 0) {
+      counts.skipped++;
+      continue;
+    }
+    const r = await emitEvent(prisma, {
+      sourceKey: `onchain:activity:${s.wallet}`,
+      subjectWallet: s.wallet,
+      actorWallet: s.wallet,
+      kind: 'onchain_activity',
+      weight,
+      occurredAt: s.latestSeen ?? s.computedAt,
+      metadata: {
+        uniqueCounterparties: s.uniqueCounterparties,
+        volumeSol: volSol,
+        activeDays: s.activeDays,
+        txCount: s.txCount,
+      },
+    });
+    r.emitted ? counts.emitted++ : counts.skipped++;
+  }
+  return counts;
+}
+
+// ── AgentFairScale → peer_reputation + red flags (partner signal) ───
+// SAID-INDEPENDENT signals only. The overall FairScale score is NOT used:
+// FairScale already reads SAID's score, so scoring it back would loop.
+async function backfillFairScale(): Promise<BackfillCounts> {
+  const counts: BackfillCounts = { source: 'fairscale', scanned: 0, emitted: 0, skipped: 0 };
+  const rows = await prisma.agentFairScale.findMany({
+    ...(LIMIT ? { take: LIMIT } : {}),
+  });
+  for (const f of rows) {
+    counts.scanned++;
+    // peer_reputation (0-100) → community axis, scaling up to weight 6.
+    if (f.peerReputation > 0) {
+      const r = await emitEvent(prisma, {
+        sourceKey: `fairscale:peer:${f.wallet}`,
+        subjectWallet: f.wallet,
+        actorWallet: null,
+        kind: 'fairscale_peer_rep',
+        weight: (f.peerReputation / 100) * 6,
+        occurredAt: f.syncedAt,
+        metadata: { peerReputation: f.peerReputation },
+      });
+      r.emitted ? counts.emitted++ : counts.skipped++;
+    }
+    // red flags → negative on delivery (one unit per flag, capped at 5).
+    if (f.redFlags.length > 0) {
+      const r = await emitEvent(prisma, {
+        sourceKey: `fairscale:redflag:${f.wallet}`,
+        subjectWallet: f.wallet,
+        actorWallet: null,
+        kind: 'fairscale_red_flag',
+        weight: Math.min(f.redFlags.length, 5),
+        occurredAt: f.syncedAt,
+        metadata: { redFlags: f.redFlags },
+      });
+      r.emitted ? counts.emitted++ : counts.skipped++;
+    }
+  }
+  return counts;
+}
+
 // ── Driver ──────────────────────────────────────────────────────────
 
 async function run() {
@@ -371,6 +462,14 @@ async function run() {
   if (only('said_engagement')) {
     console.log('→ AgentSaidEngagement...');
     results.push(await backfillSaidEngagement());
+  }
+  if (only('activity_stats')) {
+    console.log('→ AgentActivityStats...');
+    results.push(await backfillActivityStats());
+  }
+  if (only('fairscale')) {
+    console.log('→ AgentFairScale...');
+    results.push(await backfillFairScale());
   }
 
   const elapsed = Math.round((Date.now() - startedAt) / 1000);

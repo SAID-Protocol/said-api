@@ -585,7 +585,8 @@ model LaunchedToken {
   id                      String   @id @default(cuid())
   mint                    String   @unique             // SPL mint address
   agentWallet             String                       // the agent that launched it
-  detectedAt              DateTime @default(now())
+  detectedAt              DateTime @default(now())     // when WE first detected it
+  launchedAt              DateTime?                    // actual on-chain launch time (InitializeMint blockTime) — drives the sustained-survival check
   firstSeenSlot           BigInt?                      // slot of the InitializeMint tx, if known
 
   // DexScreener-enriched fields (nullable until enriched, refreshed periodically)
@@ -599,6 +600,24 @@ model LaunchedToken {
 
   @@index([agentWallet])
   @@index([enrichedAt])
+}
+
+// FairScale (partner) cross-platform reputation — full response cached so
+// v0.8 can ingest its SAID-INDEPENDENT signals (peer_reputation, red flags,
+// badges). The overall score is deliberately NOT scored: FairScale already
+// reads SAID's score, so feeding it back would create a circular loop.
+model AgentFairScale {
+  wallet           String   @id
+  overallScore     Int      @default(0)   // FairScale's flattened 0-100 — stored for reference, NOT scored (loop risk)
+  peerReputation   Int      @default(0)   // 0-100 pillar — SAID-independent, scored on `community`
+  workHistory      Int      @default(0)
+  networkQuality   Int      @default(0)
+  badges           String[] @default([])  // e.g. no_dumper, lst_staker
+  redFlags         String[] @default([])
+  raw              Json?                   // full response, for future signals
+  syncedAt         DateTime @default(now())
+
+  @@index([syncedAt])
 }
 
 // ═══════════════════════════════════════════════════════════════════

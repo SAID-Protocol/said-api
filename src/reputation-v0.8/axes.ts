@@ -19,6 +19,7 @@ export const AXES = [
   'payments',    // payment reliability: x402 sent + received, settlement track record
   'validation',  // quality of their work-validation of others: validate_work accuracy
   'community',   // ecosystem participation: attestations given/received, vouches
+  'economic',    // real on-chain economic footprint: counterparties, SOL volume, active days, token launches
 ] as const;
 
 export type Axis = (typeof AXES)[number];

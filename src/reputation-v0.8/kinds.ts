@@ -179,6 +179,33 @@ export const EVENT_KINDS = {
     description: 'Unstake-related instruction (neutral; lifecycle event)',
   },
 
+  // ── On-chain economic activity (from AgentActivityStats) ─────────
+  onchain_activity: {
+    axis: 'economic',
+    polarity: 1,
+    defaultWeight: 1.0,
+    structural: false,
+    description: 'Real on-chain economic footprint over a 30-day window — counterparty-discounted activity + SOL volume (from AgentActivityStats)',
+  },
+
+  // ── FairScale (partner) cross-platform reputation ────────────────
+  // Only SAID-INDEPENDENT signals — FairScale already reads SAID's score,
+  // so its overall score is intentionally excluded (feedback-loop risk).
+  fairscale_peer_rep: {
+    axis: 'community',
+    polarity: 1,
+    defaultWeight: 1.0,
+    structural: false,
+    description: 'FairScale peer-reputation pillar (partner cross-platform reputation; weight scales with the 0-100 pillar)',
+  },
+  fairscale_red_flag: {
+    axis: 'delivery',
+    polarity: -1,
+    defaultWeight: 1.0,
+    structural: false,
+    description: 'FairScale red flag — risky-behavior signal flagged by the partner platform',
+  },
+
   // ── Negative / fraud signals ─────────────────────────────────────
   slashed: {
     axis: 'identity',

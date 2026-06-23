@@ -118,6 +118,43 @@ async function run() {
   const elapsed = Math.round((Date.now() - startedAt) / 1000);
   console.log(`\nDone in ${elapsed}s. Wrote ${written} rows for ${bySubject.size} subjects.\n`);
 
+  // ── Sustained-launch tier-floor ─────────────────────────────────────
+  // A token still alive at high market cap weeks after launch is a strong,
+  // hard-to-fake value signal. The composite math caps such an agent
+  // (baseline-axis drag), so we floor the tier directly:
+  //   sustained ≥ $1M → gold ;  sustained ≥ $10M → platinum
+  // ("sustained" = current mcap above the bar AND ≥21 days since launch).
+  // NOTE: this floors the tier in THIS report only. The live API computes
+  // tier on `main` (read.ts) from the stored composite — the SAME floor
+  // must be applied there for the served tier to match.
+  {
+    const DAY = 24 * 60 * 60 * 1000;
+    const launches = await prisma.launchedToken.findMany({
+      select: { agentWallet: true, marketCapUsd: true, launchedAt: true, detectedAt: true },
+    });
+    const goldFloor = new Set<string>();
+    const platFloor = new Set<string>();
+    for (const t of launches) {
+      const mc = t.marketCapUsd ?? 0;
+      const ageDays = (Date.now() - (t.launchedAt ?? t.detectedAt).getTime()) / DAY;
+      if (ageDays < 21) continue;
+      if (mc >= 10_000_000) platFloor.add(t.agentWallet);
+      else if (mc >= 1_000_000) goldFloor.add(t.agentWallet);
+    }
+    const RANK: Record<string, number> = { unranked: 0, bronze: 1, silver: 2, gold: 3, platinum: 4 };
+    let floored = 0;
+    for (const c of composites) {
+      const floor = platFloor.has(c.wallet) ? 'platinum' : goldFloor.has(c.wallet) ? 'gold' : null;
+      if (floor && RANK[c.tier] < RANK[floor]) {
+        c.tier = floor;
+        floored++;
+      }
+    }
+    console.log(
+      `Sustained-launch tier-floor: ${goldFloor.size} gold-qualified, ${platFloor.size} platinum-qualified; floored ${floored} agents up.\n`,
+    );
+  }
+
   // ── Reports ───────────────────────────────────────────────────────
 
   console.log('── Tier distribution ───────────────────────────');

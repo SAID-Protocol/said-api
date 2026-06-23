@@ -4,8 +4,9 @@
  * For each agent's wallet, scan recent tx history once per refresh cycle:
  *   1. Aggregate volume / counterparty / active-day stats over a 30-day
  *      window → AgentActivityStats row
- *   2. Detect SPL Token / Token-2022 InitializeMint instructions where the
- *      agent's wallet is the mint authority → LaunchedToken row per mint
+ *   2. Detect token launches — the agent is the fee-payer of a launchpad
+ *      (pump.fun) tx that creates a new mint → LaunchedToken row per mint
+ *      (the launchpad PDA is the mint authority, not the agent)
  *
  * Single pass over each agent's signatures, so the two outputs cost what
  * the activity ingest already costs. DexScreener enrichment happens on a
@@ -25,6 +26,14 @@ const RPC_URL = ALCHEMY_URL || FALLBACK_URL;
 const SPL_TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const TOKEN_2022_PROGRAM = 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb';
 const SYSTEM_PROGRAM = '11111111111111111111111111111111';
+
+// Launchpad programs that mint on the agent's behalf: the agent is the
+// fee-payer/signer, but the launchpad PDA — not the agent — is the mint
+// authority. clawpump.tech routes through pump.fun.
+const LAUNCHPAD_PROGRAMS = new Set<string>([
+  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // pump.fun
+  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', // pumpswap (pump.fun AMM)
+]);
 
 const WINDOW_DAYS = 30;
 const SIG_LIMIT = 1000;
@@ -73,29 +82,38 @@ function isTokenProgram(programId: string): boolean {
   return programId === SPL_TOKEN_PROGRAM || programId === TOKEN_2022_PROGRAM;
 }
 
-// Detect SPL Token / Token-2022 InitializeMint where the wallet is the
-// mint authority. Returns the mint addresses.
-function findInitializedMints(
+// Detect a token LAUNCH by the agent. On a launchpad (pump.fun, which
+// clawpump.tech routes through) the agent is the fee-payer/signer of the
+// create tx, but the mint authority is the launchpad PDA — NOT the agent.
+// So we key off (fee-payer === wallet) + a launchpad program in the tx,
+// not mintAuthority === wallet (which a launchpad launch never satisfies).
+// Requiring fee-payer also excludes mints the agent merely traded/bought.
+function findLaunchedMints(
   tx: NonNullable<Awaited<ReturnType<Connection['getParsedTransaction']>>>,
   wallet: string,
 ): string[] {
-  const found: string[] = [];
+  const feePayer = getAccountAddress(tx.transaction.message.accountKeys[0]);
+  if (feePayer !== wallet) return [];
+
   const allIxs: (ParsedInstruction | PartiallyDecodedInstruction)[] = [
     ...tx.transaction.message.instructions,
     ...(tx.meta?.innerInstructions?.flatMap((ii) => ii.instructions) ?? []),
   ];
+  const programIdOf = (ix: ParsedInstruction | PartiallyDecodedInstruction): string =>
+    (ix as { programId?: { toString?: () => string } }).programId?.toString?.() ?? '';
+
+  // Must be a launchpad transaction — not a raw SPL mint init.
+  if (!allIxs.some((ix) => LAUNCHPAD_PROGRAMS.has(programIdOf(ix)))) return [];
+
+  const found: string[] = [];
   for (const ix of allIxs) {
-    const programId = (ix as { programId?: { toString?: () => string } }).programId?.toString?.() ?? '';
-    if (!isTokenProgram(programId)) continue;
+    if (!isTokenProgram(programIdOf(ix))) continue;
     const parsed = (ix as ParsedInstruction).parsed;
     if (!parsed || typeof parsed !== 'object') continue;
     const type = parsed.type;
     if (type !== 'initializeMint' && type !== 'initializeMint2' && type !== 'initializeMintCloseAuthority') continue;
-    const info = parsed.info as { mint?: string; mintAuthority?: string; authority?: string };
-    const auth = info.mintAuthority ?? info.authority;
-    if (auth === wallet && info.mint) {
-      found.push(info.mint);
-    }
+    const info = parsed.info as { mint?: string };
+    if (info.mint) found.push(info.mint);
   }
   return found;
 }
@@ -184,7 +202,7 @@ async function fetchActivityAndMints(wallet: string): Promise<ActivityResult | n
         counterparties.add(addr);
       }
 
-      for (const mint of findInitializedMints(tx, wallet)) {
+      for (const mint of findLaunchedMints(tx, wallet)) {
         launchedMints.add(mint);
       }
     }
@@ -307,7 +325,10 @@ async function enrichLaunchedTokens(prisma: PrismaClient): Promise<void> {
 
   for (const t of tokens) {
     try {
-      const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${t.mint}`);
+      // DexScreener 403s requests without a browser-like User-Agent.
+      const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${t.mint}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SAIDProtocol/1.0; +https://saidprotocol.com)' },
+      });
       if (!res.ok) {
         await prisma.launchedToken.update({ where: { id: t.id }, data: { enrichedAt: new Date() } });
         continue;

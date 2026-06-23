@@ -41,10 +41,11 @@ const PRIOR_TOTAL = PRIOR_ALPHA + PRIOR_BETA;
 /** Composite axis weights. Documented defaults — overridable per consumer. */
 export const AXIS_WEIGHTS_DEFAULT: Record<Axis, number> = {
   identity: 0.10,   // floor — every verified agent gets some baseline
-  delivery: 0.35,   // strongest — "did they deliver real work"
+  delivery: 0.30,   // strongest — "did they deliver real work"
   payments: 0.20,   // commercial activity
-  validation: 0.20, // peer-validation accuracy (Phase 3 fills this)
-  community: 0.15,  // ecosystem participation
+  validation: 0.15, // peer-validation accuracy (Phase 3 fills this)
+  community: 0.10,  // ecosystem participation
+  economic: 0.15,   // real on-chain economic footprint (activity, counterparties, volume, launches)
 };
 
 /** Tier definitions — kept in sync with the design doc. */

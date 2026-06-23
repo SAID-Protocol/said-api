@@ -74,11 +74,16 @@ export const HALF_LIFE_DAYS: Record<EventKind, number | null> = {
   stake: 365,
   unstake_lifecycle: 365,
 
+  // On-chain economic activity + FairScale (partner) cross-platform rep
+  onchain_activity: 90, // recency of real on-chain activity
+  fairscale_peer_rep: 180, // partner peer reputation — moderate memory
+
   // Negative
   slashed: 365,
   dispute_opened_against: 90,
   dispute_lost: 365,
   dispute_won: 90,
+  fairscale_red_flag: 180, // risky-behavior flag — decays slower (FICO pattern)
 };
 
 /** Fallback half-life when a kind isn't in the policy. Should never happen in practice. */

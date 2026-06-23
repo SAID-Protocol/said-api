@@ -13,6 +13,7 @@
     "db:studio": "prisma studio",
     "v8:sync-x402-activity": "tsx scripts/sync-x402-activity.ts",
     "v8:sync-said-engagement": "tsx scripts/sync-said-engagement.ts",
+    "v8:sync-fairscale": "tsx scripts/sync-fairscale.ts",
     "v8:backfill": "tsx scripts/v8-backfill-events.ts",
     "v8:sync-x402-pertx": "tsx scripts/sync-x402-per-tx.ts",
     "v8:signals": "tsx scripts/v8-compute-signals.ts",
@@ -20,7 +21,7 @@
     "v8:edges": "tsx scripts/v8-build-edges.ts",
     "v8:eigentrust": "tsx scripts/v8-compute-eigentrust.ts",
     "v8:recompute": "npm run v8:signals && npm run v8:posteriors && npm run v8:edges && npm run v8:eigentrust",
-    "v8:refresh": "npm run v8:sync-x402-activity && npm run v8:sync-said-engagement && npm run v8:backfill && npm run v8:sync-x402-pertx && COCM=true npm run v8:signals && npm run v8:posteriors && npm run v8:edges && COCM=true npm run v8:eigentrust"
+    "v8:refresh": "npm run v8:sync-x402-activity && npm run v8:sync-said-engagement && npm run v8:sync-fairscale && npm run v8:backfill && npm run v8:sync-x402-pertx && COCM=true npm run v8:signals && npm run v8:posteriors && npm run v8:edges && COCM=true npm run v8:eigentrust"
   },
   "keywords": [
     "said",

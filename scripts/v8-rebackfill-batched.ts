@@ -19,7 +19,7 @@ import { PrismaClient } from '@prisma/client';
 const prisma = new PrismaClient();
 
 async function run() {
-  console.log('Deleting batched ReputationEvent rows (x402:* and said:*)...');
+  console.log('Deleting batched ReputationEvent rows (x402:*, said:*, onchain:*)...');
 
   // Delete by sourceKey prefix patterns.
   const xResult = await prisma.reputationEvent.deleteMany({
@@ -28,9 +28,17 @@ async function run() {
   const sResult = await prisma.reputationEvent.deleteMany({
     where: { sourceKey: { startsWith: 'said:' } },
   });
+  const oResult = await prisma.reputationEvent.deleteMany({
+    where: { sourceKey: { startsWith: 'onchain:' } },
+  });
+  const fResult = await prisma.reputationEvent.deleteMany({
+    where: { sourceKey: { startsWith: 'fairscale:' } },
+  });
 
   console.log(`Deleted ${xResult.count} x402 events.`);
   console.log(`Deleted ${sResult.count} said events.`);
+  console.log(`Deleted ${oResult.count} onchain-activity events.`);
+  console.log(`Deleted ${fResult.count} fairscale events.`);
   console.log('\nNow run:');
   console.log('  npx tsx scripts/v8-backfill-events.ts');
   console.log('  npx tsx scripts/v8-compute-signals.ts');
