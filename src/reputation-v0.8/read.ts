@@ -16,6 +16,12 @@
 import type { PrismaClient } from '@prisma/client';
 import { AXES, type Axis } from './axes.js';
 import { assignTier, type Tier } from './posteriors.js';
+import {
+  LAUNCH_GOLD_FLOOR_USD,
+  LAUNCH_PLATINUM_FLOOR_USD,
+  LAUNCH_SUSTAIN_DAYS,
+  LAUNCH_FLOOR_ENABLED,
+} from './economics-env.js';
 
 export interface V8AxisView {
   posteriorMean: number;
@@ -71,7 +77,9 @@ const POST_SELECT = {
 // hard-to-fake evidence of value. We floor the agent's tier accordingly,
 // because the composite (baseline-axis drag) caps even a real launcher at
 // silver. Mirrors the floor applied in the compute pipeline's report.
-const SUSTAIN_DAYS = 21;
+//
+// The mcap bars + age gate are env-driven and DISABLED when unset — the
+// exact tuning values are kept out of source. See economics-env.ts.
 const TIER_RANK: Record<Tier, number> = {
   unranked: 0,
   bronze: 1,
@@ -85,16 +93,16 @@ async function getLaunchFloors(
   wallets: string[],
 ): Promise<Map<string, Tier>> {
   const floors = new Map<string, Tier>();
-  if (wallets.length === 0) return floors;
+  if (wallets.length === 0 || !LAUNCH_FLOOR_ENABLED) return floors;
   const launches = await prisma.launchedToken.findMany({
-    where: { agentWallet: { in: wallets }, marketCapUsd: { gte: 1_000_000 } },
+    where: { agentWallet: { in: wallets }, marketCapUsd: { gte: LAUNCH_GOLD_FLOOR_USD! } },
     select: { agentWallet: true, marketCapUsd: true, launchedAt: true, detectedAt: true },
   });
-  const cutoff = Date.now() - SUSTAIN_DAYS * 24 * 60 * 60 * 1000;
+  const cutoff = Date.now() - LAUNCH_SUSTAIN_DAYS! * 24 * 60 * 60 * 1000;
   for (const l of launches) {
     const launchedMs = (l.launchedAt ?? l.detectedAt).getTime();
     if (launchedMs > cutoff) continue; // not sustained long enough yet
-    const t: Tier = (l.marketCapUsd ?? 0) >= 10_000_000 ? 'platinum' : 'gold';
+    const t: Tier = (l.marketCapUsd ?? 0) >= LAUNCH_PLATINUM_FLOOR_USD! ? 'platinum' : 'gold';
     const cur = floors.get(l.agentWallet);
     if (!cur || TIER_RANK[t] > TIER_RANK[cur]) floors.set(l.agentWallet, t);
   }
