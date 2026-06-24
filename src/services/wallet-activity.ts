@@ -17,6 +17,7 @@
 
 import { Connection, PublicKey, ParsedInstruction, PartiallyDecodedInstruction } from '@solana/web3.js';
 import type { PrismaClient } from '@prisma/client';
+import { LAUNCH_SUSTAIN_DAYS } from '../reputation-v0.8/economics-env.js';
 
 const ALCHEMY_URL = process.env.ALCHEMY_SOLANA_RPC_URL;
 const FALLBACK_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
@@ -295,14 +296,24 @@ interface DexScreenerPair {
 
 async function enrichLaunchedTokens(prisma: PrismaClient): Promise<void> {
   const staleCutoff = new Date(Date.now() - ENRICHMENT_STALE_MS);
+  // Only launches old enough to floor/survive are worth enriching. The long
+  // tail of brand-new launches can't score until they age past the sustain
+  // window, so we skip them here (they become eligible automatically as they
+  // age) — this is ~10x fewer DexScreener calls and keeps us off its limits.
+  const eligibleCutoff =
+    LAUNCH_SUSTAIN_DAYS != null
+      ? new Date(Date.now() - LAUNCH_SUSTAIN_DAYS * 24 * 60 * 60 * 1000)
+      : null;
   const tokens = await prisma.launchedToken.findMany({
     where: {
-      OR: [{ enrichedAt: null }, { enrichedAt: { lt: staleCutoff } }],
+      ...(eligibleCutoff ? { launchedAt: { lte: eligibleCutoff } } : {}),
+      // Re-pick anything with no stored cap (never enriched, OR a prior
+      // transient failure that left it null), plus periodic refresh of stale
+      // rows. `marketCapUsd: null` is the un-poison path for rows a previous
+      // 403/429 left blank.
+      OR: [{ marketCapUsd: null }, { enrichedAt: { lt: staleCutoff } }],
     },
     take: ENRICHMENT_BATCH,
-    // Never-enriched first (nulls), then OLDEST launch first: only launches
-    // past the sustain age can floor/survive, so they must be enriched ahead
-    // of the long tail of brand-new launches (which can't score until they age).
     orderBy: [
       { enrichedAt: { sort: 'asc', nulls: 'first' } },
       { launchedAt: { sort: 'asc', nulls: 'last' } },
@@ -313,11 +324,14 @@ async function enrichLaunchedTokens(prisma: PrismaClient): Promise<void> {
 
   for (const t of tokens) {
     try {
-      const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${t.mint}`);
-      if (!res.ok) {
-        await prisma.launchedToken.update({ where: { id: t.id }, data: { enrichedAt: new Date() } });
-        continue;
-      }
+      // DexScreener 403s requests without a browser-like User-Agent.
+      const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${t.mint}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SAIDProtocol/1.0; +https://saidprotocol.com)' },
+      });
+      // Transient failure (403/429/5xx): leave the row untouched so it retries
+      // next tick — never mark it enriched-with-null, which would hide it for
+      // hours and silently drop a real launcher (the old bug).
+      if (!res.ok) continue;
       const data = (await res.json()) as { pairs?: DexScreenerPair[] };
       const pairs = data.pairs ?? [];
       // Pick the deepest-liquidity pair as authoritative.
@@ -331,7 +345,9 @@ async function enrichLaunchedTokens(prisma: PrismaClient): Promise<void> {
         where: { id: t.id },
         data: {
           priceUsd: top?.priceUsd ? Number(top.priceUsd) : null,
-          marketCapUsd: top?.marketCap ?? top?.fdv ?? null,
+          // 200 with no pair = token genuinely has no market → store 0 (not
+          // null) so it counts as enriched and isn't retried forever.
+          marketCapUsd: top?.marketCap ?? top?.fdv ?? 0,
           liquidityUsd: top?.liquidity?.usd ?? null,
           volume24hUsd: top?.volume?.h24 ?? null,
           dexId: top?.dexId ?? null,
