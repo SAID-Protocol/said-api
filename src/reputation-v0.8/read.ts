@@ -15,7 +15,7 @@
  */
 import type { PrismaClient } from '@prisma/client';
 import { AXES, type Axis } from './axes.js';
-import { assignTier, type Tier } from './posteriors.js';
+import { assignTier, TIER_THRESHOLDS, type Tier } from './posteriors.js';
 import {
   LAUNCH_GOLD_FLOOR_USD,
   LAUNCH_PLATINUM_FLOOR_USD,
@@ -138,9 +138,19 @@ function buildFromRows(wallet: string, rows: PostRow[], floor: Tier | null = nul
   }
 
   let tier = assignTier(compositeScore, totalSamples, identityMean);
-  // Sustained-launch tier-floor: bump up if the agent has a qualifying launch.
-  if (floor && TIER_RANK[floor] > TIER_RANK[tier]) tier = floor;
-  return { wallet, found: true, compositeScore, tier, totalSamples, eigentrustScore, axes, computedAt };
+  let effectiveComposite = compositeScore;
+  // Sustained-launch tier-floor: bump the tier up if the agent has a
+  // qualifying launch — AND floor the score to that tier's minimum, so the
+  // number can't contradict the badge (a floored GOLD must not show a lower
+  // score than a SILVER it now outranks).
+  if (floor && TIER_RANK[floor] > TIER_RANK[tier]) {
+    tier = floor;
+    // floor is only ever 'gold' | 'platinum' (from getLaunchFloors).
+    const floorMin =
+      floor === 'platinum' ? TIER_THRESHOLDS.platinum.composite : TIER_THRESHOLDS.gold.composite;
+    effectiveComposite = Math.max(compositeScore, floorMin);
+  }
+  return { wallet, found: true, compositeScore: effectiveComposite, tier, totalSamples, eigentrustScore, axes, computedAt };
 }
 
 /** Read one agent's v0.8 reputation from ReputationPosterior. */
