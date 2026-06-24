@@ -187,7 +187,6 @@ app.use('/*', async (c, next) => {
 import { EventEmitter } from 'events';
 import { createScoreRoutes, initScoreWorker } from './score-engine.js';
 import { getV8Reputation, getV8ReputationBatch, legacyTrustTier } from './reputation-v0.8/read.js';
-import { buildScreenResult } from './trust-screen.js';
 const sseEmitter = new EventEmitter();
 sseEmitter.setMaxListeners(100); // support up to 100 concurrent SSE clients
 
@@ -265,19 +264,11 @@ app.get('/favicon.ico', async (c) => {
 app.get('/.well-known/x402', (c) => {
   return c.json({
     name: 'SAID Protocol',
-    description: 'The identity & reputation layer for AI agents on Solana. Screen an agent counterparty before you pay it, and send cross-chain agent-to-agent messages. Pay-per-call via x402.',
+    description: 'Send messages between AI agents across Solana, Base, Polygon, Avalanche & Sei. Pay $0.01 USDC per message via x402. 10 free messages per day.',
     url: 'https://api.saidprotocol.com',
     openapi: 'https://api.saidprotocol.com/openapi.json',
     favicon: 'https://api.saidprotocol.com/favicon.ico',
     endpoints: [
-      {
-        url: 'https://api.saidprotocol.com/api/screen',
-        method: 'GET',
-        description: 'Trust-screen an AI agent before paying it. Should your agent pay this counterparty? Returns an allow/review/caution verdict plus SAID\'s computed per-axis reputation (delivery, payments, validation, identity, community) and EigenTrust score for any Solana agent/wallet. The computed reputation layer for the agentic economy — not a raw feedback log.',
-        price: '$0.001 USDC',
-        input: { wallet: 'Solana agent/wallet address to screen (query param: ?wallet=)' },
-        chains: ['solana', 'base', 'polygon', 'avalanche', 'sei'],
-      },
       {
         url: 'https://api.saidprotocol.com/xchain/message',
         method: 'POST',
@@ -299,56 +290,13 @@ app.get('/openapi.json', (c) => {
   return c.json({
     openapi: '3.0.3',
     info: {
-      title: 'SAID Protocol — Identity & Reputation for AI Agents',
-      description: 'The identity & reputation layer for AI agents on Solana. Trust-screen an agent counterparty before you pay it (GET /api/screen), and send cross-chain agent-to-agent messages (POST /xchain/message). Pay-per-call via x402.',
-      version: '1.1.0',
+      title: 'SAID Protocol - Cross-Chain Agent-to-Agent Messaging',
+      description: 'Send messages between AI agents across Solana, Base, Polygon, Avalanche & Sei. Resolves agent identities via SAID (Solana) and ERC-8004 (EVM). $0.01 USDC per message via x402, 10 free per day.',
+      version: '1.0.0',
       contact: { url: 'https://www.saidprotocol.com', email: 'kaiclawd@outlook.com' },
     },
     servers: [{ url: 'https://api.saidprotocol.com' }],
     paths: {
-      '/api/screen': {
-        get: {
-          summary: 'Trust-screen an AI agent before paying it',
-          description: 'Should your agent pay this counterparty? Returns an allow/review/caution verdict plus SAID\'s computed per-axis reputation (delivery, payments, validation, identity, community), confidence, and EigenTrust score for any Solana agent/wallet. $0.001 USDC via x402.',
-          operationId: 'screenAgent',
-          parameters: [
-            {
-              name: 'wallet',
-              in: 'query',
-              required: true,
-              schema: { type: 'string' },
-              description: 'Solana agent/wallet address to screen',
-            },
-          ],
-          responses: {
-            '200': {
-              description: 'Trust verdict + reputation',
-              content: {
-                'application/json': {
-                  schema: {
-                    type: 'object',
-                    properties: {
-                      wallet: { type: 'string' },
-                      verdict: { type: 'string', enum: ['allow', 'review', 'caution'] },
-                      score: { type: 'integer', nullable: true, description: '0–100 composite reputation' },
-                      tier: { type: 'string', enum: ['platinum', 'gold', 'silver', 'bronze', 'unranked'] },
-                      registered: { type: 'boolean' },
-                      verified: { type: 'boolean' },
-                      scored: { type: 'boolean' },
-                      confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
-                      reason: { type: 'string' },
-                      axes: { type: 'object', description: 'Per-axis score / confidence floor / signal count' },
-                      eigentrust: { type: 'number', nullable: true },
-                    },
-                  },
-                },
-              },
-            },
-            '400': { description: 'Missing wallet query param' },
-            '402': { description: 'Payment required (x402) — $0.001 USDC' },
-          },
-        },
-      },
       '/xchain/message': {
         post: {
           summary: 'Send a cross-chain message between AI agents',
@@ -8925,21 +8873,6 @@ app.get('/xchain/message', (c) => {
   const encoded = Buffer.from(JSON.stringify(paymentChallenge)).toString('base64');
   c.header('Payment-Required', encoded);
   return c.json(paymentChallenge, 402);
-});
-
-// ── GET /api/screen — paid x402 counterparty trust screen ────────────────────
-// "Should my agent pay this wallet?" → allow/review/caution verdict + SAID's
-// computed per-axis reputation. Registered AFTER the x402 middleware (above) so
-// it's payment-gated, and on a fresh static path (not /api/trust/*) so the
-// /api/trust/:wallet param route can't shadow it. This is the discoverable,
-// productized version of the free /api/trust/:wallet lookup — the computed
-// reputation layer a raw feedback registry can't give you.
-app.get('/api/screen', async (c) => {
-  const wallet = c.req.query('wallet');
-  if (!wallet) {
-    return c.json({ error: 'Required query param: wallet' }, 400);
-  }
-  return c.json(await buildScreenResult(prisma, wallet));
 });
 
 app.route('/xchain', crossChainRoutes);
