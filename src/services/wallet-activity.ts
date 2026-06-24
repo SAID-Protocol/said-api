@@ -300,7 +300,13 @@ async function enrichLaunchedTokens(prisma: PrismaClient): Promise<void> {
       OR: [{ enrichedAt: null }, { enrichedAt: { lt: staleCutoff } }],
     },
     take: ENRICHMENT_BATCH,
-    orderBy: { enrichedAt: { sort: 'asc', nulls: 'first' } },
+    // Never-enriched first (nulls), then OLDEST launch first: only launches
+    // past the sustain age can floor/survive, so they must be enriched ahead
+    // of the long tail of brand-new launches (which can't score until they age).
+    orderBy: [
+      { enrichedAt: { sort: 'asc', nulls: 'first' } },
+      { launchedAt: { sort: 'asc', nulls: 'last' } },
+    ],
   });
   if (tokens.length === 0) return;
   console.log(`[wallet-activity] enriching ${tokens.length} launched tokens via DexScreener`);
