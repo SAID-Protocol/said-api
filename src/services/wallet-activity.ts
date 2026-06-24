@@ -46,7 +46,7 @@ const INTER_BATCH_DELAY_MS = 100;
 const AGENTS_PER_TICK = 100;
 const PER_AGENT_CONCURRENCY = 2;
 const TICK_INTERVAL_MS = 5 * 60 * 1000;
-const ENRICHMENT_INTERVAL_MS = 30 * 60 * 1000;
+const ENRICHMENT_INTERVAL_MS = 90 * 1000;
 const ENRICHMENT_BATCH = 100;
 const ENRICHMENT_STALE_MS = 6 * 60 * 60 * 1000; // re-enrich a token's DexScreener data every 6h
 
