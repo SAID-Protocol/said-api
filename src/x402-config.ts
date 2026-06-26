@@ -20,6 +20,12 @@ export const SAID_EVM_TREASURY = process.env.SAID_EVM_TREASURY || '';
 export const MESSAGE_PRICE = '$0.01';
 const MESSAGE_PRICE_USDC = '0.01';
 
+// Price per trust screen (GET /api/screen). Priced at the x402 floor: the point
+// of this endpoint is discovery/exposure on x402scan & the Bazaar, not revenue —
+// it just has to be a real (priced) x402 resource to be catalogued. Tune here.
+export const SCREEN_PRICE = '$0.001';
+const SCREEN_PRICE_USDC = '0.001';
+
 // CAIP-2 network identifiers
 const CHAINS = {
   solana: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp' as const,
@@ -131,10 +137,18 @@ export function createX402Middleware() {
     console.log('ℹ️  EVM payment disabled (set SAID_EVM_TREASURY to enable)');
   }
 
+  // Same chains/treasuries as messaging, just at the trust-screen floor price.
+  const screenAcceptOptions = acceptOptions.map((o) => ({ ...o, price: SCREEN_PRICE_USDC }));
+
   const routes = {
     'POST /xchain/message': {
       accepts: acceptOptions,
       description: 'Cross-chain agent message via SAID Protocol',
+    },
+    'GET /api/screen': {
+      accepts: screenAcceptOptions,
+      description:
+        'SAID agent trust screen — should your agent pay this counterparty? Returns an allow/review/caution verdict plus SAID\'s computed per-axis reputation (delivery, payments, validation, identity, community) and EigenTrust score for any Solana agent/wallet.',
     },
   };
 

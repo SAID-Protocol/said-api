@@ -187,6 +187,7 @@ app.use('/*', async (c, next) => {
 import { EventEmitter } from 'events';
 import { createScoreRoutes, initScoreWorker } from './score-engine.js';
 import { getV8Reputation, getV8ReputationBatch, legacyTrustTier } from './reputation-v0.8/read.js';
+import { buildScreenResult } from './trust-screen.js';
 const sseEmitter = new EventEmitter();
 sseEmitter.setMaxListeners(100); // support up to 100 concurrent SSE clients
 
@@ -8807,6 +8808,19 @@ app.use('*', createX402Middleware());
 console.log(`✅ x402 payment gate active on POST /xchain/message ($0.01 USDC via Coinbase x402 SDK)`);
 console.log(`✅ Free tier: ${FREE_MESSAGES_PER_DAY} messages/day per agent`);
 console.log(`✅ Supported payment chains: ${Object.keys(CHAINS).join(', ')}`);
+console.log(`✅ x402 trust screen active on GET /api/screen ($0.001 USDC)`);
+
+// GET /api/screen — paid x402 counterparty trust screen ($0.001 USDC).
+// "Should my agent pay this counterparty?" → allow/review/caution verdict +
+// SAID's computed per-axis reputation. Registered after the x402 middleware
+// above so the payment gate runs first.
+app.get('/api/screen', async (c) => {
+  const wallet = c.req.query('wallet');
+  if (!wallet) {
+    return c.json({ error: 'Required query param: wallet' }, 400);
+  }
+  return c.json(await buildScreenResult(prisma, wallet));
+});
 
 // GET /xchain/message — return 402 challenge for x402scan discovery
 app.get('/xchain/message', (c) => {
