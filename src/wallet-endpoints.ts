@@ -835,14 +835,24 @@ export function createWalletRoutes(prisma: PrismaClient, connection: Connection,
         });
         
         if (wallet.provider === 'mock') {
-          // Mock: mark as confirmed immediately
+          // A mock wallet must NEVER report a real 'confirmed' settlement — a
+          // consumer keying on status would treat fake settlement as real (a
+          // fund-safety/trust hazard). In production, refuse outright; otherwise
+          // return an unmistakable 'simulated' status, never 'confirmed'.
+          if (process.env.PRIVY_WALLET_MODE !== 'live' && process.env.NODE_ENV === 'production') {
+            return c.json({
+              transactionId: txRequest.id,
+              status: 'failed',
+              error: 'Wallet is in mock mode — real transactions are disabled in production. Set PRIVY_WALLET_MODE=live.',
+            }, 503);
+          }
           await updateTxStatus(prisma, txRequest.id, 'confirmed', {
             confirmedAt: new Date(),
           });
-          
+
           return c.json({
             transactionId: txRequest.id,
-            status: 'confirmed',
+            status: 'simulated',
             type,
             amount: numAmount,
             token,
@@ -850,7 +860,7 @@ export function createWalletRoutes(prisma: PrismaClient, connection: Connection,
             txHash: signResult.signature,
             policyCheck: { passed: true, reason: 'All policy checks passed' },
             wallet: { publicKey: wallet.publicKey },
-            note: 'Mock transaction — no real funds moved.',
+            note: 'Mock transaction — NO real funds moved (simulated).',
           });
         }
         
