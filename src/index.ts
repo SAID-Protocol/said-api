@@ -5496,24 +5496,53 @@ app.get('/api/platforms/fairscale/balance', async (c) => {
 
 // Store a card (called by CLI during registration)
 app.post('/api/cards', async (c) => {
+  // Auth: X-Platform-Key (same key + check as the register endpoints). Writing
+  // public identity metadata MUST be gated — an open write lets anyone
+  // overwrite or hijack any agent's card.
+  const apiKey = c.req.header('X-Platform-Key');
+  const expectedCardsKey = process.env.SAID_HOSTING_API_KEY;
+  if (!expectedCardsKey || !apiKey || apiKey !== expectedCardsKey) {
+    return c.json({ error: 'Invalid or missing X-Platform-Key header' }, 401);
+  }
+
   const body = await c.req.json();
   const { wallet, name, description, twitter, website, github, capabilities } = body;
   
   if (!wallet || !name) {
     return c.json({ error: 'Required: wallet, name' }, 400);
   }
-  
-  // Build card
+
+  // Validate wallet + sanitize the public, identity-bearing name.
+  try { new PublicKey(wallet); } catch { return c.json({ error: 'Invalid wallet address' }, 400); }
+  const cleanName = String(name).trim();
+  if (cleanName.length < 1 || cleanName.length > 50) {
+    return c.json({ error: 'name must be 1-50 characters' }, 400);
+  }
+  if (/[\x00-\x1f\x7f<>]/.test(cleanName)) {
+    return c.json({ error: 'name contains invalid characters' }, 400);
+  }
+  if (/\b(support|admin|official|saidprotocol|said\s*protocol|coinbase|binance|metamask|phantom)\b/i.test(cleanName)) {
+    return c.json({ error: 'name not allowed (reserved/impersonation)' }, 400);
+  }
+
+  // Load existing card so an update (e.g. a rename) never drops fields the
+  // caller didn't resend, or resets verification.
+  const existingCard = await prisma.agentCard.findUnique({ where: { wallet } });
+  let prevCard: any = {};
+  if (existingCard) { try { prevCard = JSON.parse(existingCard.cardJson); } catch {} }
+
+  // Build card (merge onto previous)
   const card = {
-    name,
-    description: description || `${name} - AI Agent on SAID Protocol`,
+    ...prevCard,
+    name: cleanName,
+    description: description !== undefined ? description : (prevCard.description || `${cleanName} - AI Agent on SAID Protocol`),
     wallet,
-    twitter: twitter || undefined,
-    website: website || undefined,
-    github: github || undefined,
-    capabilities: capabilities || [],
-    created: new Date().toISOString().split('T')[0],
-    verified: false,
+    twitter: twitter !== undefined ? twitter : prevCard.twitter,
+    website: website !== undefined ? website : prevCard.website,
+    github: github !== undefined ? github : prevCard.github,
+    capabilities: capabilities !== undefined ? capabilities : (prevCard.capabilities || []),
+    created: prevCard.created || new Date().toISOString().split('T')[0],
+    updated: new Date().toISOString().split('T')[0],
   };
   
   // Store in database (we'll serve it from /api/cards/:wallet.json)
@@ -5528,6 +5557,11 @@ app.post('/api/cards', async (c) => {
       updatedAt: new Date(),
     }
   });
+
+  // Keep the canonical Agent record's name in sync (best-effort — the served
+  // card is the metadata, but Agent.name backs registry/search surfaces).
+  try { await prisma.agent.updateMany({ where: { wallet }, data: { name: cleanName } }); }
+  catch (e) { console.warn('[cards] Agent.name sync failed for', wallet, e); }
   
   const cardUri = `https://api.saidprotocol.com/api/cards/${wallet}.json`;
   
