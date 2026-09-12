@@ -43,6 +43,7 @@ import { fetchFairScaleScore } from './score-engine.js';
 import { computeTrustScore } from './scoring/trust-score.js';
 import { createEnforcementRouter } from './enforcement.js';
 import { createTrustCrisisRouter } from './trust-crisis.js';
+import { createLaunchScreenRouter } from './launch-screen.js';
 
 /**
  * Compute reputationScore from raw feedback rows using a Bayesian
@@ -348,6 +349,21 @@ app.get('/openapi.json', (c) => {
           responses: {
             '200': { description: 'Stake data' },
             '400': { description: 'Invalid wallet address' },
+          },
+        },
+      },
+      '/api/launch-screen': {
+        get: {
+          summary: 'Screen a token launcher at launch time',
+          description: 'A launch-time deployer verdict for launchpads. Combines the launcher wallet\'s on-chain history (age, activity scale, funder, open launch pools), its SAID identity (registered/verified, reputation tier, stake at risk), and optional GoPlus token safety on the mint. Returns clear | caution | high-risk with explicit reasons. A verified SAID launcher clears soft history flags; token danger and a brand-new wallet never can.',
+          operationId: 'launchScreen',
+          parameters: [
+            { name: 'launcher', in: 'query', required: true, schema: { type: 'string' }, description: 'Launcher (deployer) wallet address' },
+            { name: 'mint', in: 'query', required: false, schema: { type: 'string' }, description: 'The launched token mint, for token-safety checks' },
+          ],
+          responses: {
+            '200': { description: 'Launch screen verdict' },
+            '400': { description: 'Invalid launcher or mint address' },
           },
         },
       },
@@ -9166,6 +9182,10 @@ console.log('✅ Trust Score engine mounted (GET /api/score/:wallet)');
 // Mount Enforcement endpoints (staking/slashing — SAID's unique differentiator)
 app.route('/api/enforcement', createEnforcementRouter(connection));
 console.log('✅ Enforcement endpoints mounted (GET /api/enforcement/:wallet, POST /api/enforcement/batch)');
+
+// Mount Launch Screen (launch-time deployer verdict for launchpads: StonkFun, pump.fun Custom Pairs, ClawPump)
+app.route('/api/launch-screen', createLaunchScreenRouter(connection, prisma));
+console.log('✅ Launch screen mounted (GET /api/launch-screen?launcher=&mint=, GET /api/launch-screen/stats)');
 
 // Mount Trust Crisis endpoint (ERC-8004 comparison + economic trust verdict)
 app.route(
