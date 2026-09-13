@@ -43,6 +43,7 @@ import { fetchFairScaleScore } from './score-engine.js';
 import { computeTrustScore } from './scoring/trust-score.js';
 import { createEnforcementRouter } from './enforcement.js';
 import { createTrustCrisisRouter } from './trust-crisis.js';
+import { createAssetPassportRouter } from './asset-passport/router.js';
 
 /**
  * Compute reputationScore from raw feedback rows using a Bayesian
@@ -349,6 +350,24 @@ app.get('/openapi.json', (c) => {
             '200': { description: 'Stake data' },
             '400': { description: 'Invalid wallet address' },
           },
+        },
+      },
+      '/api/asset/{mint}': {
+        get: {
+          summary: 'Is this tokenized asset the real one?',
+          description: 'Classifies any Solana mint as backed (the issuer publishes a fetchable reserve figure), issuer-claimed, synthetic, meme, or impersonator. Returns the issuer, its legal structure and redemption terms, the asset ISIN and its underlying ISIN, live proof-of-reserve figures with the custodian named, and the real mint when the token is imitating one. Never reports "backed" without a reserve figure the reader can fetch.',
+          operationId: 'getAssetPassport',
+          parameters: [{ name: 'mint', in: 'path', required: true, schema: { type: 'string' }, description: 'Solana mint address' }],
+          responses: { '200': { description: 'Asset passport' }, '400': { description: 'Not a Solana mint address' } },
+        },
+      },
+      '/api/asset/search': {
+        get: {
+          summary: 'Every token trading under a ticker, real one first',
+          description: 'Returns the canonical tokenized assets using a ticker alongside every token imitating them, ranked by liquidity.',
+          operationId: 'searchAssets',
+          parameters: [{ name: 'q', in: 'query', required: true, schema: { type: 'string' }, description: 'Ticker or name, e.g. NVDAx' }],
+          responses: { '200': { description: 'Real assets and impersonators' }, '400': { description: 'Invalid query' } },
         },
       },
       '/api/trust-crisis': {
@@ -9166,6 +9185,10 @@ console.log('✅ Trust Score engine mounted (GET /api/score/:wallet)');
 // Mount Enforcement endpoints (staking/slashing — SAID's unique differentiator)
 app.route('/api/enforcement', createEnforcementRouter(connection));
 console.log('✅ Enforcement endpoints mounted (GET /api/enforcement/:wallet, POST /api/enforcement/batch)');
+
+// Mount Asset Passport (is this tokenized asset the real one? free, public, no integration needed)
+app.route('/api/asset', createAssetPassportRouter());
+console.log('✅ Asset passport mounted (GET /api/asset/:mint, /search, /impersonators, /issuers, /stats)');
 
 // Mount Trust Crisis endpoint (ERC-8004 comparison + economic trust verdict)
 app.route(
