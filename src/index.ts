@@ -44,6 +44,7 @@ import { computeTrustScore } from './scoring/trust-score.js';
 import { createEnforcementRouter } from './enforcement.js';
 import { createTrustCrisisRouter } from './trust-crisis.js';
 import { createAssetPassportRouter } from './asset-passport/router.js';
+import { getRegistry as warmAssetRegistry } from './asset-passport/issuers.js';
 
 /**
  * Compute reputationScore from raw feedback rows using a Bayesian
@@ -9186,9 +9187,50 @@ console.log('✅ Trust Score engine mounted (GET /api/score/:wallet)');
 app.route('/api/enforcement', createEnforcementRouter(connection));
 console.log('✅ Enforcement endpoints mounted (GET /api/enforcement/:wallet, POST /api/enforcement/batch)');
 
+// The public checker page. Served from the API so it is same-origin with the
+// passport endpoints, which the CORS allowlist would otherwise refuse.
+app.get('/check', async (c) => {
+  try {
+    const path = await import('path');
+    let html = await fs.readFile(path.join(process.cwd(), 'public', 'check.html'), 'utf8');
+    // A shared link carries its query, so its preview card should name it.
+    // Crawlers read the served HTML, not the page after JavaScript runs.
+    const q = (c.req.query('q') ?? '').trim();
+    if (q && /^[A-Za-z0-9._-]{2,44}$/.test(q)) {
+      const title = `Is ${q} real? — SAID Protocol`;
+      html = html
+        .replace(/<title>[^<]*<\/title>/, `<title>${title}</title>`)
+        .replace(/(<meta property="og:title" content=")[^"]*(")/, `$1${title}$2`)
+        .replace(/(<meta name="twitter:title" content=")[^"]*(")/, `$1${title}$2`);
+    }
+    c.header('Cache-Control', 'public, max-age=300');
+    return c.html(html);
+  } catch {
+    return c.text('checker page not found', 404);
+  }
+});
+
+// The link-preview image for /check. Static; generated from the page's own palette.
+app.get('/check-card.png', async (c) => {
+  try {
+    const path = await import('path');
+    const data = await fs.readFile(path.join(process.cwd(), 'public', 'check-card.png'));
+    c.header('Content-Type', 'image/png');
+    c.header('Cache-Control', 'public, max-age=86400');
+    return c.body(data);
+  } catch {
+    return c.text('', 404);
+  }
+});
+
 // Mount Asset Passport (is this tokenized asset the real one? free, public, no integration needed)
 app.route('/api/asset', createAssetPassportRouter());
 console.log('✅ Asset passport mounted (GET /api/asset/:mint, /search, /impersonators, /issuers, /stats)');
+// Build the issuer registry now rather than on the first visitor's request,
+// which otherwise costs them ~15 seconds after every deploy.
+warmAssetRegistry()
+  .then((reg) => console.log(`✅ Asset registry warm: ${reg.counts.total} assets, ${reg.counts.withReserve} with reserves${reg.errors.length ? ` (source errors: ${reg.errors.join('; ')})` : ''}`))
+  .catch((err) => console.error('⚠️  Asset registry failed to warm; it will retry on first request:', err instanceof Error ? err.message : err));
 
 // Mount Trust Crisis endpoint (ERC-8004 comparison + economic trust verdict)
 app.route(

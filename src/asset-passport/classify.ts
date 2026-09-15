@@ -82,9 +82,13 @@ export function verdictFor(
       if (market?.launchpad) reasons.push(`launched via ${market.launchpad}`);
       return { verdict: 'impersonator', reasons };
     }
-    reasons.push('not on any issuer’s published list of tokenized assets');
-    if (market?.verifiedOnJupiter) reasons.push('on Jupiter’s verified list, but with no tokenized-asset issuer tag');
-    if (market?.launchpad) reasons.push(`launched via ${market.launchpad}`);
+    // Not a tokenized asset is a STATEMENT OF SCOPE, not an allegation. Most
+    // tokens are not tokenized assets and there is nothing wrong with that.
+    // Only `impersonator` is a warning.
+    reasons.push('No issuer publishes this as a tokenized real-world asset, so there is no share, bond or commodity behind it.');
+    if (market?.verifiedOnJupiter) reasons.push('It is on Jupiter’s verified list, so the ticker is recognised. That says nothing about backing either way.');
+    if ((market?.holders ?? 0) > 1000) reasons.push(`${market!.holders!.toLocaleString()} holders.`);
+    if (market?.launchpad) reasons.push(`Launched via ${market.launchpad}.`);
     return { verdict: 'meme', reasons };
   }
 

@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Is it real? — SAID Protocol</title>
+<meta name="description" content="Check whether a tokenized stock is genuinely backed, synthetic, or a memecoin wearing its name." />
+<link rel="icon" href="/favicon.png" />
+<link rel="canonical" href="https://api.saidprotocol.com/check" />
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="SAID Protocol" />
+<meta property="og:title" content="Is it real? — SAID Protocol" />
+<meta property="og:description" content="Tokenized stocks now trade beside memecoins wearing the same ticker. Paste a mint or a ticker and find out which one you are looking at, with the evidence." />
+<meta property="og:url" content="https://api.saidprotocol.com/check" />
+<meta property="og:image" content="https://api.saidprotocol.com/check-card.png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:site" content="@saidinfra" />
+<meta name="twitter:title" content="Is it real? — SAID Protocol" />
+<meta name="twitter:description" content="One real NVIDIA xStock. Fifteen tokens wearing its name. Check any tokenized stock, with the evidence." />
+<meta name="twitter:image" content="https://api.saidprotocol.com/check-card.png" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" />
+<style>
+  :root{
+    --paper:#f6f4ef; --card:#efece4; --ink:#101010; --text:#101010;
+    --dim:#5c5a54; --faint:#8a877f; --line:rgba(16,16,16,.12); --hair:rgba(16,16,16,.07);
+    --good:#2e7c47; --good-soft:rgba(46,124,71,.10);
+    --attn:#9a6b00; --attn-soft:rgba(154,107,0,.10);
+    --crit:#a3392b; --crit-soft:rgba(163,57,43,.10);
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,monospace;
+    --sans:"Inter","Inter Variable",system-ui,-apple-system,sans-serif;
+    color-scheme:light;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --paper:#101010; --card:#191917; --ink:#f2f0ec; --text:#f2f0ec;
+      --dim:#a3a09a; --faint:#6b6963; --line:rgba(255,255,255,.12); --hair:rgba(255,255,255,.07);
+      --good:#3da35d; --good-soft:rgba(61,163,93,.12);
+      --attn:#fbbf24; --attn-soft:rgba(251,191,36,.10);
+      --crit:#f87171; --crit-soft:rgba(248,113,113,.10);
+      color-scheme:dark;
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#101010; --card:#191917; --ink:#f2f0ec; --text:#f2f0ec;
+    --dim:#a3a09a; --faint:#6b6963; --line:rgba(255,255,255,.12); --hair:rgba(255,255,255,.07);
+    --good:#3da35d; --good-soft:rgba(61,163,93,.12);
+    --attn:#fbbf24; --attn-soft:rgba(251,191,36,.10);
+    --crit:#f87171; --crit-soft:rgba(248,113,113,.10);
+    color-scheme:dark;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--text);font-family:var(--sans);font-size:15px;line-height:1.55;-webkit-font-smoothing:antialiased;font-feature-settings:"cv11","ss01"}
+  .wrap{max-width:760px;margin:0 auto;padding:48px 20px 80px}
+  .eyebrow{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
+  h1{font-size:38px;line-height:1.08;letter-spacing:-.03em;font-weight:600;margin:10px 0 10px;text-wrap:balance}
+  .lede{font-size:16.5px;color:var(--dim);margin:0 0 26px;max-width:60ch}
+
+  form{display:flex;gap:8px;margin:0 0 8px}
+  input[type=search]{flex:1;min-width:0;padding:13px 15px;font:inherit;font-size:15px;color:var(--text);background:var(--card);border:1px solid var(--line);border-radius:8px}
+  input[type=search]::placeholder{color:var(--faint)}
+  input[type=search]:focus-visible,button:focus-visible{outline:2px solid var(--good);outline-offset:2px}
+  button{padding:13px 20px;font:inherit;font-weight:600;font-size:15px;color:var(--paper);background:var(--ink);border:1px solid var(--ink);border-radius:8px;cursor:pointer}
+  button:hover{opacity:.88}
+  button[disabled]{opacity:.5;cursor:default}
+  .hint{font-size:13px;color:var(--faint);margin:0 0 30px}
+  .hint b{font-weight:500;color:var(--dim);cursor:pointer;border-bottom:1px solid var(--line)}
+  .hint b:hover{color:var(--text)}
+
+  /* ── the answer: one dominant card ─────────────────────────────────── */
+  .answer{border:1px solid var(--line);border-left:4px solid var(--good);border-radius:12px;padding:24px 26px;background:var(--card);margin:0 0 28px}
+  .answer.bad{border-left-color:var(--crit)}
+  .answer.warn{border-left-color:var(--attn)}
+  .answer.plain{border-left-color:var(--line)}
+  .answer.plain .alabel{color:var(--dim)}
+  .answer.plain ul.reasons li:before{background:var(--faint)}
+  .alabel{font-family:var(--mono);font-size:11px;letter-spacing:.09em;text-transform:uppercase;font-weight:600;color:var(--good)}
+  .answer.bad .alabel{color:var(--crit)} .answer.warn .alabel{color:var(--attn)}
+  .aname{font-size:27px;font-weight:600;letter-spacing:-.025em;line-height:1.15;margin:6px 0 2px}
+  .amint{font-family:var(--mono);font-size:12px;color:var(--faint);word-break:break-all}
+  ul.reasons{margin:16px 0 0;padding:0;list-style:none}
+  ul.reasons li{position:relative;padding-left:18px;margin-bottom:7px;font-size:14.5px}
+  ul.reasons li:before{content:"";position:absolute;left:0;top:8px;width:6px;height:6px;border-radius:50%;background:var(--good);opacity:.55}
+  .answer.bad ul.reasons li:before{background:var(--crit)} .answer.warn ul.reasons li:before{background:var(--attn)}
+  .facts{margin-top:20px;padding-top:16px;border-top:1px solid var(--hair);display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:16px 20px}
+  .facts .k{font-family:var(--mono);font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--faint);margin-bottom:3px}
+  .facts .v{font-size:13.5px;line-height:1.4;word-break:break-word}
+  .facts .v a{color:var(--good);text-decoration:none;border-bottom:1px solid var(--line)}
+  .facts .v.mono{font-family:var(--mono);font-size:12.5px}
+  .disclosure{margin-top:16px;padding-top:14px;border-top:1px solid var(--hair);font-size:12.5px;color:var(--dim);line-height:1.5}
+
+  /* ── the contrast line: the whole point of the page ──────────────────── */
+  .contrast{margin:0 0 14px;font-size:19px;font-weight:600;letter-spacing:-.015em;line-height:1.35;text-wrap:balance}
+  .contrast em{font-style:normal;color:var(--crit)}
+
+  /* ── impostors: deliberately subordinate ─────────────────────────────── */
+  .fakes{border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .fake{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:1px solid var(--hair);font-size:13.5px}
+  .fake:last-child{border-bottom:0}
+  .fake .dot{width:6px;height:6px;border-radius:50%;background:var(--crit);flex:none;opacity:.75}
+  .fake .nm{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dim)}
+  .fake .mint{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .fake .num{margin-left:auto;font-family:var(--mono);font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .more{padding:9px 14px;font-size:12.5px;color:var(--faint);background:var(--card)}
+
+  .err{border-left:3px solid var(--crit);background:var(--crit-soft);padding:14px 16px;border-radius:8px;font-size:14px;margin-bottom:16px}
+  .loading{font-size:14px;color:var(--dim);margin:4px 0}
+  footer{margin-top:40px;padding-top:16px;border-top:1px solid var(--line);font-size:12.5px;color:var(--faint);line-height:1.55}
+  footer a{color:var(--dim)}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--line);border-top-color:var(--good);border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px;margin-right:7px}
+  @keyframes s{to{transform:rotate(360deg)}}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="eyebrow">SAID Protocol</div>
+  <h1>Is it real?</h1>
+  <p class="lede">Tokenized stocks now trade beside memecoins wearing the same ticker. Paste a mint address or a ticker and find out which one you are looking at, with the evidence.</p>
+
+  <form id="f">
+    <input id="q" type="search" placeholder="NVDAx, or a mint address" autocomplete="off" spellcheck="false" aria-label="Ticker or mint address" />
+    <button type="submit" id="go">Check</button>
+  </form>
+  <p class="hint">Try <b data-q="NVDAx">NVDAx</b> · <b data-q="TSLAx">TSLAx</b> · <b data-q="SPYx">SPYx</b> · <b data-q="PreweJYECqtQwBtpxHL171nL2K6umo692gTm7Q3rpgF">a PreStocks mint</b></p>
+
+  <div id="out"></div>
+
+  <footer>
+    Evidence comes from each issuer's own published feeds and from the chain. Nothing is marked backed without a reserve figure you can fetch yourself.
+    Reserves are attested by the issuer's auditor; the circulating supply is verifiable on chain, the shares held at the custodian are not.
+    <a href="https://api.saidprotocol.com/api/asset/issuers">See who we cover</a>.
+  </footer>
+</div>
+
+<script>
+const API = location.protocol === 'file:' ? 'https://api.saidprotocol.com' : '';
+const out = document.getElementById('out');
+const qEl = document.getElementById('q');
+const goEl = document.getElementById('go');
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const money = (n) => n == null ? '—' : '$' + Math.round(n).toLocaleString();
+const short = (m) => m ? m.slice(0, 6) + '…' + m.slice(-4) : '';
+const ISSUER_NAME = { backed:'Backed Finance', ondo:'Ondo Global Markets', backpack:'Backpack Securities', prestocks:'PreStocks', tessera:'Tessera', shift:'Shift' };
+const LABEL = { backed:'Backed', 'issuer-claimed':'Issuer claim', synthetic:'Synthetic', meme:'Not a tokenized asset', impersonator:'Impersonator' };
+
+/* Real results captured 13 September 2026, so the page shows something true
+   before you type — and still works when opened straight off disk. */
+const SEED = {"query":"NVDAx","real":[{"mint":"Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh","symbol":"NVDAx","name":"NVIDIA xStock","issuer":"backed","verdict":"backed","isin":"CH1436219195","reserve":{"ratio":1.0026,"custodians":["Alpaca"],"asOf":"2026-09-13T18:01:04.370Z"}}],"impersonators":[{"mint":"9F7Wv2bPB8LUo8obqXLuh4yVXbvoqtaVqpyy6U5N4aKF","symbol":"NVDAx","name":"NVIDIA xStock","liquidityUsd":3136,"holders":1,"launchpad":"pump.fun"},{"mint":"Dn8CGUZr61mBJK1qqhvM7RKL6CvwXnABHrJuiDRspump","symbol":"NVDAx","name":"NVIDIA xStock","liquidityUsd":3081,"holders":18,"launchpad":"pump.fun"},{"mint":"6g95Bc68Wn5VazCvazzuHiC3waABJfu9srpjSaMZpump","symbol":"NVDAx","name":"NVDAx","liquidityUsd":3000,"holders":1,"launchpad":"pump.fun"},{"mint":"2kwvU12Zy5rN2iNQyKJhYFgGDfMiNwKnyEVKiApyLPjF","symbol":"NVDAx","name":"NVIDIA xStock","liquidityUsd":2902,"holders":10,"launchpad":"pump.fun"}],"summary":"1 real, 15 using the name, 15 of those with liquidity","liquidCount":15,"seeded":true};
+
+// Red is reserved for impersonation. A token simply not being a tokenized
+// asset is ordinary, and colouring it as a danger would repeat the mistake
+// this page exists to correct.
+const TONE = { backed:'', 'issuer-claimed':'warn', synthetic:'warn', meme:'plain', impersonator:'bad' };
+
+function factRow(k, v){ return '<div><div class="k">'+k+'</div><div class="v">'+v+'</div></div>'; }
+
+function passportCard(p){
+  const ids = p.identifiers || {}, r = p.reserve, f = [];
+  if (p.issuer) f.push(factRow('Issuer', esc(p.issuer.name)));
+  if (ids.isin) f.push(factRow('ISIN', '<span class="mono">'+esc(ids.isin)+'</span>'));
+  if (ids.underlyingSymbol) f.push(factRow('Tracks', esc(ids.underlyingSymbol)+(ids.exchangeMic?' on '+esc(ids.exchangeMic):'')));
+  if (r) f.push(factRow('Reserves', r.ratio.toFixed(4)+'× cover'+((r.custodians||[]).length?' at '+esc(r.custodians.join(', ')):'')));
+  if (p.issuer && p.issuer.proofOfReservesUrl) f.push(factRow('Proof', '<a href="'+esc(p.issuer.proofOfReservesUrl)+'" target="_blank" rel="noopener">check it yourself →</a>'));
+  if (p.issuer) f.push(factRow('Redeemable', esc(p.issuer.redeemable)));
+  if (p.impersonating) f.push(factRow('Imitates', esc(p.impersonating.imitates.symbol)+' · real mint '+short(p.impersonating.imitates.mint)));
+  if (p.market && p.market.liquidityUsd != null) f.push(factRow('Market', money(p.market.liquidityUsd)+' liquidity'+(p.market.holders!=null?' · '+p.market.holders+' holder'+(p.market.holders===1?'':'s'):'')));
+
+  return '<div class="answer '+(TONE[p.verdict]||'')+'">'
+    + '<div class="alabel">'+esc(LABEL[p.verdict]||p.verdict)+'</div>'
+    + '<div class="aname">'+esc(p.name || p.symbol || 'Unknown token')+'</div>'
+    + '<div class="amint">'+esc(p.symbol?p.symbol+' · ':'')+esc(p.mint)+'</div>'
+    + '<ul class="reasons">'+(p.reasons||[]).map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>'
+    + (f.length ? '<div class="facts">'+f.join('')+'</div>' : '')
+    + ((p.disclosure||[]).length ? '<div class="disclosure">'+esc(p.disclosure[0])+'</div>' : '')
+    + '</div>';
+}
+
+/* The real asset gets the card. The impostors get one sentence and a quiet
+   list — the contrast IS the product, so it has to be visible at a glance. */
+function searchView(d){
+  // A ticker that is not a tokenized asset still deserves a real answer.
+  if (d.notATokenizedAsset) {
+    const dom = d.dominant, look = d.lookalikes || [];
+    if (!dom) return '<p class="loading">Nothing is trading under that ticker.</p>';
+    let h = '<div class="answer warn">'
+      + '<div class="alabel">Not a tokenized stock</div>'
+      + '<div class="aname">'+esc(dom.name || dom.symbol)+'</div>'
+      + '<div class="amint">'+esc(dom.symbol)+' · '+esc(dom.mint)+'</div>'
+      + '<ul class="reasons"><li>No issuer publishes this as a tokenized real-world asset, so there is no share, bond or commodity behind it.</li>'
+      + (dom.verifiedOnJupiter ? '<li>It is on Jupiter’s verified list, which means the ticker is recognised — not that anything backs it.</li>' : '')
+      + '</ul>'
+      + '<div class="facts">'
+      + factRow('Liquidity', money(dom.liquidityUsd))
+      + (dom.holders != null ? factRow('Holders', dom.holders.toLocaleString()) : '')
+      + '</div></div>';
+    if (look.length) {
+      h += '<p class="contrast"><em>'+look.length+' other token'+(look.length===1?'':'s')+'</em> trade under the same ticker.</p>'
+        + '<div class="fakes">' + look.slice(0,6).map(t =>
+            '<div class="fake"><span class="dot"></span>'
+            + '<span class="nm">'+esc(t.name||t.symbol)+' <span class="mint">'+short(t.mint)+'</span></span>'
+            + '<span class="num">'+money(t.liquidityUsd)+' · '+(t.holders??'?')+' holder'+(t.holders===1?'':'s')+(t.launchpad?' · '+esc(t.launchpad):'')+'</span></div>').join('')
+        + (look.length>6 ? '<div class="more">and '+(look.length-6)+' more</div>' : '')
+        + '</div>';
+    }
+    return h;
+  }
+
+  const real = (d.real||[])[0];
+  const fakes = d.impersonators||[];
+  const withLiq = fakes.filter(f=>(f.liquidityUsd||0)>0);
+  let h = '';
+
+  if (real) {
+    const f = [];
+    if (real.isin) f.push(factRow('ISIN', '<span class="mono">'+esc(real.isin)+'</span>'));
+    f.push(factRow('Issuer', esc(ISSUER_NAME[real.issuer] || real.issuer)));
+    if (real.reserve) {
+      f.push(factRow('Reserves', real.reserve.ratio.toFixed(4)+'× cover at '+esc((real.reserve.custodians||[]).join(', '))));
+      f.push(factRow('Proof', '<a href="https://api.xstocks.fi/api/v2/public/proof-of-reserves/'+esc(real.symbol)+'" target="_blank" rel="noopener">check it yourself →</a>'));
+    }
+    h += '<div class="answer">'
+      + '<div class="alabel">'+esc(LABEL[real.verdict]||real.verdict)+' · the real one</div>'
+      + '<div class="aname">'+esc(real.name)+'</div>'
+      + '<div class="amint">'+esc(real.symbol)+' · '+esc(real.mint)+'</div>'
+      + '<div class="facts">'+f.join('')+'</div></div>';
+  }
+
+  if (fakes.length) {
+    const n = d.summary && /(\d+) using the name/.exec(d.summary);
+    const total = n ? n[1] : fakes.length;
+    h += '<p class="contrast"><em>'+esc(total)+' other tokens</em> are trading under this name'
+      + ((d.liquidCount ?? withLiq.length) ? ', and '+(d.liquidCount ?? withLiq.length)+' of them can be bought right now.' : '.') + '</p>';
+    h += '<div class="fakes">' + fakes.slice(0,6).map(f =>
+        '<div class="fake"><span class="dot"></span>'
+        + '<span class="nm">'+esc(f.name||f.symbol)+' <span class="mint">'+short(f.mint)+'</span></span>'
+        + '<span class="num">'+money(f.liquidityUsd)+' · '+(f.holders??'?')+' holder'+(f.holders===1?'':'s')+(f.launchpad?' · '+esc(f.launchpad):'')+'</span></div>').join('')
+      + (fakes.length>6 ? '<div class="more">and '+(fakes.length-6)+' more using this name</div>' : '')
+      + '</div>';
+  }
+  if (d.seeded) h += '<p class="loading" style="margin-top:14px">A real check run on 13 September 2026. Type above to run a live one.</p>';
+  return h;
+}
+
+async function run(q){
+  q = (q||'').trim();
+  if (!q) return;
+  out.innerHTML = '<p class="loading"><span class="spin"></span>Checking…</p>';
+  goEl.disabled = true;
+  const isMint = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(q);
+  try {
+    const url = API + (isMint ? '/api/asset/'+encodeURIComponent(q) : '/api/asset/search?q='+encodeURIComponent(q));
+    const res = await fetch(url, { headers:{accept:'application/json'} });
+    const body = await res.json();
+    if (!res.ok) { out.innerHTML = '<div class="err">'+esc(body.error||('HTTP '+res.status))+'</div>'; return; }
+    out.innerHTML = isMint ? passportCard(body) : (searchView(body) || '<p class="loading">Nothing is trading under that ticker.</p>');
+  } catch (e) {
+    out.innerHTML = '<div class="err">Could not reach the API. '+esc(e.message)+'</div>';
+  } finally { goEl.disabled = false; }
+}
+
+document.getElementById('f').addEventListener('submit', (e)=>{ e.preventDefault(); run(qEl.value); });
+document.querySelectorAll('.hint b').forEach(b=>b.addEventListener('click', ()=>{ qEl.value = b.dataset.q; run(b.dataset.q); }));
+// A ?q= in the URL runs that check on load, so a result can be linked, shared
+// and screenshotted rather than only reached by typing.
+const initial = new URLSearchParams(location.search).get('q');
+if (initial) { qEl.value = initial; run(initial); } else { out.innerHTML = searchView(SEED); }
+</script>
+</body>
+</html>

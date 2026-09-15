@@ -25,6 +25,20 @@ const stats = {
   since: new Date().toISOString(),
 };
 
+/**
+ * Short TTL caches. A shared link fans out to many viewers hitting the same
+ * ticker within minutes; without this every one of them is a Jupiter call,
+ * and the impersonator feed alone is twelve. Results change slowly.
+ */
+const SEARCH_TTL_MS = 2 * 60 * 1000;
+const FEED_TTL_MS = 10 * 60 * 1000;
+const searchCache = new Map<string, { at: number; body: unknown }>();
+let feedCache: { at: number; body: unknown } | null = null;
+function cached<T>(map: Map<string, { at: number; body: unknown }>, key: string, ttl: number): T | null {
+  const hit = map.get(key);
+  return hit && Date.now() - hit.at < ttl ? (hit.body as T) : null;
+}
+
 function isMint(s: unknown): s is string {
   if (typeof s !== 'string') return false;
   try { new PublicKey(s); return true; } catch { return false; }
@@ -68,6 +82,9 @@ export function createAssetPassportRouter(): Hono {
     const q = (c.req.query('q') ?? '').trim();
     if (q.length < 2 || q.length > 32) return c.json({ error: 'q must be a ticker or name, 2 to 32 characters' }, 400);
     stats.searches += 1;
+    const key = q.toLowerCase();
+    const hit = cached<object>(searchCache, key, SEARCH_TTL_MS);
+    if (hit) return c.json(hit);
     try {
       const reg = await getRegistry();
       const canonical = reg.bySymbol.get(q.toLowerCase()) ?? [];
@@ -89,7 +106,41 @@ export function createAssetPassportRouter(): Hono {
         }))
         .sort((a, b) => (b.liquidityUsd ?? 0) - (a.liquidityUsd ?? 0));
 
-      return c.json({
+      // No canonical tokenized asset uses this ticker. Do not answer "nothing
+      // found" — the ticker is usually a real token, and the useful answer is
+      // what it actually is, plus any same-ticker lookalikes beside it. A
+      // lookalike here imitates another ordinary token, not a tokenized asset,
+      // so it is named differently and never called an impersonator.
+      if (canonical.length === 0) {
+        const sameTicker = hits
+          .filter((t) => (t.symbol ?? '').toLowerCase() === q.toLowerCase())
+          .sort((a, b) => (b.liquidity ?? 0) - (a.liquidity ?? 0));
+        const [dominant, ...rest] = sameTicker;
+        const body = {
+          query: q,
+          notATokenizedAsset: true,
+          real: [],
+          dominant: dominant ? {
+            mint: dominant.id ?? dominant.address, symbol: dominant.symbol, name: dominant.name,
+            verdict: 'meme' as Verdict, verifiedOnJupiter: !!dominant.isVerified,
+            liquidityUsd: dominant.liquidity ?? null, holders: dominant.holderCount ?? null,
+          } : null,
+          lookalikes: rest.map((t) => ({
+            mint: t.id ?? t.address, symbol: t.symbol, name: t.name,
+            liquidityUsd: t.liquidity ?? null, holders: t.holderCount ?? null,
+            launchpad: t.launchpad ?? null, verifiedOnJupiter: !!t.isVerified,
+          })),
+          impersonators: [],
+          summary: dominant
+            ? `${q} is not a tokenized stock. ${sameTicker.length} token${sameTicker.length === 1 ? '' : 's'} trade under this ticker${rest.length ? `, and ${rest.length} ${rest.length === 1 ? 'of them is not' : 'of them are not'} the main one` : ''}.`
+            : `Nothing is trading under ${q}.`,
+          computedAt: new Date().toISOString(),
+        };
+        searchCache.set(key, { at: Date.now(), body });
+        return c.json(body);
+      }
+
+      const body = {
         query: q,
         real: canonical.map((a) => ({
           mint: a.mint, symbol: a.symbol, name: a.name, issuer: a.issuer,
@@ -100,7 +151,9 @@ export function createAssetPassportRouter(): Hono {
         impersonators: impostors,
         summary: `${canonical.length} real, ${impostors.length} using the name, ${impostors.filter((i) => (i.liquidityUsd ?? 0) > 0).length} of those with liquidity`,
         computedAt: new Date().toISOString(),
-      });
+      };
+      searchCache.set(key, { at: Date.now(), body });
+      return c.json(body);
     } catch (err) {
       stats.errors += 1;
       console.error('[asset-passport] search failed', q, err);
@@ -114,6 +167,10 @@ export function createAssetPassportRouter(): Hono {
    */
   router.get('/impersonators', async (c: Context) => {
     const limit = Math.min(Number(c.req.query('limit') ?? 25) || 25, 100);
+    if (feedCache && Date.now() - feedCache.at < FEED_TTL_MS) {
+      const b = feedCache.body as any;
+      return c.json({ ...b, impersonators: b.impersonators.slice(0, limit), cached: true });
+    }
     try {
       const reg = await getRegistry();
       // The most-faked tickers: the real assets with the deepest markets.
@@ -141,14 +198,16 @@ export function createAssetPassportRouter(): Hono {
       }
       found.sort((a, b) => b.liquidityUsd - a.liquidityUsd);
       const totalLiquidity = found.reduce((n, f) => n + f.liquidityUsd, 0);
-      return c.json({
+      const body = {
         tickersChecked: tickers,
         count: found.length,
         totalLiquidityUsd: totalLiquidity,
         note: 'Tokens using the ticker or name of a real tokenized asset, with live liquidity, which are not that asset. Search results are capped per ticker, so this is a lower bound.',
-        impersonators: found.slice(0, limit),
+        impersonators: found,
         computedAt: new Date().toISOString(),
-      });
+      };
+      feedCache = { at: Date.now(), body };
+      return c.json({ ...body, impersonators: found.slice(0, limit) });
     } catch (err) {
       stats.errors += 1;
       console.error('[asset-passport] impersonator feed failed', err);
