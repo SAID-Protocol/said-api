@@ -12,8 +12,9 @@
  * delegate are exactly the Token-2022 powers a regulated issuer is REQUIRED to
  * retain — to honour corporate actions, court orders and redemptions. Today's
  * scanners score the real Backed Tesla xStock 81/100 "danger" for holding
- * them, while the impersonator beside it is flagged for nothing. We surface
- * those powers as DISCLOSURE, never as a risk score.
+ * them, while the fake "NVIDIA xStock" beside it scores 29 with a single
+ * copycat warning — the impersonator rates safer than the genuine asset. We
+ * surface those powers as DISCLOSURE, never as a risk score.
  */
 
 import type { CanonicalAsset } from './issuers.js';
