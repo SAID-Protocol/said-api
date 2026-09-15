@@ -132,7 +132,7 @@ export function createAssetPassportRouter(): Hono {
           })),
           impersonators: [],
           summary: dominant
-            ? `${q} is not a tokenized stock. ${sameTicker.length} token${sameTicker.length === 1 ? '' : 's'} trade under this ticker${rest.length ? `, and ${rest.length} ${rest.length === 1 ? 'of them is not' : 'of them are not'} the main one` : ''}.`
+            ? `${q} is not a tokenized stock. ${sameTicker.length} token${sameTicker.length === 1 ? ' trades' : 's trade'} under this ticker${rest.length ? `, and ${rest.length} ${rest.length === 1 ? 'of them is not' : 'of them are not'} the main one` : ''}.`
             : `Nothing is trading under ${q}.`,
           computedAt: new Date().toISOString(),
         };
