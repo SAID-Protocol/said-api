@@ -310,11 +310,20 @@ function startReserveRefresher(): void {
       registry.counts.withReserve = [...registry.byMint.values()].filter((a) => a.reserve).length;
       registry.reservesRefreshedAt = new Date().toISOString();
       if (n === 0) console.warn('[asset-passport] reserve refresh returned nothing; existing figures kept');
+      else {
+        // Log success too. A refresh that applies an unchanged figure is
+        // otherwise invisible, which made the first production tick look like
+        // a failure on 2026-09-16.
+        let newest = '';
+        for (const a of registry.byMint.values()) if (a.reserve && a.reserve.asOf > newest) newest = a.reserve.asOf;
+        console.log(`[asset-passport] reserves refreshed: ${n} assets, newest figure ${newest}`);
+      }
     } catch (err) {
       console.error('[asset-passport] reserve refresh failed; existing figures kept:', err instanceof Error ? err.message : err);
     } finally { refreshingReserves = false; }
   }, RESERVE_REFRESH_MS);
   reserveTimer.unref?.();
+  console.log(`[asset-passport] reserve refresher armed, every ${RESERVE_REFRESH_MS / 60000} min`);
 }
 
 /** The registry, built on first use and refreshed daily; reserves every ten minutes. Never throws to callers mid-flight. */

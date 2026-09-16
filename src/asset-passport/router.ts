@@ -69,6 +69,9 @@ export function createAssetPassportRouter(): Hono {
       })),
       totals: reg.counts,
       builtAt: reg.builtAt,
+      // When the ten-minute reserve refresher last ran. Absent until the first
+      // run after boot; if it stays absent, the refresher is not running.
+      reservesRefreshedAt: reg.reservesRefreshedAt ?? null,
       ...(reg.errors.length ? { sourceErrors: reg.errors } : {}),
     });
   });
