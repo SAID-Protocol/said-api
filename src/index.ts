@@ -9202,25 +9202,12 @@ console.log('✅ Enforcement endpoints mounted (GET /api/enforcement/:wallet, PO
 
 // The public checker page. Served from the API so it is same-origin with the
 // passport endpoints, which the CORS allowlist would otherwise refuse.
-app.get('/check', async (c) => {
-  try {
-    const path = await import('path');
-    let html = await fs.readFile(path.join(process.cwd(), 'public', 'check.html'), 'utf8');
-    // A shared link carries its query, so its preview card should name it.
-    // Crawlers read the served HTML, not the page after JavaScript runs.
-    const q = (c.req.query('q') ?? '').trim();
-    if (q && /^[A-Za-z0-9._-]{2,44}$/.test(q)) {
-      const title = `Is ${q} real? — SAID Protocol`;
-      html = html
-        .replace(/<title>[^<]*<\/title>/, `<title>${title}</title>`)
-        .replace(/(<meta property="og:title" content=")[^"]*(")/, `$1${title}$2`)
-        .replace(/(<meta name="twitter:title" content=")[^"]*(")/, `$1${title}$2`);
-    }
-    c.header('Cache-Control', 'public, max-age=300');
-    return c.html(html);
-  } catch {
-    return c.text('checker page not found', 404);
-  }
+app.get('/check', (c) => {
+  // The checker now lives on the protocol site. Keep the old address working
+  // for links already shared, carrying the query across.
+  const q = (c.req.query('q') ?? '').trim();
+  const target = 'https://www.saidprotocol.com/check' + (q ? `?q=${encodeURIComponent(q)}` : '');
+  return c.redirect(target, 302);
 });
 
 // The link-preview image for /check. Static; generated from the page's own palette.
