@@ -77,7 +77,7 @@ export function verdictFor(
 
   if (!canonical) {
     if (impersonating) {
-      reasons.push(`uses the ${impersonating.basis === 'name' ? 'name' : 'ticker'} of ${impersonating.imitates.symbol}, a real tokenized asset from ${impersonating.imitates.issuer}, but is a different mint`);
+      reasons.push(`uses the ${impersonating.basis === 'name' ? 'name' : 'ticker'} of ${impersonating.imitates.symbol}, a real tokenized asset from ${issuerProfile(impersonating.imitates.issuer)?.name ?? impersonating.imitates.issuer}, but is a different mint`);
       if (market && (market.holders ?? 0) <= 5) reasons.push(`${market.holders ?? 0} holder${(market.holders ?? 0) === 1 ? '' : 's'}`);
       if (market?.liquidityUsd) reasons.push(`$${Math.round(market.liquidityUsd).toLocaleString()} of liquidity, so it can be bought`);
       if (market?.launchpad) reasons.push(`launched via ${market.launchpad}`);
