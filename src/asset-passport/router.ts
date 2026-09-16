@@ -15,7 +15,7 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { PublicKey } from '@solana/web3.js';
 import { buildPassport, verdictFor, detectImpersonation, type Verdict } from './classify.js';
-import { getRegistry, ISSUERS } from './issuers.js';
+import { getRegistry, ISSUERS, refreshReserve } from './issuers.js';
 
 const stats = {
   calls: 0,
@@ -87,7 +87,9 @@ export function createAssetPassportRouter(): Hono {
     if (hit) return c.json(hit);
     try {
       const reg = await getRegistry();
-      const canonical = reg.bySymbol.get(q.toLowerCase()) ?? [];
+      // A ticker or a name: "TSLAx" and "Tesla xStock" must both find the real one.
+      const canonical = reg.bySymbol.get(q.toLowerCase()) ?? reg.byName.get(q.toLowerCase()) ?? [];
+      for (const a of canonical) if (a.backing === 'backed' && (!a.reserve || Date.now() - Date.parse(a.reserve.asOf) > 6 * 60 * 60 * 1000)) await refreshReserve(a);
       const hits = await searchBySymbol(q);
       const impostors = hits
         .filter((t) => {
@@ -113,7 +115,7 @@ export function createAssetPassportRouter(): Hono {
       // so it is named differently and never called an impersonator.
       if (canonical.length === 0) {
         const sameTicker = hits
-          .filter((t) => (t.symbol ?? '').toLowerCase() === q.toLowerCase())
+          .filter((t) => (t.symbol ?? '').toLowerCase() === q.toLowerCase() || (t.name ?? '').toLowerCase() === q.toLowerCase())
           .sort((a, b) => (b.liquidity ?? 0) - (a.liquidity ?? 0));
         const [dominant, ...rest] = sameTicker;
         const body = {

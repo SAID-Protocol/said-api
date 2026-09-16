@@ -157,28 +157,41 @@ const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
 const RATE_LIMIT = 60; // requests per window
 const RATE_WINDOW = 60_000; // 1 minute
 
+// Static, cacheable pages are never rate limited: a shared office or carrier
+// IP must not lose the checker page itself because of other traffic.
+const RATE_LIMIT_EXEMPT = new Set(['/check', '/check-card.png', '/favicon.ico', '/health']);
+// The public asset passport is cached and cheap, and a shared link fans out
+// from a single IP (link-preview fetchers, NAT), so it has its own budget.
+const ASSET_RATE_LIMIT = 300;
+const assetRateLimitMap = new Map<string, { count: number; resetAt: number }>();
+
 app.use('/*', async (c, next) => {
+  const path = c.req.path;
+  if (RATE_LIMIT_EXEMPT.has(path)) return next();
   const ip = c.req.header('x-forwarded-for')?.split(',')[0]?.trim() || 
              c.req.header('x-real-ip') || 
              'unknown';
   
   const now = Date.now();
-  const entry = rateLimitMap.get(ip);
+  const isAsset = path.startsWith('/api/asset/');
+  const map = isAsset ? assetRateLimitMap : rateLimitMap;
+  const limit = isAsset ? ASSET_RATE_LIMIT : RATE_LIMIT;
+  const entry = map.get(ip);
   
   if (!entry || now > entry.resetAt) {
-    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_WINDOW });
+    map.set(ip, { count: 1, resetAt: now + RATE_WINDOW });
   } else {
     entry.count++;
-    if (entry.count > RATE_LIMIT) {
-      console.warn(`[rate-limit] IP ${ip} exceeded ${RATE_LIMIT} req/min`);
+    if (entry.count > limit) {
+      console.warn(`[rate-limit] IP ${ip} exceeded ${limit} req/min on ${isAsset ? '/api/asset' : 'api'}`);
       return c.json({ error: 'Too many requests. Please slow down.' }, 429);
     }
   }
   
   // Cleanup old entries every 5 minutes
   if (Math.random() < 0.01) {
-    for (const [key, val] of rateLimitMap) {
-      if (now > val.resetAt) rateLimitMap.delete(key);
+    for (const m of [rateLimitMap, assetRateLimitMap]) for (const [key, val] of m) {
+      if (now > val.resetAt) m.delete(key);
     }
   }
   

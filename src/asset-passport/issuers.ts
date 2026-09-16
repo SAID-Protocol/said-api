@@ -136,6 +136,7 @@ interface Registry {
   /** lowercased name → canonical entries, for name-collision detection */
   byName: Map<string, CanonicalAsset[]>;
   builtAt: string;
+  reservesRefreshedAt?: string;
   counts: Record<string, number>;
   errors: string[];
 }
@@ -166,23 +167,54 @@ async function loadBacked(): Promise<CanonicalAsset[]> {
     }
     if (!body.page?.hasNextPage) break;
   }
-  // Proof of reserves, folded in by symbol. An asset whose PoR is missing or
-  // stale keeps the issuer's structure but loses the `backed` claim later.
-  const bySymbol = new Map(assets.map((a) => [a.symbol, a]));
+  await applyBackedReserves(assets);
+  return assets;
+}
+
+function reserveFrom(r: any): CanonicalAsset['reserve'] | null {
+  const held = Number(r?.sharesHeld); const circ = Number(r?.circulatingSupply);
+  if (!Number.isFinite(held) || !Number.isFinite(circ) || circ <= 0) return null;
+  return { sharesHeld: held, circulating: circ, ratio: held / circ, custodians: (r.holdings ?? []).map((h: any) => h.provider).filter(Boolean), asOf: r.timestamp };
+}
+
+/**
+ * Fold Backed's proof-of-reserves into the given assets, by symbol, in place.
+ * Called at build AND every ten minutes after: Backed republishes roughly
+ * every ten minutes, and the classifier refuses to call anything `backed` on a
+ * figure older than six hours. Reserves captured once a day would therefore
+ * be "stale" for eighteen hours of every twenty-four — which is exactly what
+ * happened in production on 2026-09-16. Returns how many were updated.
+ */
+export async function applyBackedReserves(assets: Iterable<CanonicalAsset>): Promise<number> {
+  const bySymbol = new Map<string, CanonicalAsset>();
+  for (const a of assets) if (a.issuer === 'backed') bySymbol.set(a.symbol, a);
+  let updated = 0;
   for (let page = 0; page < 12; page += 1) {
     let body: any;
     try { body = await getJson(`https://api.xstocks.fi/api/v2/public/proof-of-reserves?page=${page}`, 20000); }
     catch { break; }
     for (const r of body.nodes ?? []) {
       const a = bySymbol.get(r.symbol);
-      if (!a) continue;
-      const held = Number(r.sharesHeld); const circ = Number(r.circulatingSupply);
-      if (!Number.isFinite(held) || !Number.isFinite(circ) || circ <= 0) continue;
-      a.reserve = { sharesHeld: held, circulating: circ, ratio: held / circ, custodians: (r.holdings ?? []).map((h: any) => h.provider).filter(Boolean), asOf: r.timestamp };
+      const reserve = a ? reserveFrom(r) : null;
+      if (a && reserve) { a.reserve = reserve; updated += 1; }
     }
     if (!body.page?.hasNextPage) break;
   }
-  return assets;
+  return updated;
+}
+
+/** One asset's reserves, live. Used when a request finds the cached figure stale. */
+const liveReserveCache = new Map<string, { at: number; reserve: CanonicalAsset['reserve'] | null }>();
+export async function refreshReserve(asset: CanonicalAsset): Promise<CanonicalAsset['reserve'] | null> {
+  if (asset.issuer !== 'backed') return asset.reserve ?? null;
+  const hit = liveReserveCache.get(asset.symbol);
+  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.reserve;
+  let reserve: CanonicalAsset['reserve'] | null = null;
+  try { const body = await getJson(`https://api.xstocks.fi/api/v2/public/proof-of-reserves/${encodeURIComponent(asset.symbol)}`, 15000); reserve = reserveFrom(body.data ?? body); }
+  catch { reserve = null; }
+  liveReserveCache.set(asset.symbol, { at: Date.now(), reserve });
+  if (reserve) asset.reserve = reserve;
+  return reserve;
 }
 
 /** Sunrise: the cleanest typed source, and how we reach Backpack's mints. */
@@ -265,12 +297,32 @@ async function build(): Promise<Registry> {
   return { byMint, bySymbol, byName, builtAt: new Date().toISOString(), counts, errors };
 }
 
-/** The registry, built on first use and refreshed daily. Never throws to callers mid-flight. */
+const RESERVE_REFRESH_MS = 10 * 60 * 1000;
+let reserveTimer: ReturnType<typeof setInterval> | null = null;
+let refreshingReserves = false;
+function startReserveRefresher(): void {
+  if (reserveTimer) return;
+  reserveTimer = setInterval(async () => {
+    if (!registry || refreshingReserves) return;
+    refreshingReserves = true;
+    try {
+      const n = await applyBackedReserves(registry.byMint.values());
+      registry.counts.withReserve = [...registry.byMint.values()].filter((a) => a.reserve).length;
+      registry.reservesRefreshedAt = new Date().toISOString();
+      if (n === 0) console.warn('[asset-passport] reserve refresh returned nothing; existing figures kept');
+    } catch (err) {
+      console.error('[asset-passport] reserve refresh failed; existing figures kept:', err instanceof Error ? err.message : err);
+    } finally { refreshingReserves = false; }
+  }, RESERVE_REFRESH_MS);
+  reserveTimer.unref?.();
+}
+
+/** The registry, built on first use and refreshed daily; reserves every ten minutes. Never throws to callers mid-flight. */
 export async function getRegistry(force = false): Promise<Registry> {
   if (!force && registry && Date.now() - Date.parse(registry.builtAt) < REFRESH_MS) return registry;
   if (building) return building;
   building = build()
-    .then((r) => { registry = r; return r; })
+    .then((r) => { registry = r; startReserveRefresher(); return r; })
     .catch((err) => {
       if (registry) { console.error('[asset-passport] refresh failed, serving previous registry:', err); return registry; }
       throw err;

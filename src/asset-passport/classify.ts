@@ -18,7 +18,7 @@
  */
 
 import type { CanonicalAsset } from './issuers.js';
-import { getRegistry, issuerProfile } from './issuers.js';
+import { getRegistry, issuerProfile, refreshReserve } from './issuers.js';
 
 export type Verdict = 'backed' | 'issuer-claimed' | 'synthetic' | 'meme' | 'impersonator';
 
@@ -195,6 +195,12 @@ export function detectImpersonation(
 export async function buildPassport(mint: string): Promise<Passport> {
   const reg = await getRegistry();
   const canonical = reg.byMint.get(mint);
+  // A stale cached reserve must not decide the verdict when a live one is a
+  // single call away. The ten-minute refresher makes this rare; this makes it
+  // impossible to be wrong merely because the refresher has not run yet.
+  if (canonical?.backing === 'backed' && (!canonical.reserve || Date.now() - Date.parse(canonical.reserve.asOf) > RESERVE_MAX_AGE_MS)) {
+    await refreshReserve(canonical);
+  }
   let market = await jupiter(mint);
   if (!canonical && !market?.symbol) {
     const chain = await onChainIdentity(mint);
