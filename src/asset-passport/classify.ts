@@ -126,8 +126,8 @@ export function verdictFor(
     return { verdict: 'backed', reasons };
   }
 
+  reasons.push('The issuer claims backing but publishes no reserve figure at the asset level that a reader can fetch, so it is recorded as a claim rather than as proof.');
   if (profile?.caveat) reasons.push(profile.caveat);
-  else reasons.push('the issuer claims backing but publishes no reserve figure we can fetch');
   return { verdict: 'issuer-claimed', reasons };
 }
 

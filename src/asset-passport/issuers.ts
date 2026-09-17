@@ -82,13 +82,13 @@ export const ISSUERS: Record<string, IssuerProfile> = {
   prestocks: {
     key: 'prestocks',
     name: 'PreStocks',
-    backing: 'synthetic',
+    backing: 'issuer-claimed',
     updateAuthority: 'WV9PJN7XTmTLVwbutCLFxp8TyePee6Xq5mRq6Fti5Wc',
     jupTag: 'prestocks',
-    legal: 'Pre-IPO exposure tokens. The terms of service (8 September 2026) name no issuing entity; governing law is the British Virgin Islands.',
+    legal: 'Pre-IPO exposure tokens. No issuing entity, custodian or counterparty is named, by stated policy; governing law is the British Virgin Islands. Attestations by BlockOffice Pte. Ltd. verify token supply against a cap PreStocks set, not assets held.',
     redeemable: 'No right to redeem. Their terms: a request for redemption does not of itself create an entitlement to have tokens redeemed.',
     sourceUrl: 'https://prestocks.com/api/prestocks',
-    caveat: 'The homepage and each token description say "backed 1:1 by SPV exposure to the underlying company shares". The terms of service say the exposure may take any form including a derivative or synthetic arrangement referencing the company or a proxy for it, that it creates no trust, custody or segregated claim, and that holders have no legal, equitable or contractual right to any underlying share or asset. Quoted verbatim; read both before buying.',
+    caveat: 'The homepage says "backed 1:1 by SPV exposure to the underlying company shares". The terms (8 September 2026) say the exposure may take any form including a derivative or synthetic arrangement on a proxy, may be substituted without notice, and gives holders no legal, equitable or contractual right to any underlying share. Whether shares are held is not verifiable from outside; conduct through the xAI merger and the SpaceX lockup has been consistent with real holdings.',
   },
   tessera: {
     key: 'tessera',

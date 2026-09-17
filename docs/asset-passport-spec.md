@@ -98,18 +98,24 @@ Every source below was fetched this session. Free and unauthenticated unless not
 | **Backed / xStocks** | 832 | `backed` | Free per-mint PoR, custodian named, Jersey SPV, **retail-redeemable** at $5k minimum |
 | **Ondo** | 451 | `issuer-claimed` | Attestations promised (Ankura Trust) but every URL 404s and they appear KYC-gated |
 | **Backpack Securities** | 44 | `issuer-claimed` | Their own table says "Claim on SPV"; no published proof for the token layer |
-| **PreStocks** | 9 | `synthetic` | **Their terms disclaim the backing their API advertises** — see below |
+| **PreStocks** | 9 | `issuer-claimed` | Markets "1:1 backed by SPV exposure"; terms give no enforceable claim and allow synthetic substitution; attestation counts tokens, not shares; conduct consistent with real holdings — see below |
 | **Shift** | 8 | `synthetic` | Leveraged synthetics, self-declared |
 | **Tessera** | 3 | `synthetic` | Writes *"This is a loan product, not a security"* into its own on-chain metadata |
 | **Superstate** | 4 | `backed` (different basis) | The token **is** the share register, via an SEC-registered transfer agent |
 
 **Sunrise is not an issuer** — it is Backpack's listing layer, and its API is the cleanest typed schema anywhere (`assetClass` + `issuer` per token): `api.sunrise.xyz/v1/tokens`. **Dinari is not on Solana at all.**
 
-### The PreStocks finding
+### PreStocks, stated fairly (steelmanned 2026-09-17)
 
-PreStocks says, in every token's API description and on its homepage, that its tokens are *"backed 1:1 by SPV exposure"*. Its Terms of Service (last updated 8 September 2026, at prestocks.notion.site/terms-of-service) say the opposite; every quote below was fetched verbatim on 2026-09-15. Its Terms of Service say the exposure *"may take any one or more forms… derivative or synthetic… referencing the relevant company **or a proxy for it**"*, that it *"does not of itself create a security interest, trust, custody relationship, or segregated, ring-fenced, or bankruptcy-remote claim"*, and that holders have *"**no legal, equitable, or contractual right to any underlying share or asset**."* Redemption: *"A request for redemption does not of itself create an entitlement."* No legal entity is named anywhere.
+PreStocks markets its tokens as *"backed 1:1 by SPV exposure to the underlying company shares."* Its terms (8 September 2026) say the exposure may take any form including a derivative or synthetic arrangement on a proxy, may be substituted without notice, creates no trust, custody or segregated claim, gives holders no legal, equitable or contractual right to any underlying share, and that a redemption request creates no entitlement. Its attestations (BlockOffice Pte. Ltd., one page each, "not a statutory audit") verify that minted tokens do not exceed a cap PreStocks set; they say nothing about assets held. No issuing entity, custodian or counterparty is named, by stated policy.
 
-**The live proof of what that is worth:** SpaceX listed on Nasdaq in June 2026. PreStocks SPACEX now trades at **$119.54** against Backed's SPCXx at **$149.61**, a 20% discount, and PreStocks' own banner says the tokens *"will expire worthless"* after 12 March 2027. Same underlying company, two tokens, one redeemable and one not.
+**What that does not establish:** that nothing is held. Conduct is consistent with a real but opaque position book: the xAI to SpaceX conversion at the exact merger ratio, on-chain supplies matching attestations, no exploits, denied redemptions or enforcement, and a SpaceX lockup discount that was disclosed before listing, matches the real unlock schedule, and tracks the share-backed peer Tessera rather than the openly synthetic Republic note.
+
+**SpaceX is unresolved, not failed.** The tokens convert 1:1 into tokenized public stock after the lockup ends (~December 2026); 12 March 2027 is the deadline to convert, not an expiry of value. The first real payout test is that window.
+
+**"No claim on the underlying" is category-wide** (Ondo, Backed, Tessera, Jarsy, Robinhood all say it) and is not a reason to single anyone out. What is specific to PreStocks among issuers marketing themselves as share-backed: no named entity or custodian, token-count-only attestation, and the right to substitute synthetic exposure without notice.
+
+**Verdict on the page:** `issuer-claimed` is the precise label. The reasons quote the homepage and the terms side by side, verbatim and dated, and say the holder has no enforceable claim. The page never asserts that nothing is held. Their terms carry a non-disparagement clause with BVI arbitration; exactness is not optional.
 
 ## The existing tools get it backwards
 

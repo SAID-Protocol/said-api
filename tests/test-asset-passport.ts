@@ -38,14 +38,13 @@ check('under-collateralised downgrades to issuer-claimed',
 // Issuer-level backing
 check('Ondo is issuer-claimed',
   verdictFor({ mint: 'K1', symbol: 'NVDAon', name: 'NVIDIA Ondo', issuer: 'ondo', backing: 'issuer-claimed' }, null, null, NOW).verdict, 'issuer-claimed');
-check('PreStocks is synthetic',
-  verdictFor({ mint: 'P1', symbol: 'OPENAI', name: 'OpenAI', issuer: 'prestocks', backing: 'synthetic' }, null, null, NOW).verdict, 'synthetic');
-check('PreStocks verdict quotes the terms, not the marketing',
-  verdictFor({ mint: 'P1', symbol: 'OPENAI', name: 'OpenAI', issuer: 'prestocks', backing: 'synthetic' }, null, null, NOW)
-    .reasons.some((r) => r.includes('no legal, equitable or contractual right')), true);
-check('synthetic never claims nothing is held — only that there is no enforceable claim',
-  verdictFor({ mint: 'P1', symbol: 'OPENAI', name: 'OpenAI', issuer: 'prestocks', backing: 'synthetic' }, null, null, NOW)
-    .reasons.some((r) => r.includes('no enforceable claim')) && !verdictFor({ mint: 'P1', symbol: 'OPENAI', name: 'OpenAI', issuer: 'prestocks', backing: 'synthetic' }, null, null, NOW).reasons.join(' ').includes('nothing behind'), true);
+check('PreStocks is issuer-claimed, never synthetic (holdings are unverifiable, not disproven)',
+  verdictFor({ mint: 'P1', symbol: 'OPENAI', name: 'OpenAI', issuer: 'prestocks', backing: 'issuer-claimed' }, null, null, NOW).verdict, 'issuer-claimed');
+check('PreStocks verdict quotes the terms beside the homepage claim',
+  verdictFor({ mint: 'P1', symbol: 'OPENAI', name: 'OpenAI', issuer: 'prestocks', backing: 'issuer-claimed' }, null, null, NOW)
+    .reasons.some((r) => r.includes('no legal, equitable or contractual right') && r.includes('backed 1:1')), true);
+check('PreStocks verdict never asserts nothing is held',
+  !verdictFor({ mint: 'P1', symbol: 'OPENAI', name: 'OpenAI', issuer: 'prestocks', backing: 'issuer-claimed' }, null, null, NOW).reasons.join(' ').match(/nothing (is )?(held|behind)/), true);
 
 // Impersonators — the real ones found on 2026-09-13
 const bySymbol = new Map([['tslax', [tslax]], ['nvdax', [{ ...tslax, mint: 'Xsc9qvGR', symbol: 'NVDAx', name: 'NVIDIA xStock' }]]]);
