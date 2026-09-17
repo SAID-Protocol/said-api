@@ -241,7 +241,7 @@ async function loadPreStocks(): Promise<CanonicalAsset[]> {
   const list = Array.isArray(body) ? body : (body.data ?? []);
   return list
     .filter((t: any) => t.contract_address)
-    .map((t: any) => ({ mint: t.contract_address, symbol: t.symbol, name: t.name ?? t.symbol, issuer: 'prestocks', backing: 'synthetic' as Backing }));
+    .map((t: any) => ({ mint: t.contract_address, symbol: t.symbol, name: t.name ?? t.symbol, issuer: 'prestocks', backing: ISSUERS.prestocks.backing }));
 }
 
 /**
