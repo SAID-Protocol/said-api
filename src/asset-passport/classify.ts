@@ -97,8 +97,11 @@ export function verdictFor(
   reasons.push(`published by ${profile?.name ?? canonical.issuer} on its own canonical list`);
 
   if (canonical.backing === 'synthetic') {
+    // Synthetic means the holder has no enforceable claim on the underlying.
+    // It does NOT mean nothing is held — that is unknowable from outside, and
+    // the page must never say it. Say exactly what the terms establish.
+    reasons.push('The holder has no enforceable claim on any underlying share. The issuer may hold something, but nothing in its terms gives a token holder a right to it or to redeem.');
     if (profile?.caveat) reasons.push(profile.caveat);
-    else reasons.push('exposure only; no underlying share is held for the holder');
     return { verdict: 'synthetic', reasons };
   }
 

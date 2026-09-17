@@ -43,6 +43,9 @@ check('PreStocks is synthetic',
 check('PreStocks verdict quotes the terms, not the marketing',
   verdictFor({ mint: 'P1', symbol: 'OPENAI', name: 'OpenAI', issuer: 'prestocks', backing: 'synthetic' }, null, null, NOW)
     .reasons.some((r) => r.includes('no legal, equitable or contractual right')), true);
+check('synthetic never claims nothing is held — only that there is no enforceable claim',
+  verdictFor({ mint: 'P1', symbol: 'OPENAI', name: 'OpenAI', issuer: 'prestocks', backing: 'synthetic' }, null, null, NOW)
+    .reasons.some((r) => r.includes('no enforceable claim')) && !verdictFor({ mint: 'P1', symbol: 'OPENAI', name: 'OpenAI', issuer: 'prestocks', backing: 'synthetic' }, null, null, NOW).reasons.join(' ').includes('nothing behind'), true);
 
 // Impersonators — the real ones found on 2026-09-13
 const bySymbol = new Map([['tslax', [tslax]], ['nvdax', [{ ...tslax, mint: 'Xsc9qvGR', symbol: 'NVDAx', name: 'NVIDIA xStock' }]]]);

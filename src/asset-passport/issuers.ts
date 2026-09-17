@@ -85,10 +85,10 @@ export const ISSUERS: Record<string, IssuerProfile> = {
     backing: 'synthetic',
     updateAuthority: 'WV9PJN7XTmTLVwbutCLFxp8TyePee6Xq5mRq6Fti5Wc',
     jupTag: 'prestocks',
-    legal: 'No legal entity is named anywhere. Governing law British Virgin Islands, which is itself a prohibited jurisdiction for holders.',
-    redeemable: 'No. Their terms: a request for redemption does not of itself create an entitlement.',
+    legal: 'Pre-IPO exposure tokens. The terms of service (8 September 2026) name no issuing entity; governing law is the British Virgin Islands.',
+    redeemable: 'No right to redeem. Their terms: a request for redemption does not of itself create an entitlement to have tokens redeemed.',
     sourceUrl: 'https://prestocks.com/api/prestocks',
-    caveat: 'Their API advertises "backed 1:1 by SPV exposure". Their terms of service say the exposure may be any derivative or synthetic arrangement referencing a proxy for the company, create no trust or custody relationship, and grant holders no legal, equitable or contractual right to any underlying share or asset.',
+    caveat: 'The homepage and each token description say "backed 1:1 by SPV exposure to the underlying company shares". The terms of service say the exposure may take any form including a derivative or synthetic arrangement referencing the company or a proxy for it, that it creates no trust, custody or segregated claim, and that holders have no legal, equitable or contractual right to any underlying share or asset. Quoted verbatim; read both before buying.',
   },
   tessera: {
     key: 'tessera',
