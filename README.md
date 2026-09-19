@@ -64,6 +64,7 @@ Base URL: `https://api.saidprotocol.com` · Reads are open; writes that touch ch
 | `GET` | `/api/identity/:id` | Slim identity read (resolves id / wallet / PDA) |
 | `GET` | `/api/agent/resolve/:handle` | Resolve a handle to an agent |
 | `GET` | `/api/agent/:wallet/wallets` | Linked wallets for an agent |
+| `PATCH` | `/api/agents/:wallet` | Update an agent's metadata (name, description, links, image, skills, endpoints). Signed by the agent or owner wallet, or by the registering platform's key. `POST /api/agents/:wallet/metadata/message` returns the message to sign |
 
 #### Directory
 | Method | Endpoint | Description |

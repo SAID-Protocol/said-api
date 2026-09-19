@@ -43,6 +43,7 @@ import { fetchFairScaleScore } from './score-engine.js';
 import { computeTrustScore } from './scoring/trust-score.js';
 import { createEnforcementRouter } from './enforcement.js';
 import { createTrustCrisisRouter } from './trust-crisis.js';
+import { createAgentMetadataRouter } from './agent-metadata.js';
 import { createAssetPassportRouter } from './asset-passport/router.js';
 import { getRegistry as warmAssetRegistry } from './asset-passport/issuers.js';
 
@@ -9195,6 +9196,9 @@ console.log('✅ Cross-Chain Communication endpoints mounted');
 app.route('/api/score', createScoreRoutes(prisma, connection));
 initScoreWorker(prisma, connection);
 console.log('✅ Trust Score engine mounted (GET /api/score/:wallet)');
+
+// Agent metadata self-service (PATCH /api/agents/:wallet, signature or platform-key auth)
+app.route('/', createAgentMetadataRouter(prisma));
 
 // Mount Enforcement endpoints (staking/slashing — SAID's unique differentiator)
 app.route('/api/enforcement', createEnforcementRouter(connection));
