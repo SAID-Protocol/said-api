@@ -3500,7 +3500,7 @@ app.post('/api/platforms/said-hosting/register', async (c) => {
 
   // platform — optional partner tag (e.g. 'fairscale', 'seekerclaw')
   // Falls back to 'said-hosting' if not provided
-  const VALID_PLATFORMS = ['said-hosting', 'fairscale', 'seekerclaw', 'spawnr'];
+  const VALID_PLATFORMS = ['said-hosting', 'atcha', 'fairscale', 'seekerclaw', 'spawnr'];
   const registrationSource = platform && VALID_PLATFORMS.includes(platform) ? platform : 'said-hosting';
 
   // Validate required fields
@@ -3727,7 +3727,7 @@ app.post('/api/platforms/said-hosting/confirm', async (c) => {
   const body = await c.req.json();
   const { signedTransaction, wallet, name, description, twitter, website, capabilities, platform } = body;
 
-  const VALID_PLATFORMS = ['said-hosting', 'fairscale', 'seekerclaw', 'spawnr'];
+  const VALID_PLATFORMS = ['said-hosting', 'atcha', 'fairscale', 'seekerclaw', 'spawnr'];
   const registrationSource = platform && VALID_PLATFORMS.includes(platform) ? platform : 'said-hosting';
 
   if (!signedTransaction || !wallet) {
