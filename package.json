@@ -6,7 +6,8 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "npx prisma generate && tsc",
+    "build": "npx prisma generate && tsc && node scripts/build-worker.mjs",
+    "build:worker": "node scripts/build-worker.mjs",
     "start": "npx prisma db push --accept-data-loss && node dist/index.js",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
@@ -50,6 +51,7 @@
   "devDependencies": {
     "@types/node": "^22.15.3",
     "@types/ws": "^8.18.1",
+    "esbuild": "^0.27.3",
     "tsx": "^4.19.4",
     "typescript": "^5.8.2"
   },

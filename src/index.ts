@@ -47,6 +47,7 @@ import { createAgentMetadataRouter } from './agent-metadata.js';
 import { createAssetPassportRouter } from './asset-passport/router.js';
 import { getRegistry as warmAssetRegistry } from './asset-passport/issuers.js';
 import { createWorkRouter } from './work/router.js';
+import { loadSkill, loadWorkerBundle } from './work/distribution.js';
 
 /**
  * Compute reputationScore from raw feedback rows using a Bayesian
@@ -161,7 +162,7 @@ const RATE_WINDOW = 60_000; // 1 minute
 
 // Static, cacheable pages are never rate limited: a shared office or carrier
 // IP must not lose the checker page itself because of other traffic.
-const RATE_LIMIT_EXEMPT = new Set(['/check', '/check-card.png', '/work', '/favicon.ico', '/health']);
+const RATE_LIMIT_EXEMPT = new Set(['/check', '/check-card.png', '/work', '/work/skill.md', '/work/said-worker.cjs', '/favicon.ico', '/health']);
 // The public asset passport is cached and cheap, and a shared link fans out
 // from a single IP (link-preview fetchers, NAT), so it has its own budget.
 const ASSET_RATE_LIMIT = 300;
@@ -9256,6 +9257,24 @@ app.get('/work', async (c) => {
   } catch {
     return c.text('', 404);
   }
+});
+
+// What an agent needs to join the work loop: the skill it reads and the
+// one-file worker it runs. Agents never use the page above.
+app.get('/work/skill.md', async (c) => {
+  const skill = await loadSkill();
+  if (!skill) return c.text('', 404);
+  c.header('Content-Type', 'text/markdown; charset=utf-8');
+  c.header('Cache-Control', 'public, max-age=300');
+  return c.body(skill);
+});
+app.get('/work/said-worker.cjs', async (c) => {
+  const worker = await loadWorkerBundle();
+  if (!worker) return c.text('', 404);
+  c.header('Content-Type', 'application/javascript; charset=utf-8');
+  c.header('Cache-Control', 'public, max-age=300');
+  c.header('X-Content-SHA256', worker.sha256);
+  return c.body(new Uint8Array(worker.body));
 });
 
 // Mount Trust Crisis endpoint (ERC-8004 comparison + economic trust verdict)

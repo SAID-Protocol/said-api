@@ -942,7 +942,8 @@ model WorkJob {
   spec          Json // pinned inputs; identical for every panel member
   panelSize     Int
 
-  // open → accepted | disagreed | overturned (accepted, then contradicted by our check)
+  // open → accepted | disagreed | expired (panel never filled)
+  // accepted → overturned (contradicted by our check)
   status     String  @default("open")
   resultHash String?
   result     Json?

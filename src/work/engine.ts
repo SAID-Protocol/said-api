@@ -7,6 +7,7 @@
  *     checked and to each other
  *   - a job is accepted only when every panel answer hashes the same;
  *     otherwise nothing is recorded for it
+ *   - a job whose panel never fills expires
  *   - we re-run every disagreed job and a random sample of accepted ones
  *     ourselves, and mark each answer correct or wrong against that
  *   - reputation is written once per worker per day, never per job, so a
@@ -44,6 +45,7 @@ export interface WorkConfig {
   windowDays: number;
   maxSignatures: number;
   jobBatch: number;
+  jobTtlHours: number;
   recheckHours: number;
   spotCheckRate: number;
   /** Null disables reputation writes entirely. Set from env so the value stays out of the repo. */
@@ -66,6 +68,7 @@ export function loadWorkConfig(env: NodeJS.ProcessEnv): WorkConfig {
     windowDays: num(env.WORK_WINDOW_DAYS, 30, 1, 365),
     maxSignatures: num(env.WORK_MAX_SIGNATURES, 1000, 1, 10000),
     jobBatch: num(env.WORK_JOB_BATCH, 50, 1, 1000),
+    jobTtlHours: num(env.WORK_JOB_TTL_HOURS, 6, 0.1, 24 * 30),
     recheckHours: num(env.WORK_RECHECK_HOURS, 24, 0, 24 * 90),
     spotCheckRate: num(env.WORK_SPOT_CHECK_RATE, 0.05, 0, 1),
     evidenceWeight: env.WORK_EVIDENCE_WEIGHT && Number.isFinite(weight) && weight > 0 && weight <= 3 ? weight : null,
@@ -179,15 +182,29 @@ export async function relatedWallets(prisma: PrismaClient, wallet: string): Prom
 
 // ─── Jobs ───────────────────────────────────────────────────────────────────
 
-/** Cut a batch of jobs for the verified wallets checked longest ago, when the board runs low. */
-export async function ensureOpenJobs(prisma: PrismaClient, cfg: WorkConfig, now: Date = new Date()): Promise<number> {
+// Open jobs are bounded so a board nobody can clear does not grow forever.
+const MAX_OPEN_BATCHES = 20;
+
+/**
+ * Cut a batch of jobs for the verified wallets checked longest ago. Runs when
+ * the board is low, or with `force` when a worker found nothing it may take:
+ * the open jobs can all be ones the workers online are barred from (their own
+ * wallets, panels they already sit on), and those must not stall the board.
+ */
+export async function ensureOpenJobs(
+  prisma: PrismaClient,
+  cfg: WorkConfig,
+  now: Date = new Date(),
+  force = false,
+): Promise<number> {
+  const lowWater = force ? cfg.jobBatch * MAX_OPEN_BATCHES : Math.ceil(cfg.jobBatch / 2);
   const open = await prisma.workJob.count({ where: { status: 'open' } });
-  if (open >= Math.ceil(cfg.jobBatch / 2)) return 0;
+  if (open >= lowWater) return 0;
 
   return prisma.$transaction(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(${LOCK_JOBS})`;
     const stillOpen = await tx.workJob.count({ where: { status: 'open' } });
-    if (stillOpen >= Math.ceil(cfg.jobBatch / 2)) return 0;
+    if (stillOpen >= lowWater) return 0;
 
     const recheckBefore = new Date(now.getTime() - cfg.recheckHours * 3600 * 1000);
     const due = await tx.$queryRaw<{ wallet: string }[]>`
@@ -198,6 +215,9 @@ export async function ensureOpenJobs(prisma: PrismaClient, cfg: WorkConfig, now:
       ) j ON j."subjectWallet" = a.wallet
       WHERE a."isVerified" = true
         AND (j.last IS NULL OR j.last < ${recheckBefore})
+        AND NOT EXISTS (
+          SELECT 1 FROM "WorkJob" o WHERE o."subjectWallet" = a.wallet AND o.status = 'open'
+        )
       ORDER BY j.last ASC NULLS FIRST, a."registeredAt" ASC
       LIMIT ${cfg.jobBatch}
     `;
@@ -241,6 +261,11 @@ export async function claimJob(prisma: PrismaClient, cfg: WorkConfig, body: JobC
     where: { status: 'leased', leaseExpiresAt: { lt: now } },
     data: { status: 'expired' },
   });
+  // A job whose panel never filled is dropped; its wallet gets a fresh one.
+  await prisma.workJob.updateMany({
+    where: { status: 'open', createdAt: { lt: new Date(now.getTime() - cfg.jobTtlHours * 3600 * 1000) } },
+    data: { status: 'expired', settledAt: now },
+  });
 
   const live = await prisma.workAssignment.count({ where: { workerWallet: slot.wallet, status: 'leased' } });
   if (live >= cfg.maxLeasesPerWorker) {
@@ -251,7 +276,7 @@ export async function claimJob(prisma: PrismaClient, cfg: WorkConfig, body: JobC
   const related = await relatedWallets(prisma, slot.wallet);
   const leaseExpiresAt = new Date(now.getTime() + cfg.leaseSeconds * 1000);
 
-  const assignment = await prisma.$transaction(async (tx) => {
+  const pickJob = () => prisma.$transaction(async (tx) => {
     // Lock one eligible job so two workers cannot take the same last seat.
     // Part-filled panels go first so jobs settle instead of piling up open;
     // among equals the pick is random, so a worker cannot choose its job.
@@ -288,6 +313,8 @@ export async function claimJob(prisma: PrismaClient, cfg: WorkConfig, body: JobC
     });
   });
 
+  let assignment = await pickJob();
+  if (!assignment && (await ensureOpenJobs(prisma, cfg, now, true)) > 0) assignment = await pickJob();
   if (!assignment) return { assignment: null, retryAfterSeconds: 30 };
   return {
     assignment: {

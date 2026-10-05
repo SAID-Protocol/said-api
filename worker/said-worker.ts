@@ -6,19 +6,24 @@
  * code the server checks against (src/work/wallet-history.ts), and submits
  * the answer.
  *
- *   npx tsx worker/said-worker.ts init --wallet-keypair <path>
- *       Create a worker key and bind it to your verified agent's slot. The
- *       wallet keypair signs one message locally and is never stored or sent.
+ * Shipped to agents as one bundled file (scripts/build-worker.mjs), served by
+ * the API at /work/said-worker.cjs. From this repo, run it with
+ * `npx tsx worker/said-worker.ts <command>`.
  *
- *   npx tsx worker/said-worker.ts init --wallet <address>
- *       Same, without a keypair file: prints the message to sign in your
- *       wallet, then finish with
+ *   init --wallet-secret-env <VAR>   wallet secret key read from an env var
+ *   init --wallet-keypair <path>     wallet secret key read from a keypair file
+ *       Create a worker key and bind it to your verified agent's slot. The
+ *       wallet key signs one message locally and is never stored or sent.
+ *
+ *   init --wallet <address>
+ *       For wallets this machine cannot sign with: prints the message to
+ *       sign elsewhere, then finish with
  *       `init --wallet <address> --timestamp <ms> --signature <base58>`.
  *
- *   npx tsx worker/said-worker.ts run
- *       Work until stopped.
- *
- *   npx tsx worker/said-worker.ts status
+ *   start    run in the background (log and pid file in the worker home)
+ *   stop     stop the background worker
+ *   run      run in the foreground until stopped (`--once` for a single job)
+ *   status   slot, record, and whether the worker is running
  *
  * Env:
  *   SAID_API_URL     default https://api.saidprotocol.com
@@ -26,17 +31,24 @@
  *   SAID_WORKER_HOME where the worker key lives. Default ~/.said-worker
  */
 
-import { mkdir, readFile, writeFile, chmod } from 'fs/promises';
+import { spawn } from 'child_process';
+import { openSync } from 'fs';
+import { chmod, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { Connection, Keypair } from '@solana/web3.js';
+import bs58 from 'bs58';
 import { jobClaimMessage, signMessage, slotClaimMessage, submitMessage } from '../src/work/auth.js';
 import { WALLET_HISTORY_KIND, hashResult, isValidSpec, runWalletHistory } from '../src/work/wallet-history.js';
 
+const VERSION = '0.1.0';
 const API = (process.env.SAID_API_URL || 'https://api.saidprotocol.com').replace(/\/+$/, '');
 const RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
 const HOME = process.env.SAID_WORKER_HOME || join(homedir(), '.said-worker');
 const KEY_FILE = join(HOME, 'worker-key.json');
+const CONFIG_FILE = join(HOME, 'config.json');
+const PID_FILE = join(HOME, 'worker.pid');
+const LOG_FILE = join(HOME, 'worker.log');
 
 const IDLE_MS = 30_000;
 const BETWEEN_JOBS_MS = 1_000;
@@ -60,9 +72,21 @@ async function post(path: string, body: unknown): Promise<{ status: number; body
   return { status: res.status, body: await res.json().catch(() => ({})) };
 }
 
+async function getJson(path: string): Promise<{ status: number; body: any }> {
+  const res = await fetch(`${API}${path}`, { signal: AbortSignal.timeout(30_000) });
+  return { status: res.status, body: await res.json().catch(() => ({})) };
+}
+
+/** A Solana secret key as either a JSON byte array (solana-keygen) or base58. */
+function parseSecret(raw: string): Keypair {
+  const text = raw.trim();
+  const bytes = text.startsWith('[') ? Uint8Array.from(JSON.parse(text)) : bs58.decode(text);
+  return Keypair.fromSecretKey(bytes);
+}
+
 async function loadWorkerKey(): Promise<Keypair | null> {
   try {
-    return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(await readFile(KEY_FILE, 'utf8'))));
+    return parseSecret(await readFile(KEY_FILE, 'utf8'));
   } catch {
     return null;
   }
@@ -79,22 +103,47 @@ async function loadOrCreateWorkerKey(): Promise<Keypair> {
   return kp;
 }
 
+async function loadConfig(): Promise<{ wallet?: string }> {
+  try {
+    return JSON.parse(await readFile(CONFIG_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+/** The pid of a live background or foreground worker for this home, if any. */
+async function runningPid(): Promise<number | null> {
+  try {
+    const pid = Number(await readFile(PID_FILE, 'utf8'));
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    process.kill(pid, 0); // throws when no such process
+    return pid;
+  } catch {
+    return null;
+  }
+}
+
 async function init(): Promise<void> {
   const worker = await loadOrCreateWorkerKey();
   const workerKey = worker.publicKey.toBase58();
   const keypairPath = arg('wallet-keypair');
+  const secretEnv = arg('wallet-secret-env');
 
   let wallet: string;
   let timestamp: number;
   let signature: string;
-  if (keypairPath) {
-    const agent = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(await readFile(keypairPath, 'utf8'))));
+  if (keypairPath || secretEnv) {
+    let raw: string | undefined;
+    if (secretEnv) raw = process.env[secretEnv];
+    else raw = await readFile(keypairPath as string, 'utf8');
+    if (!raw) throw new Error(`env var ${secretEnv} is empty`);
+    const agent = parseSecret(raw);
     wallet = agent.publicKey.toBase58();
     timestamp = Date.now();
     signature = signMessage(slotClaimMessage(wallet, workerKey, timestamp), agent.secretKey);
   } else {
     const given = arg('wallet');
-    if (!given) throw new Error('init needs --wallet-keypair <path> or --wallet <address>');
+    if (!given) throw new Error('init needs --wallet-secret-env <VAR>, --wallet-keypair <path> or --wallet <address>');
     wallet = given;
     const sig = arg('signature');
     const ts = Number(arg('timestamp'));
@@ -103,7 +152,7 @@ async function init(): Promise<void> {
       console.log('\nSign this exact message with your agent wallet (valid for 5 minutes):\n');
       console.log(`  ${slotClaimMessage(wallet, workerKey, now)}\n`);
       console.log('Then run:\n');
-      console.log(`  npx tsx worker/said-worker.ts init --wallet ${wallet} --timestamp ${now} --signature <base58 signature>\n`);
+      console.log(`  init --wallet ${wallet} --timestamp ${now} --signature <base58 signature>\n`);
       return;
     }
     timestamp = ts;
@@ -112,16 +161,55 @@ async function init(): Promise<void> {
 
   const res = await post('/api/work/slots/claim', { wallet, workerKey, timestamp, signature });
   if (res.status !== 200 && res.status !== 201) throw new Error(`slot claim refused (${res.status}): ${res.body.error ?? 'unknown error'}`);
+  await writeFile(CONFIG_FILE, JSON.stringify({ wallet }, null, 2));
   log(`${res.body.created ? 'slot claimed' : 'slot re-bound'} for ${wallet}; worker key ${workerKey}`);
 }
 
 async function status(): Promise<void> {
   const worker = await loadWorkerKey();
+  const { wallet } = await loadConfig();
+  const pid = await runningPid();
+  console.log(`version:    ${VERSION}`);
   console.log(`api:        ${API}`);
-  console.log(`rpc:        ${RPC.replace(/([?&/])[A-Za-z0-9_-]{20,}/g, '$1…')}`);
+  console.log(`rpc:        ${new URL(RPC).host}`);
   console.log(`worker key: ${worker ? worker.publicKey.toBase58() : `none (run init) — looked in ${KEY_FILE}`}`);
-  const stats = await fetch(`${API}/api/work/stats`).then((r) => r.json());
-  console.log(`slots:      ${stats.slots.claimed}/${stats.slots.cap}, ${stats.workersOnline} online, ${stats.jobs.open} jobs open`);
+  console.log(`wallet:     ${wallet ?? 'none (run init)'}`);
+  console.log(`running:    ${pid ? `yes (pid ${pid})` : 'no'}`);
+  if (wallet) {
+    const slot = await getJson(`/api/work/slots/${wallet}`);
+    if (slot.status === 200) {
+      console.log(`record:     ${slot.body.accepted} accepted, ${slot.body.disagreed} disagreed, ${slot.body.wrong} wrong`);
+      if (slot.body.workerKey !== worker?.publicKey.toBase58()) console.log('warning:    the slot is bound to a different worker key; run init again');
+    } else {
+      console.log('record:     no slot for this wallet');
+    }
+  }
+  const stats = (await getJson('/api/work/stats')).body;
+  console.log(`network:    ${stats.slots.claimed}/${stats.slots.cap} slots, ${stats.workersOnline} online, ${stats.jobs.open} jobs open`);
+}
+
+async function start(): Promise<void> {
+  if (!(await loadWorkerKey())) throw new Error(`no worker key at ${KEY_FILE}; run init first`);
+  const already = await runningPid();
+  if (already) return log(`already running (pid ${already})`);
+  await mkdir(HOME, { recursive: true });
+  const out = openSync(LOG_FILE, 'a');
+  // Same interpreter and flags as this process, so it works both as the
+  // bundled file under node and as TypeScript under tsx.
+  const child = spawn(process.execPath, [...process.execArgv, process.argv[1], 'run'], {
+    detached: true,
+    stdio: ['ignore', out, out],
+    env: process.env,
+  });
+  child.unref();
+  log(`started in the background (pid ${child.pid}); log at ${LOG_FILE}`);
+}
+
+async function stop(): Promise<void> {
+  const pid = await runningPid();
+  if (!pid) return log('not running');
+  process.kill(pid, 'SIGTERM');
+  log(`stopped (pid ${pid})`);
 }
 
 async function run(): Promise<void> {
@@ -130,7 +218,18 @@ async function run(): Promise<void> {
   const workerKey = worker.publicKey.toBase58();
   const conn = new Connection(RPC, 'finalized');
   const once = process.argv.includes('--once');
-  log(`worker ${workerKey} starting against ${API}`);
+
+  if (!once) {
+    const other = await runningPid();
+    if (other && other !== process.pid) throw new Error(`a worker is already running for this home (pid ${other})`);
+    await writeFile(PID_FILE, String(process.pid));
+    const cleanup = () => {
+      rm(PID_FILE, { force: true }).finally(() => process.exit(0));
+    };
+    process.on('SIGTERM', cleanup);
+    process.on('SIGINT', cleanup);
+  }
+  log(`worker ${workerKey} v${VERSION} starting against ${API}`);
 
   for (;;) {
     try {
@@ -155,9 +254,9 @@ async function run(): Promise<void> {
       }
       if (a.kind !== WALLET_HISTORY_KIND || !isValidSpec(a.spec)) {
         // A job kind this build does not know: let the lease expire.
-        log(`skipping job ${a.jobId}: unknown kind ${a.kind}`);
+        log(`skipping job ${a.jobId}: unknown kind ${a.kind}; this worker may be out of date`);
         if (once) return;
-        await sleep(BETWEEN_JOBS_MS);
+        await sleep(IDLE_MS);
         continue;
       }
 
@@ -176,7 +275,10 @@ async function run(): Promise<void> {
       await sleep(BETWEEN_JOBS_MS);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.startsWith('not allowed to work')) throw err;
+      if (msg.startsWith('not allowed to work')) {
+        await rm(PID_FILE, { force: true });
+        throw err;
+      }
       log(`error: ${msg}`);
       if (once) return;
       await sleep(ERROR_BACKOFF_MS);
@@ -185,9 +287,9 @@ async function run(): Promise<void> {
 }
 
 const command = process.argv[2];
-const commands: Record<string, () => Promise<void>> = { init, run, status };
+const commands: Record<string, () => Promise<void>> = { init, start, stop, run, status };
 if (!command || !commands[command]) {
-  console.error('usage: said-worker <init|run|status>   (see the header of this file)');
+  console.error(`said-worker ${VERSION}\nusage: said-worker <init|start|stop|run|status>\n  init --wallet-secret-env <VAR> | --wallet-keypair <path> | --wallet <address>`);
   process.exit(2);
 }
 commands[command]().catch((err) => {

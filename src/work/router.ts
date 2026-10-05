@@ -5,7 +5,7 @@
  *   GET  /api/work/feed?limit=50          recently settled jobs, newest first
  *   GET  /api/work/workers?limit=100      slot holders by accepted work
  *   GET  /api/work/slots/:wallet          one agent's slot
- *   GET  /api/work/protocol               message formats and limits for worker authors
+ *   GET  /api/work/protocol               message formats, limits and download links for worker authors
  *   POST /api/work/slots/claim            agent wallet binds a worker key to a slot
  *   POST /api/work/jobs/claim             worker takes one job on a lease
  *   POST /api/work/assignments/:id/submit worker returns its answer
@@ -32,6 +32,7 @@ import {
   type ReferenceRunner,
 } from './engine.js';
 import { SIGNATURE_WINDOW_MS } from './auth.js';
+import { PUBLIC_API_URL, loadSkill, loadWorkerBundle } from './distribution.js';
 import { WALLET_HISTORY_KIND, runWalletHistory } from './wallet-history.js';
 
 const EVIDENCE_INTERVAL_MS = 60 * 60 * 1000;
@@ -73,8 +74,11 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
     return slot ? c.json(slot) : c.json({ error: 'No slot for this wallet' }, 404);
   });
 
-  router.get('/protocol', (c) =>
-    c.json({
+  router.get('/protocol', async (c) => {
+    const worker = await loadWorkerBundle();
+    return c.json({
+      skill: `${PUBLIC_API_URL}/work/skill.md`,
+      worker: worker ? { url: `${PUBLIC_API_URL}/work/said-worker.cjs`, sha256: worker.sha256 } : null,
       jobKinds: [WALLET_HISTORY_KIND],
       panelSize: cfg.panelSize,
       leaseSeconds: cfg.leaseSeconds,
@@ -86,8 +90,8 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
         submit: 'SAID:work:submit:<assignmentId>:<resultHash>:<timestamp>  (signed by the worker key)',
       },
       notes: 'Signatures are base58 Ed25519. Timestamps are unix milliseconds. Reference worker: worker/said-worker.ts.',
-    }),
-  );
+    });
+  });
 
   router.post('/slots/claim', async (c) => {
     try {
