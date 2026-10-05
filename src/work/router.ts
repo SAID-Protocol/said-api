@@ -15,6 +15,7 @@
  *   GET  /api/work/updates?limit=10       operator announcements, newest first
  *   GET  /api/work/records/:day           one UTC day's accepted work and its Merkle root
  *   GET  /api/work/jobs/:id/proof         proof that an accepted job is in its day's record
+ *   GET  /api/work/admin/clusters         slots that share a funder or an address (x-admin-secret)
  *   POST /api/work/admin/updates          post an announcement (x-admin-secret)
  *   POST /api/work/admin/records/:day/anchor  attach the on-chain transaction carrying a day's root
  *   POST /api/work/admin/epochs           record a reward period (x-admin-secret)
@@ -25,6 +26,7 @@
  * secret and answer 404 without it.
  */
 
+import { createHash } from 'crypto';
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { PrismaClient } from '@prisma/client';
@@ -36,6 +38,7 @@ import {
   getFeed,
   BREAKER_COOLDOWN_MS,
   BREAKER_FAILURES,
+  getClusters,
   getSlot,
   getStanding,
   getStats,
@@ -45,6 +48,7 @@ import {
   submitResult,
   type SettleHooks,
 } from './engine.js';
+import { refreshFunder } from './funder.js';
 import { JOB_KINDS, jobKind } from './kinds.js';
 import { WRONG_PENALTY, createEpoch, getPayouts, recordLockTx } from './payouts.js';
 import { freezeYesterday, getDayRecord, getJobProof, getUpdates, postUpdate, recordAnchorTx } from './records.js';
@@ -67,6 +71,19 @@ async function readJson(c: Context): Promise<Record<string, unknown>> {
   } catch {
     return {};
   }
+}
+
+/**
+ * A salted hash of the caller's network address, or null when it cannot be
+ * read. Takes the address the nearest proxy recorded (the last entry), since
+ * anything earlier in the header is supplied by the caller.
+ */
+function addressHash(c: Context): string | null {
+  const forwarded = c.req.header('x-forwarded-for')?.split(',').map((p) => p.trim()).filter(Boolean);
+  const ip = c.req.header('x-real-ip') || (forwarded && forwarded[forwarded.length - 1]);
+  if (!ip) return null;
+  const salt = process.env.WORK_IP_SALT || process.env.ADMIN_SECRET || 'said-work';
+  return createHash('sha256').update(`${salt}:${ip}`).digest('hex');
 }
 
 function fail(c: Context, err: unknown) {
@@ -175,7 +192,9 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
 
   router.post('/slots/claim', async (c) => {
     try {
-      const { slot, created } = await claimSlot(prisma, cfg, await readJson(c));
+      const { slot, created } = await claimSlot(prisma, cfg, await readJson(c), addressHash(c));
+      // Not awaited: the lookup walks the wallet's history on our RPC.
+      void refreshFunder(prisma, connection, slot.wallet);
       return c.json({ wallet: slot.wallet, workerKey: slot.workerKey, claimedAt: slot.claimedAt.toISOString(), created }, created ? 201 : 200);
     } catch (err) {
       return fail(c, err);
@@ -184,7 +203,13 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
 
   router.post('/jobs/claim', async (c) => {
     try {
-      return c.json(await claimJob(prisma, cfg, await readJson(c)));
+      const body = await readJson(c);
+      const out = await claimJob(prisma, cfg, body, new Date(), addressHash(c));
+      if (typeof body.workerKey === 'string') {
+        const slot = await prisma.workSlot.findUnique({ where: { workerKey: body.workerKey }, select: { wallet: true } });
+        if (slot) void refreshFunder(prisma, connection, slot.wallet);
+      }
+      return c.json(out);
     } catch (err) {
       return fail(c, err);
     }
@@ -245,6 +270,11 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
     } catch (err) {
       return fail(c, err);
     }
+  });
+
+  router.get('/admin/clusters', async (c) => {
+    if (!isAdmin(c)) return c.json({ error: 'Not found' }, 404);
+    return c.json(await getClusters(prisma, cfg));
   });
 
   router.post('/admin/updates', async (c) => {

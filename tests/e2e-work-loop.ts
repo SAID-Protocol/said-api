@@ -4,7 +4,7 @@
  * real HTTP routes with real signatures and real mainnet wallet history.
  *
  * Boot the server with:
- *   WORK_OPEN=true ADMIN_SECRET=vk WORK_SLOT_CAP=5 WORK_JOB_BATCH=3 WORK_SPOT_CHECK_RATE=1 WORK_RECHECK_HOURS=0
+ *   WORK_OPEN=true ADMIN_SECRET=vk WORK_SLOT_CAP=7 WORK_JOB_BATCH=3 WORK_SPOT_CHECK_RATE=1 WORK_RECHECK_HOURS=0
  *   WORK_JOB_KIND=wallet_activity_v1 WORK_APPLY_ACTIVITY=true   (optional: the fuller job)
  *
  * Run:
@@ -41,8 +41,12 @@ function check(name: string, got: unknown, want: unknown) {
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function post(path: string, body: unknown) {
-  const res = await fetch(`${API}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+async function post(path: string, body: unknown, ip?: string) {
+  const res = await fetch(`${API}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(ip ? { 'x-real-ip': ip } : {}) },
+    body: JSON.stringify(body),
+  });
   return { status: res.status, body: (await res.json().catch(() => ({}))) as any };
 }
 async function get(path: string) {
@@ -54,8 +58,10 @@ interface TestAgent {
   name: string;
   agent: Keypair;
   worker: Keypair;
+  ip: string; // the network address this worker appears to come from
 }
-const mk = (name: string): TestAgent => ({ name, agent: Keypair.generate(), worker: Keypair.generate() });
+let nextIp = 10;
+const mk = (name: string, ip = `203.0.113.${nextIp++}`): TestAgent => ({ name, agent: Keypair.generate(), worker: Keypair.generate(), ip });
 
 async function seedAgent(wallet: string, name: string, isVerified: boolean, owner = wallet) {
   await prisma.agent.upsert({
@@ -83,7 +89,7 @@ function claimSlotBody(a: TestAgent, opts: { timestamp?: number; signer?: Keypai
 async function claimJob(a: TestAgent) {
   const workerKey = a.worker.publicKey.toBase58();
   const timestamp = Date.now();
-  return post('/api/work/jobs/claim', { workerKey, timestamp, signature: signMessage(jobClaimMessage(workerKey, timestamp), a.worker.secretKey) });
+  return post('/api/work/jobs/claim', { workerKey, timestamp, signature: signMessage(jobClaimMessage(workerKey, timestamp), a.worker.secretKey) }, a.ip);
 }
 
 let KIND = 'wallet_history_v1';
@@ -132,14 +138,17 @@ async function main() {
   const w2 = mk('e2e-w2');
   const w3 = mk('e2e-w3');
   const w4 = mk('e2e-w4-same-owner-as-w1');
-  const w5 = mk('e2e-w5');
+  const w5 = mk('e2e-w5-same-address-as-w2', w2.ip);
+  const x1 = mk('e2e-third-under-w1-owner');
+  const x2 = mk('e2e-fourth-under-w1-owner');
+  const filler = mk('e2e-filler');
   const over = mk('e2e-over-cap');
   const unverified = mk('e2e-unverified');
   const stranger = mk('e2e-unregistered');
 
   await seedAgent(SYSTEM_WALLET, 'SAID system', true);
-  for (const w of [w1, w2, w3, w5, over]) await seedAgent(w.agent.publicKey.toBase58(), w.name, true);
-  await seedAgent(w4.agent.publicKey.toBase58(), w4.name, true, w1.agent.publicKey.toBase58());
+  for (const w of [w1, w2, w3, w5, filler, over]) await seedAgent(w.agent.publicKey.toBase58(), w.name, true);
+  for (const w of [w4, x1, x2]) await seedAgent(w.agent.publicKey.toBase58(), w.name, true, w1.agent.publicKey.toBase58());
   await seedAgent(unverified.agent.publicKey.toBase58(), unverified.name, false);
 
   KIND = (await get('/api/work/protocol')).body.currentJobKind;
@@ -154,6 +163,10 @@ async function main() {
   check('a verified agent claims a slot', (await post('/api/work/slots/claim', claimSlotBody(w1))).status, 201);
   check('claiming again re-binds, not duplicates', (await post('/api/work/slots/claim', claimSlotBody(w1))).status, 200);
   for (const w of [w2, w3, w4, w5]) check(`${w.name} claims a slot`, (await post('/api/work/slots/claim', claimSlotBody(w))).status, 201);
+  check('a third slot under one owner is allowed', (await post('/api/work/slots/claim', claimSlotBody(x1))).status, 201);
+  const fourth = await post('/api/work/slots/claim', claimSlotBody(x2));
+  check('a fourth slot under one owner is refused', [fourth.status, /at most 3/.test(fourth.body.error ?? '')], [409, true]);
+  check('the filler claims the last slot', (await post('/api/work/slots/claim', claimSlotBody(filler))).status, 201);
   const overCap = await post('/api/work/slots/claim', claimSlotBody(over));
   check('the slot cap holds', [overCap.status, /slots are taken/.test(overCap.body.error ?? '')], [409, true]);
   check('a worker key without a slot cannot take jobs', (await claimJob(over)).status, 401);
@@ -244,13 +257,23 @@ async function main() {
   const w1Jobs = new Set(all.filter((a) => a.workerWallet === w1Wallet).map((a) => a.jobId));
   check('two agents under one owner never share a panel', all.filter((a) => a.workerWallet === w4Wallet && w1Jobs.has(a.jobId)).length, 0);
   check('the same-owner worker still gets other work', all.some((a) => a.workerWallet === w4Wallet), true);
+  const w2Wallet = w2.agent.publicKey.toBase58();
+  const w5Wallet = w5.agent.publicKey.toBase58();
+  const w2Jobs = new Set(all.filter((a) => a.workerWallet === w2Wallet).map((a) => a.jobId));
+  check('two workers at one network address never share a panel', all.filter((a) => a.workerWallet === w5Wallet && w2Jobs.has(a.jobId)).length, 0);
+  check('nor is one asked to check the other', all.filter((a) => (a.workerWallet === w5Wallet && a.job.subjectWallet === w2Wallet) || (a.workerWallet === w2Wallet && a.job.subjectWallet === w5Wallet)).length, 0);
+  check('the same-address worker still gets other work', all.some((a) => a.workerWallet === w5Wallet), true);
+  const clusters = await fetch(`${API}/api/work/admin/clusters`, { headers: { 'x-admin-secret': 'vk' } }).then((r) => r.json() as any);
+  check('the operator view groups the two by address', clusters.byAddress.some((g: any) => g.size === 2 && g.slots.every((x: any) => [w2Wallet, w5Wallet].includes(x.wallet))), true);
+  check('the operator view needs the admin secret', (await fetch(`${API}/api/work/admin/clusters`)).status, 404);
+  check('standing tells a worker it shares an operator', (await get(`/api/work/workers/${w5Wallet}/standing`)).body.sameOperatorSlots, 1);
   const perJob = new Map<string, number>();
   for (const a of all) if (a.status !== 'expired') perJob.set(a.jobId, (perJob.get(a.jobId) ?? 0) + 1);
   check('no panel is over-filled', [...perJob.values()].some((n) => n > 3), false);
 
   // ── Public read side ────────────────────────────────────────────────────
   const stats = (await get('/api/work/stats')).body;
-  check('stats: slots and cap', [stats.slots.claimed, stats.slots.cap], [5, 5]);
+  check('stats: slots and cap', [stats.slots.claimed, stats.slots.cap], [7, 7]);
   check('stats: workers are online', stats.workersOnline >= 3, true);
   check('stats: accepted jobs are counted', stats.jobs.accepted >= 1 && stats.jobs.accepted24h >= 1, true);
   check('stats: reputation writes are off by default', stats.reputationWrites, false);
@@ -262,7 +285,7 @@ async function main() {
   const page = await fetch(`${API}/work`);
   check('the feed page is served', [page.status, (await page.text()).includes('Agents at work')], [200, true]);
   check('protocol lists both job kinds', (await get('/api/work/protocol')).body.jobKinds, ['wallet_history_v1', 'wallet_activity_v1']);
-  check('workers are numbered in joining order', workers.map((w) => w.number).sort((a, b) => a - b), [1, 2, 3, 4, 5]);
+  check('workers are numbered in joining order', workers.map((w) => w.number).sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7]);
 
   if (KIND === 'wallet_activity_v1') {
     const subject = (indep?.spec as any).wallet as string;
@@ -280,7 +303,7 @@ async function main() {
   const swarmRes = await fetch(`${API}/api/work/swarm`, { headers: { Origin: 'https://example.org' } });
   const swarm = (await swarmRes.json()) as any;
   check('the snapshot is readable from any origin', swarmRes.headers.get('access-control-allow-origin'), '*');
-  check('the snapshot carries stats, workers, feed and the payout formula', [swarm.open, swarm.workers.length, swarm.feed.length > 0, /units/.test(swarm.rules.payout.formula)], [true, 5, true, true]);
+  check('the snapshot carries stats, workers, feed and the payout formula', [swarm.open, swarm.workers.length, swarm.feed.length > 0, /units/.test(swarm.rules.payout.formula)], [true, 7, true, true]);
 
   // ── Daily record and announcements ──────────────────────────────────────
   const today = new Date().toISOString().slice(0, 10);

@@ -66,6 +66,7 @@ tail -n 20 ~/.said-worker/worker.log
 - Use an RPC that serves full, finalized history. An RPC that drops old transactions produces wrong answers.
 - Do not edit answers. The server computes its own hash of what you send, and a mismatch with the panel is recorded.
 - You will never be given your own wallet, or one linked to you, to check.
+- Workers that share an owner, a funding wallet or a network address are treated as one operator and are never put on the same panel. Running several from one place earns no extra agreement. One owner can hold at most three slots.
 
 ## Keys
 

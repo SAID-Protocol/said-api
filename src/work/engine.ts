@@ -56,6 +56,12 @@ export interface WorkConfig {
   /** Share of each period's rewards, in basis points. The remainder is unallocated. */
   workersBps: number;
   lockBps: number;
+  /** One owner may hold at most this many slots. */
+  maxSlotsPerOwner: number;
+  /** Treat workers claiming from one network address as one operator. */
+  ipSeparation: boolean;
+  /** Funding wallets too common to mean "same operator" (a sponsor wallet, an exchange). */
+  commonFunders: Set<string>;
   /** A share smaller than this is not sent (it would cost more to send than it is worth). */
   minPayoutLamports: number;
 }
@@ -85,6 +91,9 @@ export function loadWorkConfig(env: NodeJS.ProcessEnv): WorkConfig {
     evidenceWeight: env.WORK_EVIDENCE_WEIGHT && Number.isFinite(weight) && weight > 0 && weight <= 3 ? weight : null,
     evidenceMinAccepted: num(env.WORK_EVIDENCE_MIN_ACCEPTED, 10, 1, 100000),
     applyActivity: env.WORK_APPLY_ACTIVITY === 'true',
+    maxSlotsPerOwner: num(env.WORK_MAX_SLOTS_PER_OWNER, 3, 1, 1000),
+    ipSeparation: env.WORK_IP_SEPARATION !== 'false',
+    commonFunders: new Set((env.WORK_COMMON_FUNDERS ?? '').split(',').map((w) => w.trim()).filter(Boolean)),
     workersBps,
     lockBps: Math.min(num(env.WORK_SPLIT_LOCK_BPS, 4000, 0, 10000), 10000 - workersBps),
     minPayoutLamports: num(env.WORK_MIN_PAYOUT_LAMPORTS, 1_000_000, 0, 1e12),
@@ -136,7 +145,7 @@ export interface SlotClaimBody {
 
 const NOT_OPEN = 'The work loop is not open yet';
 
-export async function claimSlot(prisma: PrismaClient, cfg: WorkConfig, body: SlotClaimBody) {
+export async function claimSlot(prisma: PrismaClient, cfg: WorkConfig, body: SlotClaimBody, ipHash: string | null = null) {
   if (!cfg.open) throw new WorkError(503, NOT_OPEN);
   const { wallet, workerKey, timestamp, signature } = body;
   if (!isPubkey(wallet) || !isPubkey(workerKey)) throw new WorkError(400, 'wallet and workerKey must be base58 public keys');
@@ -146,7 +155,7 @@ export async function claimSlot(prisma: PrismaClient, cfg: WorkConfig, body: Slo
     throw new WorkError(401, 'signature does not match the agent wallet');
   }
 
-  const agent = await prisma.agent.findUnique({ where: { wallet }, select: { isVerified: true } });
+  const agent = await prisma.agent.findUnique({ where: { wallet }, select: { isVerified: true, owner: true } });
   if (!agent) throw new WorkError(404, 'Agent not registered on SAID');
   if (!agent.isVerified) throw new WorkError(403, 'Only verified agents can claim a worker slot');
 
@@ -162,7 +171,10 @@ export async function claimSlot(prisma: PrismaClient, cfg: WorkConfig, body: Slo
       }
       const taken = await tx.workSlot.count({ where: { status: 'active' } });
       if (taken >= cfg.slotCap) throw new WorkError(409, `All ${cfg.slotCap} worker slots are taken`);
-      const slot = await tx.workSlot.create({ data: { wallet, workerKey } });
+      const siblings = await tx.agent.findMany({ where: { owner: agent.owner }, select: { wallet: true } });
+      const held = await tx.workSlot.count({ where: { status: 'active', wallet: { in: siblings.map((a) => a.wallet) } } });
+      if (held >= cfg.maxSlotsPerOwner) throw new WorkError(409, `One owner can hold at most ${cfg.maxSlotsPerOwner} worker slots`);
+      const slot = await tx.workSlot.create({ data: { wallet, workerKey, ipHash } });
       return { slot, created: true };
     });
   } catch (err) {
@@ -184,7 +196,11 @@ async function activeSlotForKey(prisma: PrismaClient, workerKey: unknown) {
  * Every wallet a worker must never be asked to check: its own, its owner's,
  * its linked and delegated wallets, and other agents under the same owner.
  */
-export async function relatedWallets(prisma: PrismaClient, wallet: string): Promise<{ owner: string; wallets: string[] }> {
+export async function relatedWallets(
+  prisma: PrismaClient,
+  wallet: string,
+  cfg?: WorkConfig,
+): Promise<{ owner: string; wallets: string[] }> {
   const agent = await prisma.agent.findUnique({ where: { wallet }, select: { id: true, pda: true, owner: true } });
   if (!agent) throw new WorkError(403, 'Agent is no longer registered');
   const [siblings, linksOut, linkIn, delegated] = await Promise.all([
@@ -201,7 +217,45 @@ export async function relatedWallets(prisma: PrismaClient, wallet: string): Prom
     const parent = await prisma.agent.findUnique({ where: { pda: linkIn.agentPda }, select: { wallet: true } });
     if (parent) set.add(parent.wallet);
   }
+  if (cfg) for (const w of await sameOperatorSlots(prisma, cfg, wallet)) set.add(w);
   return { owner: agent.owner, wallets: [...set] };
+}
+
+/**
+ * Other slots that look like the same operator: funded by the same wallet, or
+ * working from the same network address. Either can be faked around at a
+ * cost; the point is to make a farm of slots more expensive than one honest
+ * worker, not to prove who anyone is.
+ */
+export async function sameOperatorSlots(prisma: PrismaClient, cfg: WorkConfig, wallet: string): Promise<string[]> {
+  const me = await prisma.workSlot.findUnique({ where: { wallet }, select: { ipHash: true, funder: true } });
+  if (!me) return [];
+  const or: Prisma.WorkSlotWhereInput[] = [];
+  if (cfg.ipSeparation && me.ipHash) or.push({ ipHash: me.ipHash });
+  if (me.funder && !cfg.commonFunders.has(me.funder)) or.push({ funder: me.funder });
+  // A slot whose funder is another slot's wallet, or the reverse.
+  or.push({ funder: wallet });
+  if (me.funder) or.push({ wallet: me.funder });
+  const rows = await prisma.workSlot.findMany({ where: { status: 'active', wallet: { not: wallet }, OR: or }, select: { wallet: true } });
+  return rows.map((r) => r.wallet);
+}
+
+/** Groups of slots that share a funder or an address, for an operator to review. */
+export async function getClusters(prisma: PrismaClient, cfg: WorkConfig) {
+  const slots = await prisma.workSlot.findMany({ where: { status: 'active' }, select: { wallet: true, number: true, ipHash: true, funder: true, acceptedCount: true } });
+  const group = (key: (s: (typeof slots)[number]) => string | null) => {
+    const m = new Map<string, typeof slots>();
+    for (const s of slots) {
+      const k = key(s);
+      if (k) m.set(k, [...(m.get(k) ?? []), s]);
+    }
+    return [...m].filter(([, v]) => v.length > 1).map(([k, v]) => ({ key: k, size: v.length, slots: v.map((x) => ({ wallet: x.wallet, number: x.number, accepted: x.acceptedCount })) }));
+  };
+  return {
+    byFunder: group((s) => s.funder).map((g) => ({ funder: g.key, treatedAsCommon: cfg.commonFunders.has(g.key), size: g.size, slots: g.slots })),
+    byAddress: cfg.ipSeparation ? group((s) => s.ipHash).map((g) => ({ addressHash: g.key.slice(0, 12), size: g.size, slots: g.slots })) : [],
+    unknownFunder: slots.filter((s) => !s.funder).length,
+  };
 }
 
 // ─── Standing ───────────────────────────────────────────────────────────────
@@ -289,7 +343,8 @@ export async function getStanding(prisma: PrismaClient, cfg: WorkConfig, wallet:
     prisma.workAssignment.count({ where: { workerWallet: wallet, status: 'leased', leaseExpiresAt: { gte: now } } }),
     prisma.workJob.count({ where: { status: 'open' } }),
   ]);
-  const eligible = agent ? await eligibleJobCount(prisma, wallet, await relatedWallets(prisma, wallet)) : 0;
+  const eligible = agent ? await eligibleJobCount(prisma, wallet, await relatedWallets(prisma, wallet, cfg)) : 0;
+  const sameOperator = (await sameOperatorSlots(prisma, cfg, wallet)).length;
 
   const blocked: string[] = [];
   if (!cfg.open) blocked.push('loop_closed');
@@ -322,6 +377,9 @@ export async function getStanding(prisma: PrismaClient, cfg: WorkConfig, wallet:
     },
     limits: { openLeases, maxLeases: cfg.maxLeasesPerWorker, usedThisHour, maxJobsPerHour: cfg.maxJobsPerHour },
     queue: { open: openJobs, eligibleForYou: eligible },
+    // Slots that share your funding wallet or network address. You are never
+    // put on a panel with them, so running several earns no extra agreement.
+    sameOperatorSlots: sameOperator,
     blocked,
   };
 }
@@ -391,7 +449,13 @@ export interface JobClaimBody {
   signature?: unknown;
 }
 
-export async function claimJob(prisma: PrismaClient, cfg: WorkConfig, body: JobClaimBody, now: Date = new Date()) {
+export async function claimJob(
+  prisma: PrismaClient,
+  cfg: WorkConfig,
+  body: JobClaimBody,
+  now: Date = new Date(),
+  ipHash: string | null = null,
+) {
   if (!cfg.open) throw new WorkError(503, NOT_OPEN);
   const { workerKey, timestamp, signature } = body;
   const slot = await activeSlotForKey(prisma, workerKey);
@@ -403,7 +467,7 @@ export async function claimJob(prisma: PrismaClient, cfg: WorkConfig, body: JobC
   const agent = await prisma.agent.findUnique({ where: { wallet: slot.wallet }, select: { isVerified: true } });
   if (!agent?.isVerified) throw new WorkError(403, 'Agent is no longer verified');
 
-  await prisma.workSlot.update({ where: { id: slot.id }, data: { lastSeenAt: now } });
+  await prisma.workSlot.update({ where: { id: slot.id }, data: { lastSeenAt: now, ...(ipHash ? { ipHash } : {}) } });
   await prisma.workAssignment.updateMany({
     where: { status: 'leased', leaseExpiresAt: { lt: now } },
     data: { status: 'expired' },
@@ -430,7 +494,7 @@ export async function claimJob(prisma: PrismaClient, cfg: WorkConfig, body: JobC
   }
 
   await ensureOpenJobs(prisma, cfg, now);
-  const related = await relatedWallets(prisma, slot.wallet);
+  const related = await relatedWallets(prisma, slot.wallet, cfg);
   const leaseExpiresAt = new Date(now.getTime() + cfg.leaseSeconds * 1000);
 
   const pickJob = () => prisma.$transaction(async (tx) => {

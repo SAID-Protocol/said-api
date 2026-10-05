@@ -933,7 +933,15 @@ model WorkSlot {
   claimedAt  DateTime  @default(now())
   lastSeenAt DateTime?
 
+  // Signals that two slots are run by one operator. Slots sharing either are
+  // never put on the same panel or asked to check each other.
+  ipHash          String? // salted hash of the address the worker last claimed from
+  funder          String? // wallet that paid for this agent wallet's first transaction
+  funderCheckedAt DateTime?
+
   @@index([status, lastSeenAt])
+  @@index([ipHash])
+  @@index([funder])
 }
 
 model WorkJob {

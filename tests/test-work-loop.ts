@@ -158,6 +158,9 @@ check('a split panel is not a failure', breakerState([fin(1, 'submitted', 'split
 check('an answer still waiting on its panel is not a failure', breakerState([fin(1, 'submitted', null), fin(2, 'expired'), fin(3, 'expired')], T0).pausedUntil, null);
 check('a new worker is not paused', breakerState([], T0), { pausedUntil: null, consecutiveFailures: 0 });
 check('default hourly cap', loadWorkConfig({}).maxJobsPerHour, 600);
+check('one owner holds at most three slots by default', loadWorkConfig({}).maxSlotsPerOwner, 3);
+check('address separation is on unless switched off', [loadWorkConfig({}).ipSeparation, loadWorkConfig({ WORK_IP_SEPARATION: 'false' }).ipSeparation], [true, false]);
+check('common funders are read as a list', [...loadWorkConfig({ WORK_COMMON_FUNDERS: ' a , b,, ' }).commonFunders], ['a', 'b']);
 
 // Daily record
 const lv = ['a', 'b', 'c', 'd', 'e'].map((j) => leafHash(j, 'h' + j));
