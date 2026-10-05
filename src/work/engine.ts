@@ -64,9 +64,9 @@ export interface WorkConfig {
   /** Funding wallets too common to mean "same operator" (a sponsor wallet, an exchange). */
   commonFunders: Set<string>;
   /**
-   * Pay rate per reputation tier, in percent of the base rate. Empty means
-   * every worker is paid at the same rate. Set with WORK_TIER_RATES, e.g.
-   * "silver:110,gold:125,platinum:150".
+   * Pay rate per reputation tier, in percent of the base rate; a tier not
+   * listed is paid at 100. WORK_TIER_RATES overrides the default below, and
+   * setting it to an empty string pays every tier the same.
    */
   tierRates: Record<string, number>;
   /** A share smaller than this is not sent (it would cost more to send than it is worth). */
@@ -83,6 +83,12 @@ function num(raw: string | undefined, fallback: number, min: number, max: number
 const MIN_RATE_PCT = 25;
 const MAX_RATE_PCT = 300;
 const RATEABLE_TIERS = new Set(['unranked', 'bronze', 'silver', 'gold', 'platinum', 'flagged']);
+
+// Modest on purpose. Work raises reputation and reputation raises pay, so a
+// steep ladder would let the first workers pull away for good; at these
+// rates a top-tier agent earns half as much again as a newcomer for the same
+// work. A flagged agent is paid the least the bounds allow.
+export const DEFAULT_TIER_RATES = 'silver:110,gold:125,platinum:150,flagged:25';
 
 export function parseTierRates(raw: string | undefined): Record<string, number> {
   const out: Record<string, number> = {};
@@ -123,7 +129,7 @@ export function loadWorkConfig(env: NodeJS.ProcessEnv): WorkConfig {
     evidenceWeight: env.WORK_EVIDENCE_WEIGHT && Number.isFinite(weight) && weight > 0 && weight <= 3 ? weight : null,
     evidenceMinAccepted: num(env.WORK_EVIDENCE_MIN_ACCEPTED, 10, 1, 100000),
     applyActivity: env.WORK_APPLY_ACTIVITY === 'true',
-    tierRates: parseTierRates(env.WORK_TIER_RATES),
+    tierRates: parseTierRates(env.WORK_TIER_RATES ?? DEFAULT_TIER_RATES),
     maxSlotsPerOwner: num(env.WORK_MAX_SLOTS_PER_OWNER, 3, 1, 1000),
     ipSeparation: env.WORK_IP_SEPARATION !== 'false',
     commonFunders: new Set((env.WORK_COMMON_FUNDERS ?? '').split(',').map((w) => w.trim()).filter(Boolean)),

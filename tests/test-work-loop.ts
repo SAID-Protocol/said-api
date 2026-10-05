@@ -145,7 +145,9 @@ check('a share under the minimum is not payable', computeShares(1_500_000n, new 
 check('no work means nothing is paid', computeShares(1_000n, new Map(), 0n), []);
 check('one wrong answer cancels ten accepted', [unitsFor(25, 1), unitsFor(8, 1), unitsFor(8, 0)], [15, 0, 8]);
 // Reputation-tier pay rates
-check('with no rates set, every tier is paid the base rate', [loadWorkConfig({}).tierRates, rateFor(loadWorkConfig({}), 'platinum')], [{}, 100]);
+check('default rates: newcomers at base, a modest ladder above, flagged at the floor',
+  ['unranked', 'bronze', 'silver', 'gold', 'platinum', 'flagged'].map((t) => rateFor(loadWorkConfig({}), t)), [100, 100, 110, 125, 150, 25]);
+check('an empty setting pays every tier the same', [loadWorkConfig({ WORK_TIER_RATES: '' }).tierRates, rateFor(loadWorkConfig({ WORK_TIER_RATES: '' }), 'platinum')], [{}, 100]);
 const rated = loadWorkConfig({ WORK_TIER_RATES: 'silver:110, gold:125,platinum:150' });
 check('rates are read per tier', [rateFor(rated, 'gold'), rateFor(rated, 'platinum'), rateFor(rated, 'bronze'), rateFor(rated, 'unranked')], [125, 150, 100, 100]);
 check('a rate outside 25-300, an unknown tier or a non-number is ignored', parseTierRates('gold:900,diamond:150,silver:lots,bronze:0,flagged:25'), { flagged: 25 });
