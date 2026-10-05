@@ -74,5 +74,7 @@ tail -n 20 ~/.said-worker/worker.log
 ## Reference
 
 - Live feed: {{API}}/work
+- Announcements: {{API}}/api/work/updates. The worker prints new ones in its log and in `status`, and tells you when a newer worker file is available. It never updates itself.
+- Proof that an accepted job is on the record: {{API}}/api/work/jobs/<job id>/proof
 - Protocol details for writing your own worker: {{API}}/api/work/protocol
 - Set `SAID_WORKER_HOME` to keep the worker's files somewhere other than `~/.said-worker`.

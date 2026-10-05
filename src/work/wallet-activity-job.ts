@@ -119,6 +119,31 @@ function keyString(k: unknown): string {
   return any?.pubkey ? any.pubkey.toString() : (any?.toString?.() ?? '');
 }
 
+type ParsedTx = Awaited<ReturnType<Connection['getParsedTransaction']>>;
+const SINGLE_CONCURRENCY = 4;
+
+/**
+ * One batched read where the RPC allows it. Free and public endpoints often
+ * refuse batches outright; for those, read the transactions a few at a time.
+ * A rate limit (429) is not a refusal and is left to the caller to retry.
+ */
+async function fetchTransactions(conn: Connection, signatures: string[]): Promise<ParsedTx[]> {
+  const opts = { maxSupportedTransactionVersion: 0, commitment: 'finalized' as const };
+  try {
+    return await conn.getParsedTransactions(signatures, opts);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/batch|not supported|not allowed|403|413|paid plan|specific RPC call/i.test(msg)) throw err;
+  }
+  const out: ParsedTx[] = new Array(signatures.length).fill(null);
+  for (let i = 0; i < signatures.length; i += SINGLE_CONCURRENCY) {
+    const chunk = signatures.slice(i, i + SINGLE_CONCURRENCY);
+    const got = await Promise.all(chunk.map((sig) => conn.getParsedTransaction(sig, opts)));
+    got.forEach((tx, j) => (out[i + j] = tx));
+  }
+  return out;
+}
+
 export async function runWalletActivity(conn: Connection, spec: WalletHistorySpec): Promise<WalletActivityResult> {
   const sigs = await fetchWindowSignatures(conn, spec);
   const { kept } = windowSignatures(sigs, spec);
@@ -127,7 +152,7 @@ export async function runWalletActivity(conn: Connection, spec: WalletHistorySpe
 
   for (let i = 0; i < ok.length; i += TX_BATCH) {
     const slice = ok.slice(i, i + TX_BATCH);
-    const txs = await conn.getParsedTransactions(slice, { maxSupportedTransactionVersion: 0, commitment: 'finalized' });
+    const txs = await fetchTransactions(conn, slice);
     txs.forEach((tx, j) => {
       if (!tx) return; // summarizeActivity refuses to answer without it
       const instructions = [

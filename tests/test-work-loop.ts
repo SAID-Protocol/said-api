@@ -17,6 +17,7 @@ import { loadWorkConfig, panelAgrees } from '../src/work/engine.js';
 import { canonicalActivity, hashActivity, summarizeActivity, type TxView } from '../src/work/wallet-activity-job.js';
 import { jobKind } from '../src/work/kinds.js';
 import { computeShares, unitsFor } from '../src/work/payouts.js';
+import { leafHash, merkleProof, merkleRoot, verifyProof } from '../src/work/records.js';
 
 let failures = 0;
 function check(name: string, got: unknown, want: unknown) {
@@ -144,6 +145,17 @@ check('no work means nothing is paid', computeShares(1_000n, new Map(), 0n), [])
 check('one wrong answer cancels ten accepted', [unitsFor(25, 1), unitsFor(8, 1), unitsFor(8, 0)], [15, 0, 8]);
 const cfgSplit = loadWorkConfig({ WORK_SPLIT_WORKERS_BPS: '7000', WORK_SPLIT_LOCK_BPS: '5000' });
 check('the split can never exceed the whole', cfgSplit.workersBps + cfgSplit.lockBps <= 10000, true);
+
+// Daily record
+const lv = ['a', 'b', 'c', 'd', 'e'].map((j) => leafHash(j, 'h' + j));
+const root5 = merkleRoot(lv);
+check('every leaf proves against the root', lv.every((l, i) => verifyProof(l, merkleProof(lv, i), root5)), true);
+check('a leaf does not prove against another day', verifyProof(lv[0], merkleProof(lv, 0), merkleRoot(lv.slice(1))), false);
+check('a changed answer does not prove', verifyProof(leafHash('a', 'other'), merkleProof(lv, 0), root5), false);
+check('order changes the root', merkleRoot([...lv].reverse()) === root5, false);
+check('a single job is its own root', merkleRoot([lv[0]]), lv[0]);
+check('an empty day still has a root', merkleRoot([]).length, 64);
+check('one and two leaves prove too', [1, 2].every((n) => lv.slice(0, n).every((l, i) => verifyProof(l, merkleProof(lv.slice(0, n), i), merkleRoot(lv.slice(0, n))))), true);
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

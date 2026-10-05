@@ -22,7 +22,7 @@
  *   start    run in the background (log and pid file in the worker home)
  *   stop     stop the background worker
  *   run      run in the foreground until stopped (`--once` for a single job)
- *   status   slot, record, and whether the worker is running
+ *   status   slot, record, announcements, and whether the worker is running
  *
  * Env:
  *   SAID_API_URL     default https://api.saidprotocol.com
@@ -31,6 +31,7 @@
  */
 
 import { spawn } from 'child_process';
+import { createHash } from 'crypto';
 import { openSync } from 'fs';
 import { chmod, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { homedir } from 'os';
@@ -40,7 +41,7 @@ import bs58 from 'bs58';
 import { jobClaimMessage, signMessage, slotClaimMessage, submitMessage } from '../src/work/auth.js';
 import { jobKind } from '../src/work/kinds.js';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const API = (process.env.SAID_API_URL || 'https://api.saidprotocol.com').replace(/\/+$/, '');
 const RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
 const HOME = process.env.SAID_WORKER_HOME || join(homedir(), '.said-worker');
@@ -52,6 +53,7 @@ const LOG_FILE = join(HOME, 'worker.log');
 const IDLE_MS = 30_000;
 const BETWEEN_JOBS_MS = 1_000;
 const ERROR_BACKOFF_MS = 15_000;
+const NOTICE_INTERVAL_MS = 60 * 60 * 1000;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const log = (msg: string) => console.log(`${new Date().toISOString()} ${msg}`);
@@ -102,12 +104,40 @@ async function loadOrCreateWorkerKey(): Promise<Keypair> {
   return kp;
 }
 
-async function loadConfig(): Promise<{ wallet?: string }> {
+async function loadConfig(): Promise<{ wallet?: string; lastUpdateId?: string }> {
   try {
     return JSON.parse(await readFile(CONFIG_FILE, 'utf8'));
   } catch {
     return {};
   }
+}
+
+/**
+ * What the operator should know: whether this file is older than the one the
+ * API serves, and any announcement not yet shown. The worker never updates
+ * itself; it says so and leaves the download to the operator.
+ */
+async function notices(markSeen: boolean): Promise<string[]> {
+  const out: string[] = [];
+  try {
+    const protocol = (await getJson('/api/work/protocol')).body;
+    const self = process.argv[1] ?? '';
+    if (protocol.worker?.sha256 && self.endsWith('.cjs')) {
+      const mine = createHash('sha256').update(await readFile(self)).digest('hex');
+      if (mine !== protocol.worker.sha256) out.push(`a newer worker is available: download ${protocol.worker.url} again and restart`);
+    }
+    const updates = (await getJson('/api/work/updates?limit=5')).body.updates ?? [];
+    const config = await loadConfig();
+    const seenAt = updates.findIndex((u: { id: string }) => u.id === config.lastUpdateId);
+    const fresh = (seenAt < 0 ? updates : updates.slice(0, seenAt)).reverse();
+    for (const u of fresh) out.push(`announcement: ${u.title}. ${u.body}`);
+    if (markSeen && updates.length && updates[0].id !== config.lastUpdateId) {
+      await writeFile(CONFIG_FILE, JSON.stringify({ ...config, lastUpdateId: updates[0].id }, null, 2));
+    }
+  } catch {
+    // Notices are a courtesy; never let them stop the worker.
+  }
+  return out;
 }
 
 /** The pid of a live background or foreground worker for this home, if any. */
@@ -187,6 +217,7 @@ async function status(): Promise<void> {
   }
   const stats = (await getJson('/api/work/stats')).body;
   console.log(`network:    ${stats.slots.claimed}/${stats.slots.cap} slots, ${stats.workersOnline} online, ${stats.jobs.open} jobs open`);
+  for (const n of await notices(false)) console.log(`notice:     ${n}`);
 }
 
 async function start(): Promise<void> {
@@ -231,9 +262,14 @@ async function run(): Promise<void> {
     process.on('SIGINT', cleanup);
   }
   log(`worker ${workerKey} v${VERSION} starting against ${API}`);
+  let noticesAt = 0;
 
   for (;;) {
     try {
+      if (!once && Date.now() - noticesAt > NOTICE_INTERVAL_MS) {
+        noticesAt = Date.now();
+        for (const n of await notices(true)) log(`notice: ${n}`);
+      }
       const ts = Date.now();
       const claim = await post('/api/work/jobs/claim', {
         workerKey,

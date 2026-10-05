@@ -10,6 +10,11 @@
  *   POST /api/work/jobs/claim             worker takes one job on a lease
  *   POST /api/work/assignments/:id/submit worker returns its answer
  *   GET  /api/work/payouts?limit=12       reward periods and every worker payout
+ *   GET  /api/work/updates?limit=10       operator announcements, newest first
+ *   GET  /api/work/records/:day           one UTC day's accepted work and its Merkle root
+ *   GET  /api/work/jobs/:id/proof         proof that an accepted job is in its day's record
+ *   POST /api/work/admin/updates          post an announcement (x-admin-secret)
+ *   POST /api/work/admin/records/:day/anchor  attach the on-chain transaction carrying a day's root
  *   POST /api/work/admin/epochs           record a reward period (x-admin-secret)
  *   POST /api/work/admin/epochs/:label/lock  attach the buy-and-lock transaction
  *
@@ -37,6 +42,7 @@ import {
 } from './engine.js';
 import { JOB_KINDS, jobKind } from './kinds.js';
 import { createEpoch, getPayouts, recordLockTx } from './payouts.js';
+import { freezeYesterday, getDayRecord, getJobProof, getUpdates, postUpdate, recordAnchorTx } from './records.js';
 import { WALLET_ACTIVITY_KIND, applyActivityResult, type WalletActivityResult } from './wallet-activity-job.js';
 import { SIGNATURE_WINDOW_MS } from './auth.js';
 import { PUBLIC_API_URL, loadSkill, loadWorkerBundle } from './distribution.js';
@@ -170,6 +176,49 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
       return fail(c, err);
     }
   });
+
+  router.get('/updates', async (c) => c.json({ updates: await getUpdates(prisma, clampLimit(c.req.query('limit'), 10, 50)) }));
+
+  router.get('/records/:day', async (c) => {
+    try {
+      return c.json(await getDayRecord(prisma, c.req.param('day')));
+    } catch (err) {
+      return fail(c, err);
+    }
+  });
+
+  router.get('/jobs/:id/proof', async (c) => {
+    try {
+      return c.json(await getJobProof(prisma, c.req.param('id')));
+    } catch (err) {
+      return fail(c, err);
+    }
+  });
+
+  router.post('/admin/updates', async (c) => {
+    if (!isAdmin(c)) return c.json({ error: 'Not found' }, 404);
+    try {
+      const u = await postUpdate(prisma, await readJson(c));
+      return c.json({ id: u.id, title: u.title, at: u.createdAt.toISOString() }, 201);
+    } catch (err) {
+      return fail(c, err);
+    }
+  });
+
+  router.post('/admin/records/:day/anchor', async (c) => {
+    if (!isAdmin(c)) return c.json({ error: 'Not found' }, 404);
+    try {
+      const row = await recordAnchorTx(prisma, c.req.param('day'), (await readJson(c)).tx);
+      return c.json({ day: row.day, root: row.root, anchorTx: row.anchorTx });
+    } catch (err) {
+      return fail(c, err);
+    }
+  });
+
+  // Close yesterday's record even if nobody asks for it.
+  const freeze = () => freezeYesterday(prisma).catch((err) => console.error('[work] could not freeze the daily record:', err instanceof Error ? err.message : err));
+  freeze();
+  setInterval(freeze, EVIDENCE_INTERVAL_MS);
 
   // Daily reputation rows. Hourly so a restart never skips a day; each run
   // re-settles yesterday, and the sourceKey makes repeats a no-op.

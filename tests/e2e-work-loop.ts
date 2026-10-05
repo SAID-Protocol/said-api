@@ -19,6 +19,7 @@ import { jobClaimMessage, signMessage, slotClaimMessage, submitMessage } from '.
 import { loadWorkConfig, settleDailyEvidence } from '../src/work/engine.js';
 import { jobKind, type JobResult } from '../src/work/kinds.js';
 import { computeShares } from '../src/work/payouts.js';
+import { leafHash, verifyProof } from '../src/work/records.js';
 import type { WalletHistorySpec } from '../src/work/wallet-history.js';
 
 const API = process.env.API || 'http://localhost:3999';
@@ -269,6 +270,26 @@ async function main() {
     check('an accepted activity answer is written to the activity stats', stats2?.source, 'work-panel');
     check('the stats carry the agreed transaction count', stats2?.txCount, (indep?.result as any).successCount);
   }
+
+  // ── Daily record and announcements ──────────────────────────────────────
+  const today = new Date().toISOString().slice(0, 10);
+  const record = (await get(`/api/work/records/${today}`)).body;
+  check('today\'s record lists the accepted job and is not final yet', [record.final, record.leaves.some((l: any) => l.jobId === independentJob)], [false, true]);
+  const proof = (await get(`/api/work/jobs/${independentJob}/proof`)).body;
+  check('an accepted job proves against the day root', verifyProof(proof.leaf, proof.proof, record.root), true);
+  check('the proof leaf is the job id and its answer hash', proof.leaf, leafHash(independentJob!, indep!.resultHash!));
+  check('a disagreed job has no proof', (await get(`/api/work/jobs/${tamperJob}/proof`)).status, 404);
+  check('a malformed day is refused', (await get('/api/work/records/2026-13-40')).status, 400);
+  const yesterday = new Date(Date.now() - 86400e3).toISOString().slice(0, 10);
+  const closed = (await get(`/api/work/records/${yesterday}`)).body;
+  check('a day that has ended is final, even when empty', [closed.final, closed.count], [true, 0]);
+  const adminPost = (path: string, body: unknown, secret = 'vk') =>
+    fetch(`${API}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-admin-secret': secret }, body: JSON.stringify(body) })
+      .then(async (r) => ({ status: r.status, body: (await r.json().catch(() => ({}))) as any }));
+  check('an announcement needs the admin secret', (await adminPost('/api/work/admin/updates', { title: 'x', body: 'y' }, 'nope')).status, 404);
+  check('an announcement is posted', (await adminPost('/api/work/admin/updates', { title: 'First payout sent', body: 'Period e2e paid three workers.' })).status, 201);
+  check('announcements are public, newest first', (await get('/api/work/updates')).body.updates[0].title, 'First payout sent');
+  check('an anchor transaction can be attached to a closed day', (await adminPost(`/api/work/admin/records/${yesterday}/anchor`, { tx: '3'.repeat(88) })).body.anchorTx, '3'.repeat(88));
 
   // ── Reward period and payouts ───────────────────────────────────────────
   const period = { label: 'e2e-period', startsAt: startedAt.toISOString(), endsAt: new Date().toISOString(), rewardsLamports: '1000000000' };

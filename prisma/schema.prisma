@@ -1033,3 +1033,23 @@ model WorkPayout {
   @@index([workerWallet, status])
   @@index([status])
 }
+
+// Operator announcements that workers and the feed page read.
+model WorkUpdate {
+  id        String   @id @default(cuid())
+  title     String
+  body      String
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+// One Merkle root per UTC day over that day's accepted jobs, frozen once the
+// day has ended, so anyone holding a job's result can prove it was recorded.
+model WorkDayRoot {
+  day      String   @id // YYYY-MM-DD (UTC)
+  root     String
+  count    Int
+  anchorTx String? // on-chain transaction carrying the root, once made
+  frozenAt DateTime @default(now())
+}
