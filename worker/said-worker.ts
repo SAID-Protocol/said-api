@@ -215,6 +215,15 @@ async function status(): Promise<void> {
       console.log('record:     no slot for this wallet');
     }
   }
+  if (wallet) {
+    const st = await getJson(`/api/work/workers/${wallet}/standing`);
+    if (st.status === 200) {
+      const b: string[] = st.body.blocked ?? [];
+      console.log(`getting work: ${b.length ? `no (${b.join(', ')})` : `yes (${st.body.queue.eligibleForYou} jobs open to you)`}`);
+      if (st.body.standing.paused) console.log(`paused until: ${st.body.standing.pausedUntil}`);
+      for (const f of (st.body.standing.recentFailures ?? []).slice(0, 3)) console.log(`failed:     ${f.at} ${f.reason} (job ${f.jobId})`);
+    }
+  }
   const stats = (await getJson('/api/work/stats')).body;
   console.log(`network:    ${stats.slots.claimed}/${stats.slots.cap} slots, ${stats.workersOnline} online, ${stats.jobs.open} jobs open`);
   for (const n of await notices(false)) console.log(`notice:     ${n}`);

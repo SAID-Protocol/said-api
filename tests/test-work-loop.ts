@@ -13,7 +13,7 @@ import {
   type WalletHistorySpec,
 } from '../src/work/wallet-history.js';
 import { isFresh, signMessage, slotClaimMessage, submitMessage, verifyMessage } from '../src/work/auth.js';
-import { loadWorkConfig, panelAgrees } from '../src/work/engine.js';
+import { breakerState, loadWorkConfig, panelAgrees, type FinishedAssignment } from '../src/work/engine.js';
 import { canonicalActivity, hashActivity, summarizeActivity, type TxView } from '../src/work/wallet-activity-job.js';
 import { jobKind } from '../src/work/kinds.js';
 import { computeShares, unitsFor } from '../src/work/payouts.js';
@@ -146,6 +146,18 @@ check('no work means nothing is paid', computeShares(1_000n, new Map(), 0n), [])
 check('one wrong answer cancels ten accepted', [unitsFor(25, 1), unitsFor(8, 1), unitsFor(8, 0)], [15, 0, 8]);
 const cfgSplit = loadWorkConfig({ WORK_SPLIT_WORKERS_BPS: '7000', WORK_SPLIT_LOCK_BPS: '5000' });
 check('the split can never exceed the whole', cfgSplit.workersBps + cfgSplit.lockBps <= 10000, true);
+
+// Breaker
+const T0 = new Date('2026-10-05T12:00:00Z');
+const fin = (mins: number, status: string, verdict: string | null = null): FinishedAssignment => ({ jobId: 'j' + mins, status, verdict, endedAt: new Date(T0.getTime() - mins * 60000) });
+check('three bad jobs in a row pause the worker for 15 minutes from the latest',
+  breakerState([fin(2, 'expired'), fin(5, 'submitted', 'wrong'), fin(9, 'expired')], T0).pausedUntil?.toISOString(), '2026-10-05T12:13:00.000Z');
+check('the pause lifts by itself', breakerState([fin(16, 'expired'), fin(20, 'expired'), fin(25, 'expired')], T0).pausedUntil, null);
+check('a good job in between resets the count', breakerState([fin(1, 'expired'), fin(2, 'submitted', 'agreed'), fin(3, 'expired'), fin(4, 'expired')], T0), { pausedUntil: null, consecutiveFailures: 1 });
+check('a split panel is not a failure', breakerState([fin(1, 'submitted', 'split'), fin(2, 'expired'), fin(3, 'expired')], T0).consecutiveFailures, 0);
+check('an answer still waiting on its panel is not a failure', breakerState([fin(1, 'submitted', null), fin(2, 'expired'), fin(3, 'expired')], T0).pausedUntil, null);
+check('a new worker is not paused', breakerState([], T0), { pausedUntil: null, consecutiveFailures: 0 });
+check('default hourly cap', loadWorkConfig({}).maxJobsPerHour, 600);
 
 // Daily record
 const lv = ['a', 'b', 'c', 'd', 'e'].map((j) => leafHash(j, 'h' + j));

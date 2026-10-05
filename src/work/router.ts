@@ -5,6 +5,8 @@
  *   GET  /api/work/feed?limit=50          recently settled jobs, newest first
  *   GET  /api/work/workers?limit=100      slot holders by accepted work
  *   GET  /api/work/slots/:wallet          one agent's slot
+ *   GET  /api/work/workers/:wallet/standing  why a worker is or is not getting work
+ *   GET  /api/work/swarm                  one snapshot of everything, for dashboards and bots (any origin)
  *   GET  /api/work/protocol               message formats, limits and download links for worker authors
  *   POST /api/work/slots/claim            agent wallet binds a worker key to a slot
  *   POST /api/work/jobs/claim             worker takes one job on a lease
@@ -32,7 +34,10 @@ import {
   claimJob,
   claimSlot,
   getFeed,
+  BREAKER_COOLDOWN_MS,
+  BREAKER_FAILURES,
   getSlot,
+  getStanding,
   getStats,
   getWorkers,
   loadWorkConfig,
@@ -41,13 +46,14 @@ import {
   type SettleHooks,
 } from './engine.js';
 import { JOB_KINDS, jobKind } from './kinds.js';
-import { createEpoch, getPayouts, recordLockTx } from './payouts.js';
+import { WRONG_PENALTY, createEpoch, getPayouts, recordLockTx } from './payouts.js';
 import { freezeYesterday, getDayRecord, getJobProof, getUpdates, postUpdate, recordAnchorTx } from './records.js';
 import { WALLET_ACTIVITY_KIND, applyActivityResult, type WalletActivityResult } from './wallet-activity-job.js';
 import { SIGNATURE_WINDOW_MS } from './auth.js';
 import { PUBLIC_API_URL, loadSkill, loadWorkerBundle } from './distribution.js';
 
 const EVIDENCE_INTERVAL_MS = 60 * 60 * 1000;
+const SWARM_TTL_MS = 10 * 1000;
 
 function clampLimit(raw: string | undefined, fallback: number, max: number): number {
   const n = Number(raw);
@@ -99,6 +105,52 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
   router.get('/slots/:wallet', async (c) => {
     const slot = await getSlot(prisma, c.req.param('wallet'));
     return slot ? c.json(slot) : c.json({ error: 'No slot for this wallet' }, 404);
+  });
+
+  router.get('/workers/:wallet/standing', async (c) => {
+    const standing = await getStanding(prisma, cfg, c.req.param('wallet'));
+    return standing ? c.json(standing) : c.json({ error: 'No slot for this wallet' }, 404);
+  });
+
+  // One call for third-party dashboards and bots. Cached briefly, and
+  // readable from any origin, unlike the rest of the API.
+  let swarmCache: { at: number; body: unknown } | null = null;
+  router.get('/swarm', async (c) => {
+    c.header('Access-Control-Allow-Origin', '*');
+    c.header('Cache-Control', 'public, max-age=10');
+    if (!swarmCache || Date.now() - swarmCache.at > SWARM_TTL_MS) {
+      const [stats, feed, workers, payouts, updates] = await Promise.all([
+        getStats(prisma, cfg),
+        getFeed(prisma, 20),
+        getWorkers(prisma, 100),
+        getPayouts(prisma, 2),
+        getUpdates(prisma, 3),
+      ]);
+      swarmCache = {
+        at: Date.now(),
+        body: {
+          ...stats,
+          rules: {
+            panelSize: cfg.panelSize,
+            slotCap: cfg.slotCap,
+            leaseSeconds: cfg.leaseSeconds,
+            maxJobsPerHour: cfg.maxJobsPerHour,
+            breaker: { failures: BREAKER_FAILURES, cooldownMs: BREAKER_COOLDOWN_MS },
+            payout: {
+              workersBps: cfg.workersBps,
+              lockBps: cfg.lockBps,
+              formula: 'worker pool x your units / all units; units = accepted answers - wrong answers x ' + WRONG_PENALTY,
+              minPayoutLamports: cfg.minPayoutLamports,
+            },
+          },
+          workers,
+          feed,
+          payouts,
+          updates,
+        },
+      };
+    }
+    return c.json(swarmCache.body);
   });
 
   router.get('/protocol', async (c) => {

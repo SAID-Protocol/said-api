@@ -271,6 +271,17 @@ async function main() {
     check('the stats carry the agreed transaction count', stats2?.txCount, (indep?.result as any).successCount);
   }
 
+  // ── Standing and the one-call snapshot ──────────────────────────────────
+  const st = (await get(`/api/work/workers/${w3.agent.publicKey.toBase58()}/standing`)).body;
+  check('standing lists the wrong answer with its reason', st.standing.recentFailures.some((f: any) => f.reason === 'wrong_answer' && f.jobId === tamperJob), true);
+  check('one wrong answer does not pause a worker', [st.standing.paused, st.blocked.includes('paused')], [false, false]);
+  check('standing reports limits and the queue', [st.limits.maxLeases, typeof st.queue.eligibleForYou, st.presence.online], [3, 'number', true]);
+  check('standing for a wallet without a slot is 404', (await get(`/api/work/workers/${over.agent.publicKey.toBase58()}/standing`)).status, 404);
+  const swarmRes = await fetch(`${API}/api/work/swarm`, { headers: { Origin: 'https://example.org' } });
+  const swarm = (await swarmRes.json()) as any;
+  check('the snapshot is readable from any origin', swarmRes.headers.get('access-control-allow-origin'), '*');
+  check('the snapshot carries stats, workers, feed and the payout formula', [swarm.open, swarm.workers.length, swarm.feed.length > 0, /units/.test(swarm.rules.payout.formula)], [true, 5, true, true]);
+
   // ── Daily record and announcements ──────────────────────────────────────
   const today = new Date().toISOString().slice(0, 10);
   const record = (await get(`/api/work/records/${today}`)).body;

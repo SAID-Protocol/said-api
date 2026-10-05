@@ -38,6 +38,8 @@ export interface WorkConfig {
   panelSize: number;
   leaseSeconds: number;
   maxLeasesPerWorker: number;
+  /** Ceiling on jobs one worker may take per hour: protects the operator's RPC quota and stops one worker taking the whole board. */
+  maxJobsPerHour: number;
   windowDays: number;
   maxSignatures: number;
   /** The kind new jobs are cut as. Existing jobs keep the kind they were cut with. */
@@ -73,6 +75,7 @@ export function loadWorkConfig(env: NodeJS.ProcessEnv): WorkConfig {
     panelSize: num(env.WORK_PANEL_SIZE, 3, 2, 15),
     leaseSeconds: num(env.WORK_LEASE_SECONDS, 300, 30, 3600),
     maxLeasesPerWorker: num(env.WORK_MAX_LEASES, 3, 1, 20),
+    maxJobsPerHour: num(env.WORK_MAX_JOBS_PER_HOUR, 600, 1, 100000),
     windowDays: num(env.WORK_WINDOW_DAYS, 30, 1, 365),
     maxSignatures: num(env.WORK_MAX_SIGNATURES, 1000, 1, 10000),
     jobBatch: num(env.WORK_JOB_BATCH, 50, 1, 1000),
@@ -201,6 +204,128 @@ export async function relatedWallets(prisma: PrismaClient, wallet: string): Prom
   return { owner: agent.owner, wallets: [...set] };
 }
 
+// ─── Standing ───────────────────────────────────────────────────────────────
+
+// A worker whose last BREAKER_FAILURES jobs all went bad is paused for
+// BREAKER_COOLDOWN_MS from the latest of them. The pause lifts by itself;
+// nothing is stored, it is read off the worker's recent assignments.
+export const BREAKER_FAILURES = 3;
+export const BREAKER_COOLDOWN_MS = 15 * 60 * 1000;
+
+export interface FinishedAssignment {
+  jobId: string;
+  status: string; // submitted | expired
+  verdict: string | null;
+  endedAt: Date;
+}
+
+export type FailureReason = 'lease_expired' | 'wrong_answer';
+
+export function failureReason(a: FinishedAssignment): FailureReason | null {
+  if (a.status === 'expired') return 'lease_expired';
+  if (a.verdict === 'wrong') return 'wrong_answer';
+  return null;
+}
+
+/** Pure: is the breaker open? `recent` is newest first. */
+export function breakerState(recent: FinishedAssignment[], now: Date): { pausedUntil: Date | null; consecutiveFailures: number } {
+  let consecutive = 0;
+  for (const a of recent) {
+    if (failureReason(a) === null) break;
+    consecutive++;
+  }
+  if (consecutive < BREAKER_FAILURES || recent.length === 0) return { pausedUntil: null, consecutiveFailures: consecutive };
+  const until = new Date(recent[0].endedAt.getTime() + BREAKER_COOLDOWN_MS);
+  return { pausedUntil: until > now ? until : null, consecutiveFailures: consecutive };
+}
+
+async function recentFinished(prisma: PrismaClient, wallet: string, now: Date, take: number): Promise<FinishedAssignment[]> {
+  const rows = await prisma.workAssignment.findMany({
+    where: { workerWallet: wallet, OR: [{ status: 'submitted' }, { status: 'expired' }, { status: 'leased', leaseExpiresAt: { lt: now } }] },
+    orderBy: { createdAt: 'desc' },
+    take,
+    select: { jobId: true, status: true, verdict: true, submittedAt: true, leaseExpiresAt: true },
+  });
+  return rows.map((r) => ({
+    jobId: r.jobId,
+    status: r.status === 'leased' ? 'expired' : r.status,
+    verdict: r.verdict,
+    endedAt: r.submittedAt ?? r.leaseExpiresAt,
+  }));
+}
+
+/** Open jobs this worker would be allowed to take right now. */
+async function eligibleJobCount(prisma: PrismaClient, wallet: string, related: { owner: string; wallets: string[] }): Promise<number> {
+  const rows = await prisma.$queryRaw<{ n: bigint }[]>`
+    SELECT count(*) AS n
+    FROM "WorkJob" j
+    WHERE j.status = 'open'
+      AND j."subjectWallet" <> ALL(${related.wallets})
+      AND NOT EXISTS (SELECT 1 FROM "WorkAssignment" a WHERE a."jobId" = j.id AND a."workerWallet" = ${wallet})
+      AND (SELECT count(*) FROM "WorkAssignment" a WHERE a."jobId" = j.id AND a.status <> 'expired') < j."panelSize"
+      AND NOT EXISTS (
+        SELECT 1 FROM "WorkAssignment" a
+        JOIN "Agent" g ON g.wallet = a."workerWallet"
+        WHERE a."jobId" = j.id AND a.status <> 'expired'
+          AND (g.owner = ${related.owner} OR a."workerWallet" = ANY(${related.wallets}))
+      )
+  `;
+  return Number(rows[0]?.n ?? 0);
+}
+
+/**
+ * Everything a worker's operator needs to answer "why am I not getting
+ * work?": the slot, whether it is paused and why, and what is blocking it.
+ */
+export async function getStanding(prisma: PrismaClient, cfg: WorkConfig, wallet: string, now: Date = new Date()) {
+  const slot = await prisma.workSlot.findUnique({ where: { wallet } });
+  if (!slot) return null;
+  const agent = await prisma.agent.findUnique({ where: { wallet }, select: { isVerified: true } });
+  const recent = await recentFinished(prisma, wallet, now, 20);
+  const breaker = breakerState(recent, now);
+  const hourAgo = new Date(now.getTime() - 3600 * 1000);
+  const [usedThisHour, openLeases, openJobs] = await Promise.all([
+    prisma.workAssignment.count({ where: { workerWallet: wallet, createdAt: { gte: hourAgo } } }),
+    prisma.workAssignment.count({ where: { workerWallet: wallet, status: 'leased', leaseExpiresAt: { gte: now } } }),
+    prisma.workJob.count({ where: { status: 'open' } }),
+  ]);
+  const eligible = agent ? await eligibleJobCount(prisma, wallet, await relatedWallets(prisma, wallet)) : 0;
+
+  const blocked: string[] = [];
+  if (!cfg.open) blocked.push('loop_closed');
+  if (slot.status !== 'active') blocked.push('slot_revoked');
+  if (!agent?.isVerified) blocked.push('agent_not_verified');
+  if (breaker.pausedUntil) blocked.push('paused');
+  if (usedThisHour >= cfg.maxJobsPerHour) blocked.push('hourly_cap');
+  if (openLeases >= cfg.maxLeasesPerWorker) blocked.push('open_leases_at_limit');
+  // New jobs are cut when a worker asks and finds none, so this only blocks
+  // when every verified wallet has been checked recently.
+  if (blocked.length === 0 && eligible === 0 && openJobs > 0) blocked.push('no_eligible_jobs');
+
+  return {
+    wallet,
+    number: slot.number,
+    presence: {
+      lastSeenAt: slot.lastSeenAt?.toISOString() ?? null,
+      online: slot.lastSeenAt !== null && now.getTime() - slot.lastSeenAt.getTime() <= ONLINE_WINDOW_MS,
+    },
+    record: { accepted: slot.acceptedCount, disagreed: slot.disagreedCount, wrong: slot.wrongCount },
+    standing: {
+      paused: breaker.pausedUntil !== null,
+      pausedUntil: breaker.pausedUntil?.toISOString() ?? null,
+      consecutiveFailures: breaker.consecutiveFailures,
+      rules: { failures: BREAKER_FAILURES, cooldownMs: BREAKER_COOLDOWN_MS },
+      recentFailures: recent
+        .filter((a) => failureReason(a) !== null)
+        .slice(0, 10)
+        .map((a) => ({ at: a.endedAt.toISOString(), reason: failureReason(a), jobId: a.jobId })),
+    },
+    limits: { openLeases, maxLeases: cfg.maxLeasesPerWorker, usedThisHour, maxJobsPerHour: cfg.maxJobsPerHour },
+    queue: { open: openJobs, eligibleForYou: eligible },
+    blocked,
+  };
+}
+
 // ─── Jobs ───────────────────────────────────────────────────────────────────
 
 // Open jobs are bounded so a board nobody can clear does not grow forever.
@@ -292,6 +417,16 @@ export async function claimJob(prisma: PrismaClient, cfg: WorkConfig, body: JobC
   const live = await prisma.workAssignment.count({ where: { workerWallet: slot.wallet, status: 'leased' } });
   if (live >= cfg.maxLeasesPerWorker) {
     throw new WorkError(429, `Finish or let expire your ${live} open jobs before claiming more`);
+  }
+  const breaker = breakerState(await recentFinished(prisma, slot.wallet, now, BREAKER_FAILURES), now);
+  if (breaker.pausedUntil) {
+    throw new WorkError(429, `Paused until ${breaker.pausedUntil.toISOString()} after ${BREAKER_FAILURES} failed jobs in a row; see your standing for the reasons`);
+  }
+  const usedThisHour = await prisma.workAssignment.count({
+    where: { workerWallet: slot.wallet, createdAt: { gte: new Date(now.getTime() - 3600 * 1000) } },
+  });
+  if (usedThisHour >= cfg.maxJobsPerHour) {
+    throw new WorkError(429, `Hourly limit of ${cfg.maxJobsPerHour} jobs reached; try again later`);
   }
 
   await ensureOpenJobs(prisma, cfg, now);
