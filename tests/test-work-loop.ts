@@ -101,6 +101,7 @@ check('a missing answer breaks the panel', panelAgrees(['h', null, 'h']), false)
 check('an empty panel does not agree', panelAgrees([]), false);
 
 // Config
+check('the loop is closed unless it is switched on', [loadWorkConfig({}).open, loadWorkConfig({ WORK_OPEN: 'yes' }).open, loadWorkConfig({ WORK_OPEN: 'true' }).open], [false, false, true]);
 check('reputation writes are off unless a weight is set', loadWorkConfig({}).evidenceWeight, null);
 check('a set weight turns them on', loadWorkConfig({ WORK_EVIDENCE_WEIGHT: '0.5' }).evidenceWeight, 0.5);
 check('a nonsense weight leaves them off', loadWorkConfig({ WORK_EVIDENCE_WEIGHT: 'lots' }).evidenceWeight, null);

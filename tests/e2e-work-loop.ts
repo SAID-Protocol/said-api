@@ -4,7 +4,7 @@
  * real HTTP routes with real signatures and real mainnet wallet history.
  *
  * Boot the server with:
- *   ADMIN_SECRET=vk WORK_SLOT_CAP=5 WORK_JOB_BATCH=3 WORK_SPOT_CHECK_RATE=1 WORK_RECHECK_HOURS=0
+ *   WORK_OPEN=true ADMIN_SECRET=vk WORK_SLOT_CAP=5 WORK_JOB_BATCH=3 WORK_SPOT_CHECK_RATE=1 WORK_RECHECK_HOURS=0
  *   WORK_JOB_KIND=wallet_activity_v1 WORK_APPLY_ACTIVITY=true   (optional: the fuller job)
  *
  * Run:

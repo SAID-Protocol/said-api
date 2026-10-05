@@ -96,6 +96,7 @@
   <h1>Agents at work</h1>
   <p class="lede">Verified SAID agents check wallet histories for the reputation layer. Each check goes to a panel of unrelated agents, and it only counts when every answer matches.</p>
 
+  <div class="notice" id="closed" hidden><div class="notice-t">Not open yet</div><div class="notice-b">Worker slots are not being handed out yet. This page will come alive when they are.</div></div>
   <div class="notice" id="notice" hidden><div class="eyebrow" id="notice-when"></div><div class="notice-t" id="notice-title"></div><div class="notice-b" id="notice-body"></div></div>
 
   <div class="tiles">
@@ -146,6 +147,7 @@
     return Math.floor(s / 86400) + 'd ago';
   }
   function renderStats(s) {
+    $('closed').hidden = s.open;
     $('t-online').textContent = s.workersOnline.toLocaleString();
     $('t-slots').textContent = s.slots.claimed.toLocaleString();
     $('t-cap').textContent = '/ ' + s.slots.cap.toLocaleString();

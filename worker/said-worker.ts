@@ -277,6 +277,13 @@ async function run(): Promise<void> {
         signature: signMessage(jobClaimMessage(workerKey, ts), worker.secretKey),
       });
       if (claim.status === 401 || claim.status === 403) throw new Error(`not allowed to work: ${claim.body.error}`);
+      if (claim.status === 503) {
+        // Closed for now; check back slowly rather than hammering.
+        log(`${claim.body.error ?? 'not open'}; checking again in 10 minutes`);
+        if (once) return;
+        await sleep(10 * 60 * 1000);
+        continue;
+      }
       if (claim.status !== 200) {
         log(`claim refused (${claim.status}): ${claim.body.error ?? ''}`);
         if (once) return;

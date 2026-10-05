@@ -235,5 +235,7 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
     console.log('[work] WORK_EVIDENCE_WEIGHT not set — work results are stored but not written to reputation');
   }
 
+  if (!cfg.open) console.log('[work] WORK_OPEN is not "true": the work loop is mounted but closed, no slots or jobs can be claimed');
+
   return router;
 }

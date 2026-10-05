@@ -24,7 +24,7 @@ import { WALLET_HISTORY_KIND, isValidSpec, type WalletHistorySpec } from './wall
 
 export class WorkError extends Error {
   constructor(
-    public status: 400 | 401 | 403 | 404 | 409 | 429,
+    public status: 400 | 401 | 403 | 404 | 409 | 429 | 503,
     message: string,
   ) {
     super(message);
@@ -32,6 +32,8 @@ export class WorkError extends Error {
 }
 
 export interface WorkConfig {
+  /** Master switch. Until it is on, nobody can claim a slot or a job; reads still work. */
+  open: boolean;
   slotCap: number;
   panelSize: number;
   leaseSeconds: number;
@@ -65,6 +67,7 @@ export function loadWorkConfig(env: NodeJS.ProcessEnv): WorkConfig {
   const weight = Number(env.WORK_EVIDENCE_WEIGHT);
   const workersBps = num(env.WORK_SPLIT_WORKERS_BPS, 4000, 0, 10000);
   return {
+    open: env.WORK_OPEN === 'true',
     jobKind: jobKind(env.WORK_JOB_KIND ?? '') ? (env.WORK_JOB_KIND as string) : WALLET_HISTORY_KIND,
     slotCap: num(env.WORK_SLOT_CAP, 500, 1, 100000),
     panelSize: num(env.WORK_PANEL_SIZE, 3, 2, 15),
@@ -128,7 +131,10 @@ export interface SlotClaimBody {
   signature?: unknown;
 }
 
+const NOT_OPEN = 'The work loop is not open yet';
+
 export async function claimSlot(prisma: PrismaClient, cfg: WorkConfig, body: SlotClaimBody) {
+  if (!cfg.open) throw new WorkError(503, NOT_OPEN);
   const { wallet, workerKey, timestamp, signature } = body;
   if (!isPubkey(wallet) || !isPubkey(workerKey)) throw new WorkError(400, 'wallet and workerKey must be base58 public keys');
   if (wallet === workerKey) throw new WorkError(400, 'workerKey must be a separate key from the agent wallet');
@@ -261,6 +267,7 @@ export interface JobClaimBody {
 }
 
 export async function claimJob(prisma: PrismaClient, cfg: WorkConfig, body: JobClaimBody, now: Date = new Date()) {
+  if (!cfg.open) throw new WorkError(503, NOT_OPEN);
   const { workerKey, timestamp, signature } = body;
   const slot = await activeSlotForKey(prisma, workerKey);
   if (!isFresh(timestamp)) throw new WorkError(400, 'timestamp must be unix milliseconds within 5 minutes of now');
@@ -580,6 +587,7 @@ export async function getStats(prisma: PrismaClient, cfg: WorkConfig, now: Date 
     prisma.workJob.findMany({ where: { status: 'accepted' }, distinct: ['subjectWallet'], select: { subjectWallet: true } }),
   ]);
   return {
+    open: cfg.open,
     slots: { claimed: slotsClaimed, cap: cfg.slotCap },
     workersOnline,
     panelSize: cfg.panelSize,
