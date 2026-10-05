@@ -14,6 +14,9 @@ import {
 } from '../src/work/wallet-history.js';
 import { isFresh, signMessage, slotClaimMessage, submitMessage, verifyMessage } from '../src/work/auth.js';
 import { loadWorkConfig, panelAgrees } from '../src/work/engine.js';
+import { canonicalActivity, hashActivity, summarizeActivity, type TxView } from '../src/work/wallet-activity-job.js';
+import { jobKind } from '../src/work/kinds.js';
+import { computeShares, unitsFor } from '../src/work/payouts.js';
 
 let failures = 0;
 function check(name: string, got: unknown, want: unknown) {
@@ -101,6 +104,46 @@ check('reputation writes are off unless a weight is set', loadWorkConfig({}).evi
 check('a set weight turns them on', loadWorkConfig({ WORK_EVIDENCE_WEIGHT: '0.5' }).evidenceWeight, 0.5);
 check('a nonsense weight leaves them off', loadWorkConfig({ WORK_EVIDENCE_WEIGHT: 'lots' }).evidenceWeight, null);
 check('defaults: 500 slots, panels of 3', [loadWorkConfig({}).slotCap, loadWorkConfig({}).panelSize], [500, 3]);
+
+// Wallet activity (the fuller job)
+const other = Keypair.generate().publicKey.toBase58();
+const mint = Keypair.generate().publicKey.toBase58();
+const TOKEN = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const view = (o: Partial<TxView>): TxView => ({ accountKeys: [wallet], preBalances: [0], postBalances: [0], instructions: [], ...o });
+const txs = new Map<string, TxView>([
+  ['d', view({ accountKeys: [wallet, other, '11111111111111111111111111111111'], preBalances: [5_000, 0, 1], postBalances: [2_000, 3_000, 1] })],
+  ['b', view({ accountKeys: [other, wallet], preBalances: [9, 1_000], postBalances: [9, 1_500],
+    instructions: [{ programId: TOKEN, parsed: { type: 'initializeMint2', info: { mint, mintAuthority: wallet } } },
+                   { programId: TOKEN, parsed: { type: 'initializeMint', info: { mint: other, mintAuthority: other } } }] })],
+  ['a', view({})],
+]);
+const act = summarizeActivity(sigs, txs, spec);
+check('activity counts only successful transactions', [act.successCount, act.failedCount, act.txCount], [3, 1, 4]);
+check('volume is the absolute balance change, summed', act.volumeLamports, '3500');
+check('counterparties exclude the wallet and the system program', act.uniqueCounterparties, 1);
+check('only mints the wallet initialised are launched mints', act.launchedMints, [mint]);
+check('successful active days ignore failed transactions', act.successActiveDays, 3);
+let threw = false;
+try { summarizeActivity(sigs, new Map([['d', txs.get('d')!]]), spec); } catch { threw = true; }
+check('a missing transaction refuses to answer', threw, true);
+check('a real activity answer survives validation', hashActivity(canonicalActivity(act, spec)!), hashActivity(act));
+check('counts that do not add up are rejected', canonicalActivity({ ...act, successCount: 4 }, spec), null);
+check('unsorted mints are rejected', canonicalActivity({ ...act, launchedMints: ['b', 'a'] }, spec), null);
+check('a non-numeric volume is rejected', canonicalActivity({ ...act, volumeLamports: '1e9' }, spec), null);
+check('a different volume changes the hash', hashActivity({ ...act, volumeLamports: '3501' }) === hashActivity(act), false);
+check('both job kinds resolve, unknown ones do not', [!!jobKind('wallet_history_v1'), !!jobKind('wallet_activity_v1'), jobKind('toString')], [true, true, null]);
+check('an unknown job kind in config falls back', loadWorkConfig({ WORK_JOB_KIND: 'nope' }).jobKind, 'wallet_history_v1');
+
+// Payout shares
+const shares = computeShares(1_000_000_000n, new Map([['a', 30], ['b', 10], ['c', 0]]), 1_000_000n);
+check('shares are proportional', shares.map((x) => [x.wallet, x.lamports.toString()]), [['a', '750000000'], ['b', '250000000'], ['c', '0']]);
+check('a zero share is not payable', shares.find((x) => x.wallet === 'c')!.payable, false);
+check('shares round down and never exceed the pool', computeShares(10n, new Map([['a', 1], ['b', 1], ['c', 1]]), 0n).reduce((t, x) => t + x.lamports, 0n) <= 10n, true);
+check('a share under the minimum is not payable', computeShares(1_500_000n, new Map([['a', 2], ['b', 1]]), 1_000_000n).map((x) => x.payable), [true, false]);
+check('no work means nothing is paid', computeShares(1_000n, new Map(), 0n), []);
+check('one wrong answer cancels ten accepted', [unitsFor(25, 1), unitsFor(8, 1), unitsFor(8, 0)], [15, 0, 8]);
+const cfgSplit = loadWorkConfig({ WORK_SPLIT_WORKERS_BPS: '7000', WORK_SPLIT_LOCK_BPS: '5000' });
+check('the split can never exceed the whole', cfgSplit.workersBps + cfgSplit.lockBps <= 10000, true);
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

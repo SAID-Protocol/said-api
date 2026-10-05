@@ -2,9 +2,8 @@
  * SAID worker — the reference client for the work loop.
  *
  * Runs on the agent operator's own machine, with their own Solana RPC. It
- * takes wallet-history jobs from the SAID API, computes them with the same
- * code the server checks against (src/work/wallet-history.ts), and submits
- * the answer.
+ * takes wallet jobs from the SAID API, computes them with the same code the
+ * server checks against (src/work/kinds.ts), and submits the answer.
  *
  * Shipped to agents as one bundled file (scripts/build-worker.mjs), served by
  * the API at /work/said-worker.cjs. From this repo, run it with
@@ -39,9 +38,9 @@ import { join } from 'path';
 import { Connection, Keypair } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { jobClaimMessage, signMessage, slotClaimMessage, submitMessage } from '../src/work/auth.js';
-import { WALLET_HISTORY_KIND, hashResult, isValidSpec, runWalletHistory } from '../src/work/wallet-history.js';
+import { jobKind } from '../src/work/kinds.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const API = (process.env.SAID_API_URL || 'https://api.saidprotocol.com').replace(/\/+$/, '');
 const RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
 const HOME = process.env.SAID_WORKER_HOME || join(homedir(), '.said-worker');
@@ -178,7 +177,9 @@ async function status(): Promise<void> {
   if (wallet) {
     const slot = await getJson(`/api/work/slots/${wallet}`);
     if (slot.status === 200) {
+      console.log(`worker:     #${slot.body.number}`);
       console.log(`record:     ${slot.body.accepted} accepted, ${slot.body.disagreed} disagreed, ${slot.body.wrong} wrong`);
+      console.log(`paid:       ${(Number(slot.body.paidLamports) / 1e9).toFixed(6)} SOL`);
       if (slot.body.workerKey !== worker?.publicKey.toBase58()) console.log('warning:    the slot is bound to a different worker key; run init again');
     } else {
       console.log('record:     no slot for this wallet');
@@ -252,7 +253,8 @@ async function run(): Promise<void> {
         await sleep((claim.body.retryAfterSeconds ?? 30) * 1000 || IDLE_MS);
         continue;
       }
-      if (a.kind !== WALLET_HISTORY_KIND || !isValidSpec(a.spec)) {
+      const kind = jobKind(a.kind);
+      if (!kind || !kind.isValidSpec(a.spec)) {
         // A job kind this build does not know: let the lease expire.
         log(`skipping job ${a.jobId}: unknown kind ${a.kind}; this worker may be out of date`);
         if (once) return;
@@ -260,8 +262,8 @@ async function run(): Promise<void> {
         continue;
       }
 
-      const result = await runWalletHistory(conn, a.spec);
-      const resultHash = hashResult(result);
+      const result = await kind.run(conn, a.spec);
+      const resultHash = kind.hash(result);
       const sts = Date.now();
       const sub = await post(`/api/work/assignments/${a.id}/submit`, {
         workerKey,

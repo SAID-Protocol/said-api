@@ -74,17 +74,22 @@ export function isValidSpec(spec: unknown): spec is WalletHistorySpec {
   );
 }
 
+/** Pure: the signatures a job covers, newest-first, with the cap applied. */
+export function windowSignatures(sigs: SigInfo[], spec: WalletHistorySpec): { kept: SigInfo[]; truncated: boolean } {
+  const inWindow = sigs.filter(
+    (s) => typeof s.blockTime === 'number' && s.blockTime >= spec.fromTime && s.blockTime < spec.toTime,
+  );
+  const truncated = inWindow.length > spec.maxSignatures;
+  return { kept: truncated ? inWindow.slice(0, spec.maxSignatures) : inWindow, truncated };
+}
+
 /**
  * Pure: turn the signatures of a window into the job result. `sigs` must be
  * newest-first, as the RPC returns them; anything outside the window or
  * without a blockTime is dropped here, so callers may over-supply.
  */
 export function summarize(sigs: SigInfo[], spec: WalletHistorySpec): WalletHistoryResult {
-  const inWindow = sigs.filter(
-    (s) => typeof s.blockTime === 'number' && s.blockTime >= spec.fromTime && s.blockTime < spec.toTime,
-  );
-  const truncated = inWindow.length > spec.maxSignatures;
-  const kept = truncated ? inWindow.slice(0, spec.maxSignatures) : inWindow;
+  const { kept, truncated } = windowSignatures(sigs, spec);
 
   const days = new Set<number>();
   let failedCount = 0;

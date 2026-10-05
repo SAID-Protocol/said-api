@@ -19,14 +19,8 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { PublicKey } from '@solana/web3.js';
 import { isFresh, jobClaimMessage, slotClaimMessage, submitMessage, verifyMessage } from './auth.js';
-import {
-  WALLET_HISTORY_KIND,
-  canonicalResult,
-  hashResult,
-  isValidSpec,
-  type WalletHistoryResult,
-  type WalletHistorySpec,
-} from './wallet-history.js';
+import { jobKind, type JobResult } from './kinds.js';
+import { WALLET_HISTORY_KIND, isValidSpec, type WalletHistorySpec } from './wallet-history.js';
 
 export class WorkError extends Error {
   constructor(
@@ -44,6 +38,8 @@ export interface WorkConfig {
   maxLeasesPerWorker: number;
   windowDays: number;
   maxSignatures: number;
+  /** The kind new jobs are cut as. Existing jobs keep the kind they were cut with. */
+  jobKind: string;
   jobBatch: number;
   jobTtlHours: number;
   recheckHours: number;
@@ -51,6 +47,13 @@ export interface WorkConfig {
   /** Null disables reputation writes entirely. Set from env so the value stays out of the repo. */
   evidenceWeight: number | null;
   evidenceMinAccepted: number;
+  /** Write accepted wallet-activity answers into the API's activity stats. */
+  applyActivity: boolean;
+  /** Share of each period's rewards, in basis points. The remainder is unallocated. */
+  workersBps: number;
+  lockBps: number;
+  /** A share smaller than this is not sent (it would cost more to send than it is worth). */
+  minPayoutLamports: number;
 }
 
 function num(raw: string | undefined, fallback: number, min: number, max: number): number {
@@ -60,7 +63,9 @@ function num(raw: string | undefined, fallback: number, min: number, max: number
 
 export function loadWorkConfig(env: NodeJS.ProcessEnv): WorkConfig {
   const weight = Number(env.WORK_EVIDENCE_WEIGHT);
+  const workersBps = num(env.WORK_SPLIT_WORKERS_BPS, 4000, 0, 10000);
   return {
+    jobKind: jobKind(env.WORK_JOB_KIND ?? '') ? (env.WORK_JOB_KIND as string) : WALLET_HISTORY_KIND,
     slotCap: num(env.WORK_SLOT_CAP, 500, 1, 100000),
     panelSize: num(env.WORK_PANEL_SIZE, 3, 2, 15),
     leaseSeconds: num(env.WORK_LEASE_SECONDS, 300, 30, 3600),
@@ -73,11 +78,21 @@ export function loadWorkConfig(env: NodeJS.ProcessEnv): WorkConfig {
     spotCheckRate: num(env.WORK_SPOT_CHECK_RATE, 0.05, 0, 1),
     evidenceWeight: env.WORK_EVIDENCE_WEIGHT && Number.isFinite(weight) && weight > 0 && weight <= 3 ? weight : null,
     evidenceMinAccepted: num(env.WORK_EVIDENCE_MIN_ACCEPTED, 10, 1, 100000),
+    applyActivity: env.WORK_APPLY_ACTIVITY === 'true',
+    workersBps,
+    lockBps: Math.min(num(env.WORK_SPLIT_LOCK_BPS, 4000, 0, 10000), 10000 - workersBps),
+    minPayoutLamports: num(env.WORK_MIN_PAYOUT_LAMPORTS, 1_000_000, 0, 1e12),
   };
 }
 
 /** Our own run of a job, used to judge panel answers. */
-export type ReferenceRunner = (spec: WalletHistorySpec) => Promise<WalletHistoryResult>;
+export type ReferenceRunner = (kind: string, spec: WalletHistorySpec) => Promise<JobResult>;
+
+export interface SettleHooks {
+  reference: ReferenceRunner | null;
+  /** Called once when a panel agrees, with the agreed answer. */
+  onAccepted?: (job: { id: string; kind: string; result: JobResult }) => Promise<void>;
+}
 
 // Same system wallet the partner outcome door writes from (index.ts).
 const SYSTEM_WALLET = '72onvrQJZkPGLAhWK5MeYc73iyM72P2ABKzDMQ4NpQBL';
@@ -229,7 +244,7 @@ export async function ensureOpenJobs(
     const fromTime = toTime - cfg.windowDays * 86400;
     const created = await tx.workJob.createMany({
       data: wallets.map((wallet) => ({
-        kind: WALLET_HISTORY_KIND,
+        kind: cfg.jobKind,
         subjectWallet: wallet,
         spec: { wallet, fromTime, toTime, maxSignatures: cfg.maxSignatures } satisfies WalletHistorySpec,
         panelSize: cfg.panelSize,
@@ -341,7 +356,7 @@ export async function submitResult(
   cfg: WorkConfig,
   assignmentId: string,
   body: SubmitBody,
-  reference: ReferenceRunner | null,
+  hooks: SettleHooks,
   now: Date = new Date(),
 ) {
   const slot = await activeSlotForKey(prisma, body.workerKey);
@@ -349,12 +364,13 @@ export async function submitResult(
   if (!assignment || assignment.workerWallet !== slot.wallet) throw new WorkError(404, 'No such assignment for this worker');
   if (assignment.status !== 'leased') throw new WorkError(409, `Assignment is already ${assignment.status}`);
   if (assignment.leaseExpiresAt < now) throw new WorkError(409, 'Lease expired');
-  if (!isValidSpec(assignment.job.spec)) throw new WorkError(409, 'Job spec is not readable');
+  const kind = jobKind(assignment.job.kind);
+  if (!kind || !kind.isValidSpec(assignment.job.spec)) throw new WorkError(409, 'Job is not readable');
 
-  const result = canonicalResult(body.result, assignment.job.spec);
+  const result = kind.canonical(body.result, assignment.job.spec);
   if (!result) throw new WorkError(400, 'result is not a well-formed answer to this job');
   // The hash is always ours: a worker cannot claim agreement it did not compute.
-  const resultHash = hashResult(result);
+  const resultHash = kind.hash(result);
 
   if (!isFresh(body.timestamp)) throw new WorkError(400, 'timestamp must be unix milliseconds within 5 minutes of now');
   if (!verifyMessage(submitMessage(assignmentId, resultHash, body.timestamp), body.signature, slot.workerKey)) {
@@ -369,7 +385,7 @@ export async function submitResult(
   if (updated.count === 0) throw new WorkError(409, 'Assignment is no longer open');
   await prisma.workSlot.update({ where: { id: slot.id }, data: { lastSeenAt: now } });
 
-  const jobStatus = await settleIfComplete(prisma, cfg, assignment.jobId, reference, now);
+  const jobStatus = await settleIfComplete(prisma, cfg, assignment.jobId, hooks, now);
   return { resultHash, jobStatus };
 }
 
@@ -382,12 +398,14 @@ async function settleIfComplete(
   prisma: PrismaClient,
   cfg: WorkConfig,
   jobId: string,
-  reference: ReferenceRunner | null,
+  hooks: SettleHooks,
   now: Date,
 ): Promise<string> {
+  const { reference, onAccepted } = hooks;
+  let agreed: { kind: string; result: JobResult } | null = null;
   const status = await prisma.$transaction(async (tx) => {
-    const locked = await tx.$queryRaw<{ status: string; panelSize: number }[]>`
-      SELECT status, "panelSize" FROM "WorkJob" WHERE id = ${jobId} FOR UPDATE
+    const locked = await tx.$queryRaw<{ status: string; panelSize: number; kind: string }[]>`
+      SELECT status, "panelSize", kind FROM "WorkJob" WHERE id = ${jobId} FOR UPDATE
     `;
     const job = locked[0];
     if (!job || job.status !== 'open') return job?.status ?? 'open';
@@ -411,6 +429,7 @@ async function settleIfComplete(
       });
       await tx.workAssignment.updateMany({ where: { jobId, status: 'submitted' }, data: { verdict: 'agreed' } });
       await tx.workSlot.updateMany({ where: { wallet: { in: wallets } }, data: { acceptedCount: { increment: 1 } } });
+      agreed = { kind: job.kind, result: submitted[0].result as unknown as JobResult };
       return 'accepted';
     }
     await tx.workJob.update({ where: { id: jobId }, data: { status: 'disagreed', settledAt: now } });
@@ -418,6 +437,13 @@ async function settleIfComplete(
     await tx.workSlot.updateMany({ where: { wallet: { in: wallets } }, data: { disagreedCount: { increment: 1 } } });
     return 'disagreed';
   });
+
+  const accepted = agreed as { kind: string; result: JobResult } | null;
+  if (accepted && onAccepted) {
+    onAccepted({ id: jobId, ...accepted }).catch((err) =>
+      console.error(`[work] could not apply accepted job ${jobId}:`, err instanceof Error ? err.message : err),
+    );
+  }
 
   const check = status === 'disagreed' || (status === 'accepted' && Math.random() < cfg.spotCheckRate);
   if (reference && check) {
@@ -432,9 +458,10 @@ async function settleIfComplete(
 /** Re-run a settled job ourselves and mark each panel answer against it. */
 export async function applyReference(prisma: PrismaClient, jobId: string, reference: ReferenceRunner): Promise<void> {
   const job = await prisma.workJob.findUnique({ where: { id: jobId } });
-  if (!job || job.referenceHash || !isValidSpec(job.spec)) return;
+  const kind = job ? jobKind(job.kind) : null;
+  if (!job || !kind || job.referenceHash || !kind.isValidSpec(job.spec)) return;
   if (job.status !== 'accepted' && job.status !== 'disagreed') return;
-  const referenceHash = hashResult(await reference(job.spec));
+  const referenceHash = kind.hash(await reference(job.kind, job.spec));
 
   await prisma.$transaction(async (tx) => {
     const claimed = await tx.workJob.updateMany({
@@ -521,7 +548,7 @@ export async function settleDailyEvidence(
           toWallet: wallet,
           score: negative ? EVIDENCE_SCORE_NEGATIVE : EVIDENCE_SCORE_POSITIVE,
           weight: cfg.evidenceWeight,
-          comment: `[${EVIDENCE_SOURCE}] ${WALLET_HISTORY_KIND} ${label}: ${outcome}`,
+          comment: `[${EVIDENCE_SOURCE}] wallet checks ${label}: ${outcome}`,
           signature: `trusted:${EVIDENCE_SOURCE}:${wallet}:${label}`,
           fromIsVerified: true,
           sourceKey: `src:${EVIDENCE_SOURCE}:${wallet}:${label}`,
@@ -559,6 +586,7 @@ export async function getStats(prisma: PrismaClient, cfg: WorkConfig, now: Date 
     jobs: { open, accepted, accepted24h, disagreed24h, overturned },
     walletsChecked: checked.length,
     reputationWrites: cfg.evidenceWeight !== null,
+    rewardSplit: { workersBps: cfg.workersBps, lockBps: cfg.lockBps },
     computedAt: now.toISOString(),
   };
 }
@@ -577,7 +605,7 @@ export async function getFeed(prisma: PrismaClient, limit: number) {
   });
   const names = await namesFor(prisma, jobs.flatMap((j) => [j.subjectWallet, ...j.assignments.map((a) => a.workerWallet)]));
   return jobs.map((j) => {
-    const r = j.status === 'accepted' ? (j.result as Partial<WalletHistoryResult> | null) : null;
+    const r = j.status === 'accepted' ? (j.result as Partial<JobResult> | null) : null;
     return {
       jobId: j.id,
       kind: j.kind,
@@ -599,6 +627,7 @@ export async function getWorkers(prisma: PrismaClient, limit: number, now: Date 
   });
   const names = await namesFor(prisma, slots.map((s) => s.wallet));
   return slots.map((s) => ({
+    number: s.number,
     wallet: s.wallet,
     name: names.get(s.wallet) ?? null,
     accepted: s.acceptedCount,
@@ -612,7 +641,10 @@ export async function getWorkers(prisma: PrismaClient, limit: number, now: Date 
 export async function getSlot(prisma: PrismaClient, wallet: string) {
   const slot = await prisma.workSlot.findUnique({ where: { wallet } });
   if (!slot) return null;
+  const paid = await prisma.workPayout.aggregate({ where: { workerWallet: wallet, status: 'paid' }, _sum: { lamports: true } });
   return {
+    number: slot.number,
+    paidLamports: (paid._sum.lamports ?? 0n).toString(),
     wallet: slot.wallet,
     workerKey: slot.workerKey,
     status: slot.status,

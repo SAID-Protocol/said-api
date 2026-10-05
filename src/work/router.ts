@@ -9,9 +9,13 @@
  *   POST /api/work/slots/claim            agent wallet binds a worker key to a slot
  *   POST /api/work/jobs/claim             worker takes one job on a lease
  *   POST /api/work/assignments/:id/submit worker returns its answer
+ *   GET  /api/work/payouts?limit=12       reward periods and every worker payout
+ *   POST /api/work/admin/epochs           record a reward period (x-admin-secret)
+ *   POST /api/work/admin/epochs/:label/lock  attach the buy-and-lock transaction
  *
  * Reads are public. Writes are signed: the first by the agent wallet, the
- * rest by the worker key (see auth.ts).
+ * rest by the worker key (see auth.ts). Admin routes take the API's admin
+ * secret and answer 404 without it.
  */
 
 import { Hono } from 'hono';
@@ -29,11 +33,13 @@ import {
   loadWorkConfig,
   settleDailyEvidence,
   submitResult,
-  type ReferenceRunner,
+  type SettleHooks,
 } from './engine.js';
+import { JOB_KINDS, jobKind } from './kinds.js';
+import { createEpoch, getPayouts, recordLockTx } from './payouts.js';
+import { WALLET_ACTIVITY_KIND, applyActivityResult, type WalletActivityResult } from './wallet-activity-job.js';
 import { SIGNATURE_WINDOW_MS } from './auth.js';
 import { PUBLIC_API_URL, loadSkill, loadWorkerBundle } from './distribution.js';
-import { WALLET_HISTORY_KIND, runWalletHistory } from './wallet-history.js';
 
 const EVIDENCE_INTERVAL_MS = 60 * 60 * 1000;
 
@@ -59,7 +65,22 @@ function fail(c: Context, err: unknown) {
 export function createWorkRouter(prisma: PrismaClient, connection: Connection): Hono {
   const router = new Hono();
   const cfg = loadWorkConfig(process.env);
-  const reference: ReferenceRunner = (spec) => runWalletHistory(connection, spec);
+  const hooks: SettleHooks = {
+    reference: (kind, spec) => {
+      const k = jobKind(kind);
+      if (!k) throw new Error(`unknown job kind ${kind}`);
+      return k.run(connection, spec);
+    },
+    onAccepted: async (job) => {
+      if (cfg.applyActivity && job.kind === WALLET_ACTIVITY_KIND) {
+        await applyActivityResult(prisma, job.result as WalletActivityResult, cfg.windowDays);
+      }
+    },
+  };
+  const isAdmin = (c: Context) => {
+    const secret = process.env.ADMIN_SECRET;
+    return Boolean(secret) && c.req.header('x-admin-secret') === secret;
+  };
 
   router.get('/stats', async (c) => c.json(await getStats(prisma, cfg)));
 
@@ -79,7 +100,8 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
     return c.json({
       skill: `${PUBLIC_API_URL}/work/skill.md`,
       worker: worker ? { url: `${PUBLIC_API_URL}/work/said-worker.cjs`, sha256: worker.sha256 } : null,
-      jobKinds: [WALLET_HISTORY_KIND],
+      jobKinds: Object.keys(JOB_KINDS),
+      currentJobKind: cfg.jobKind,
       panelSize: cfg.panelSize,
       leaseSeconds: cfg.leaseSeconds,
       maxLeasesPerWorker: cfg.maxLeasesPerWorker,
@@ -112,7 +134,38 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
 
   router.post('/assignments/:id/submit', async (c) => {
     try {
-      return c.json(await submitResult(prisma, cfg, c.req.param('id'), await readJson(c), reference));
+      return c.json(await submitResult(prisma, cfg, c.req.param('id'), await readJson(c), hooks));
+    } catch (err) {
+      return fail(c, err);
+    }
+  });
+
+  router.get('/payouts', async (c) => c.json({ epochs: await getPayouts(prisma, clampLimit(c.req.query('limit'), 12, 52)) }));
+
+  router.post('/admin/epochs', async (c) => {
+    if (!isAdmin(c)) return c.json({ error: 'Not found' }, 404);
+    try {
+      const epoch = await createEpoch(prisma, cfg, await readJson(c));
+      return c.json(
+        {
+          label: epoch.label,
+          workerPoolLamports: epoch.workerPoolLamports.toString(),
+          lockLamports: epoch.lockLamports.toString(),
+          payouts: epoch.payouts.length,
+          pending: epoch.payouts.filter((p) => p.status === 'pending').length,
+        },
+        201,
+      );
+    } catch (err) {
+      return fail(c, err);
+    }
+  });
+
+  router.post('/admin/epochs/:label/lock', async (c) => {
+    if (!isAdmin(c)) return c.json({ error: 'Not found' }, 404);
+    try {
+      const epoch = await recordLockTx(prisma, c.req.param('label'), (await readJson(c)).tx);
+      return c.json({ label: epoch.label, lockTx: epoch.lockTx });
     } catch (err) {
       return fail(c, err);
     }
