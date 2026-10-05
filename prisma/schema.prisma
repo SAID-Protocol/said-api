@@ -906,3 +906,81 @@ model Dispute {
   @@index([claimantWallet, status])
   @@index([status, expiresAt])
 }
+
+// ============================================================
+// Work loop — verified agents do checkable work for the protocol
+// ============================================================
+// A slot is a verified agent's right to work. Jobs go to a panel of
+// unrelated workers whose answers must match exactly; an accepted job is
+// stored here and summarised into the worker's reputation once a day.
+// See src/work/.
+
+model WorkSlot {
+  id String @id @default(cuid())
+
+  wallet String @unique // the verified Agent.wallet that owns the slot
+  // Ed25519 key the worker process signs with. The agent wallet signs once
+  // to bind it, so the wallet key never has to sit on the worker machine.
+  workerKey String @unique
+  status    String @default("active") // active, revoked
+
+  acceptedCount  Int @default(0) // jobs where the whole panel agreed
+  disagreedCount Int @default(0) // jobs where the panel did not agree
+  wrongCount     Int @default(0) // answers our own check contradicted
+
+  claimedAt  DateTime  @default(now())
+  lastSeenAt DateTime?
+
+  @@index([status, lastSeenAt])
+}
+
+model WorkJob {
+  id String @id @default(cuid())
+
+  kind          String // 'wallet_history_v1'
+  subjectWallet String
+  spec          Json // pinned inputs; identical for every panel member
+  panelSize     Int
+
+  // open → accepted | disagreed | overturned (accepted, then contradicted by our check)
+  status     String  @default("open")
+  resultHash String?
+  result     Json?
+
+  // Our own re-run of the job, when one was made.
+  referenceHash String?
+  referenceAt   DateTime?
+
+  createdAt DateTime  @default(now())
+  settledAt DateTime?
+
+  assignments WorkAssignment[]
+
+  @@index([status, createdAt])
+  @@index([subjectWallet, createdAt])
+  @@index([settledAt])
+}
+
+model WorkAssignment {
+  id String @id @default(cuid())
+
+  jobId String
+  job   WorkJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  workerWallet String
+  status       String   @default("leased") // leased, submitted, expired
+  leaseExpiresAt DateTime
+
+  resultHash String?
+  result     Json?
+  // agreed (panel matched) | split (panel did not match) | correct / wrong (vs our check)
+  verdict String?
+
+  createdAt   DateTime  @default(now())
+  submittedAt DateTime?
+
+  @@unique([jobId, workerWallet])
+  @@index([workerWallet, status])
+  @@index([workerWallet, submittedAt])
+  @@index([status, leaseExpiresAt])
+}

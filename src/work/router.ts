@@ -1,0 +1,133 @@
+/**
+ * Work loop — HTTP surface.
+ *
+ *   GET  /api/work/stats                  slots, workers online, job counts
+ *   GET  /api/work/feed?limit=50          recently settled jobs, newest first
+ *   GET  /api/work/workers?limit=100      slot holders by accepted work
+ *   GET  /api/work/slots/:wallet          one agent's slot
+ *   GET  /api/work/protocol               message formats and limits for worker authors
+ *   POST /api/work/slots/claim            agent wallet binds a worker key to a slot
+ *   POST /api/work/jobs/claim             worker takes one job on a lease
+ *   POST /api/work/assignments/:id/submit worker returns its answer
+ *
+ * Reads are public. Writes are signed: the first by the agent wallet, the
+ * rest by the worker key (see auth.ts).
+ */
+
+import { Hono } from 'hono';
+import type { Context } from 'hono';
+import type { PrismaClient } from '@prisma/client';
+import type { Connection } from '@solana/web3.js';
+import {
+  WorkError,
+  claimJob,
+  claimSlot,
+  getFeed,
+  getSlot,
+  getStats,
+  getWorkers,
+  loadWorkConfig,
+  settleDailyEvidence,
+  submitResult,
+  type ReferenceRunner,
+} from './engine.js';
+import { SIGNATURE_WINDOW_MS } from './auth.js';
+import { WALLET_HISTORY_KIND, runWalletHistory } from './wallet-history.js';
+
+const EVIDENCE_INTERVAL_MS = 60 * 60 * 1000;
+
+function clampLimit(raw: string | undefined, fallback: number, max: number): number {
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? Math.min(n, max) : fallback;
+}
+
+async function readJson(c: Context): Promise<Record<string, unknown>> {
+  try {
+    const body = await c.req.json();
+    return body !== null && typeof body === 'object' ? (body as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function fail(c: Context, err: unknown) {
+  if (err instanceof WorkError) return c.json({ error: err.message }, err.status);
+  throw err;
+}
+
+export function createWorkRouter(prisma: PrismaClient, connection: Connection): Hono {
+  const router = new Hono();
+  const cfg = loadWorkConfig(process.env);
+  const reference: ReferenceRunner = (spec) => runWalletHistory(connection, spec);
+
+  router.get('/stats', async (c) => c.json(await getStats(prisma, cfg)));
+
+  router.get('/feed', async (c) => c.json({ jobs: await getFeed(prisma, clampLimit(c.req.query('limit'), 50, 200)) }));
+
+  router.get('/workers', async (c) =>
+    c.json({ workers: await getWorkers(prisma, clampLimit(c.req.query('limit'), 100, 500)) }),
+  );
+
+  router.get('/slots/:wallet', async (c) => {
+    const slot = await getSlot(prisma, c.req.param('wallet'));
+    return slot ? c.json(slot) : c.json({ error: 'No slot for this wallet' }, 404);
+  });
+
+  router.get('/protocol', (c) =>
+    c.json({
+      jobKinds: [WALLET_HISTORY_KIND],
+      panelSize: cfg.panelSize,
+      leaseSeconds: cfg.leaseSeconds,
+      maxLeasesPerWorker: cfg.maxLeasesPerWorker,
+      signatureWindowMs: SIGNATURE_WINDOW_MS,
+      messages: {
+        claimSlot: 'SAID:work:claim-slot:<wallet>:<workerKey>:<timestamp>  (signed by the agent wallet)',
+        claimJob: 'SAID:work:claim-job:<workerKey>:<timestamp>  (signed by the worker key)',
+        submit: 'SAID:work:submit:<assignmentId>:<resultHash>:<timestamp>  (signed by the worker key)',
+      },
+      notes: 'Signatures are base58 Ed25519. Timestamps are unix milliseconds. Reference worker: worker/said-worker.ts.',
+    }),
+  );
+
+  router.post('/slots/claim', async (c) => {
+    try {
+      const { slot, created } = await claimSlot(prisma, cfg, await readJson(c));
+      return c.json({ wallet: slot.wallet, workerKey: slot.workerKey, claimedAt: slot.claimedAt.toISOString(), created }, created ? 201 : 200);
+    } catch (err) {
+      return fail(c, err);
+    }
+  });
+
+  router.post('/jobs/claim', async (c) => {
+    try {
+      return c.json(await claimJob(prisma, cfg, await readJson(c)));
+    } catch (err) {
+      return fail(c, err);
+    }
+  });
+
+  router.post('/assignments/:id/submit', async (c) => {
+    try {
+      return c.json(await submitResult(prisma, cfg, c.req.param('id'), await readJson(c), reference));
+    } catch (err) {
+      return fail(c, err);
+    }
+  });
+
+  // Daily reputation rows. Hourly so a restart never skips a day; each run
+  // re-settles yesterday, and the sourceKey makes repeats a no-op.
+  if (cfg.evidenceWeight !== null) {
+    const tick = () =>
+      settleDailyEvidence(prisma, cfg, new Date(Date.now() - 86400 * 1000))
+        .then((r) => {
+          if (r.positive || r.negative) console.log(`[work] reputation rows for ${r.day}: +${r.positive} / -${r.negative}`);
+        })
+        .catch((err) => console.error('[work] daily reputation settle failed:', err instanceof Error ? err.message : err));
+    tick();
+    setInterval(tick, EVIDENCE_INTERVAL_MS);
+  } else {
+    console.log('[work] WORK_EVIDENCE_WEIGHT not set — work results are stored but not written to reputation');
+  }
+
+  return router;
+}

@@ -46,6 +46,7 @@ import { createTrustCrisisRouter } from './trust-crisis.js';
 import { createAgentMetadataRouter } from './agent-metadata.js';
 import { createAssetPassportRouter } from './asset-passport/router.js';
 import { getRegistry as warmAssetRegistry } from './asset-passport/issuers.js';
+import { createWorkRouter } from './work/router.js';
 
 /**
  * Compute reputationScore from raw feedback rows using a Bayesian
@@ -160,11 +161,15 @@ const RATE_WINDOW = 60_000; // 1 minute
 
 // Static, cacheable pages are never rate limited: a shared office or carrier
 // IP must not lose the checker page itself because of other traffic.
-const RATE_LIMIT_EXEMPT = new Set(['/check', '/check-card.png', '/favicon.ico', '/health']);
+const RATE_LIMIT_EXEMPT = new Set(['/check', '/check-card.png', '/work', '/favicon.ico', '/health']);
 // The public asset passport is cached and cheap, and a shared link fans out
 // from a single IP (link-preview fetchers, NAT), so it has its own budget.
 const ASSET_RATE_LIMIT = 300;
 const assetRateLimitMap = new Map<string, { count: number; resetAt: number }>();
+// Workers claim and submit in a loop, and several can sit behind one IP, so
+// the work loop has its own budget too.
+const WORK_RATE_LIMIT = 600;
+const workRateLimitMap = new Map<string, { count: number; resetAt: number }>();
 
 app.use('/*', async (c, next) => {
   const path = c.req.path;
@@ -175,8 +180,9 @@ app.use('/*', async (c, next) => {
   
   const now = Date.now();
   const isAsset = path.startsWith('/api/asset/');
-  const map = isAsset ? assetRateLimitMap : rateLimitMap;
-  const limit = isAsset ? ASSET_RATE_LIMIT : RATE_LIMIT;
+  const isWork = path.startsWith('/api/work/');
+  const map = isAsset ? assetRateLimitMap : isWork ? workRateLimitMap : rateLimitMap;
+  const limit = isAsset ? ASSET_RATE_LIMIT : isWork ? WORK_RATE_LIMIT : RATE_LIMIT;
   const entry = map.get(ip);
   
   if (!entry || now > entry.resetAt) {
@@ -184,14 +190,14 @@ app.use('/*', async (c, next) => {
   } else {
     entry.count++;
     if (entry.count > limit) {
-      console.warn(`[rate-limit] IP ${ip} exceeded ${limit} req/min on ${isAsset ? '/api/asset' : 'api'}`);
+      console.warn(`[rate-limit] IP ${ip} exceeded ${limit} req/min on ${isAsset ? '/api/asset' : isWork ? '/api/work' : 'api'}`);
       return c.json({ error: 'Too many requests. Please slow down.' }, 429);
     }
   }
   
   // Cleanup old entries every 5 minutes
   if (Math.random() < 0.01) {
-    for (const m of [rateLimitMap, assetRateLimitMap]) for (const [key, val] of m) {
+    for (const m of [rateLimitMap, assetRateLimitMap, workRateLimitMap]) for (const [key, val] of m) {
       if (now > val.resetAt) m.delete(key);
     }
   }
@@ -9235,6 +9241,22 @@ console.log('✅ Asset passport mounted (GET /api/asset/:mint, /search, /imperso
 warmAssetRegistry()
   .then((reg) => console.log(`✅ Asset registry warm: ${reg.counts.total} assets, ${reg.counts.withReserve} with reserves${reg.errors.length ? ` (source errors: ${reg.errors.join('; ')})` : ''}`))
   .catch((err) => console.error('⚠️  Asset registry failed to warm; it will retry on first request:', err instanceof Error ? err.message : err));
+
+// Mount the work loop (verified agents do checkable work in panels; public feed)
+app.route('/api/work', createWorkRouter(prisma, connection));
+console.log('✅ Work loop mounted (GET /api/work/stats, /feed, /workers; POST /slots/claim, /jobs/claim, /assignments/:id/submit)');
+
+// The public live feed page for the work loop.
+app.get('/work', async (c) => {
+  try {
+    const path = await import('path');
+    const html = await fs.readFile(path.join(process.cwd(), 'public', 'work.html'), 'utf8');
+    c.header('Cache-Control', 'public, max-age=300');
+    return c.html(html);
+  } catch {
+    return c.text('', 404);
+  }
+});
 
 // Mount Trust Crisis endpoint (ERC-8004 comparison + economic trust verdict)
 app.route(
