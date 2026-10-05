@@ -19,6 +19,7 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { PublicKey } from '@solana/web3.js';
 import { isFresh, jobClaimMessage, slotClaimMessage, submitMessage, verifyMessage } from './auth.js';
+import { getV8Reputation } from '../reputation-v0.8/read.js';
 import { jobKind, type JobResult } from './kinds.js';
 import { WALLET_HISTORY_KIND, isValidSpec, type WalletHistorySpec } from './wallet-history.js';
 
@@ -62,6 +63,12 @@ export interface WorkConfig {
   ipSeparation: boolean;
   /** Funding wallets too common to mean "same operator" (a sponsor wallet, an exchange). */
   commonFunders: Set<string>;
+  /**
+   * Pay rate per reputation tier, in percent of the base rate. Empty means
+   * every worker is paid at the same rate. Set with WORK_TIER_RATES, e.g.
+   * "silver:110,gold:125,platinum:150".
+   */
+  tierRates: Record<string, number>;
   /** A share smaller than this is not sent (it would cost more to send than it is worth). */
   minPayoutLamports: number;
 }
@@ -69,6 +76,31 @@ export interface WorkConfig {
 function num(raw: string | undefined, fallback: number, min: number, max: number): number {
   const n = Number(raw);
   return raw !== undefined && raw !== '' && Number.isFinite(n) && n >= min && n <= max ? n : fallback;
+}
+
+// A rate can lower pay as well as raise it, within these bounds, so that no
+// tier is ever paid nothing and none can swallow the pool.
+const MIN_RATE_PCT = 25;
+const MAX_RATE_PCT = 300;
+const RATEABLE_TIERS = new Set(['unranked', 'bronze', 'silver', 'gold', 'platinum', 'flagged']);
+
+export function parseTierRates(raw: string | undefined): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const entry of (raw ?? '').split(',')) {
+    const [tier, value] = entry.split(':').map((p) => p.trim().toLowerCase());
+    const pct = Number(value);
+    if (!tier || !RATEABLE_TIERS.has(tier) || !Number.isInteger(pct) || pct < MIN_RATE_PCT || pct > MAX_RATE_PCT) {
+      if (entry.trim()) console.error(`[work] ignoring WORK_TIER_RATES entry "${entry.trim()}" (tier:percent, ${MIN_RATE_PCT}-${MAX_RATE_PCT})`);
+      continue;
+    }
+    out[tier] = pct;
+  }
+  return out;
+}
+
+/** The pay rate for a tier, in percent of base. 100 unless a rate was set for it. */
+export function rateFor(cfg: Pick<WorkConfig, 'tierRates'>, tier: string): number {
+  return cfg.tierRates[tier] ?? 100;
 }
 
 export function loadWorkConfig(env: NodeJS.ProcessEnv): WorkConfig {
@@ -91,6 +123,7 @@ export function loadWorkConfig(env: NodeJS.ProcessEnv): WorkConfig {
     evidenceWeight: env.WORK_EVIDENCE_WEIGHT && Number.isFinite(weight) && weight > 0 && weight <= 3 ? weight : null,
     evidenceMinAccepted: num(env.WORK_EVIDENCE_MIN_ACCEPTED, 10, 1, 100000),
     applyActivity: env.WORK_APPLY_ACTIVITY === 'true',
+    tierRates: parseTierRates(env.WORK_TIER_RATES),
     maxSlotsPerOwner: num(env.WORK_MAX_SLOTS_PER_OWNER, 3, 1, 1000),
     ipSeparation: env.WORK_IP_SEPARATION !== 'false',
     commonFunders: new Set((env.WORK_COMMON_FUNDERS ?? '').split(',').map((w) => w.trim()).filter(Boolean)),
@@ -345,6 +378,7 @@ export async function getStanding(prisma: PrismaClient, cfg: WorkConfig, wallet:
   ]);
   const eligible = agent ? await eligibleJobCount(prisma, wallet, await relatedWallets(prisma, wallet, cfg)) : 0;
   const sameOperator = (await sameOperatorSlots(prisma, cfg, wallet)).length;
+  const tier = (await getV8Reputation(prisma, wallet)).tier;
 
   const blocked: string[] = [];
   if (!cfg.open) blocked.push('loop_closed');
@@ -365,6 +399,8 @@ export async function getStanding(prisma: PrismaClient, cfg: WorkConfig, wallet:
       online: slot.lastSeenAt !== null && now.getTime() - slot.lastSeenAt.getTime() <= ONLINE_WINDOW_MS,
     },
     record: { accepted: slot.acceptedCount, disagreed: slot.disagreedCount, wrong: slot.wrongCount },
+    // What this worker's accepted work is paid at, from its reputation tier.
+    pay: { tier, ratePct: rateFor(cfg, tier), ratesByTier: cfg.tierRates },
     standing: {
       paused: breaker.pausedUntil !== null,
       pausedUntil: breaker.pausedUntil?.toISOString() ?? null,

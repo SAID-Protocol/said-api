@@ -303,7 +303,7 @@ async function main() {
   const swarmRes = await fetch(`${API}/api/work/swarm`, { headers: { Origin: 'https://example.org' } });
   const swarm = (await swarmRes.json()) as any;
   check('the snapshot is readable from any origin', swarmRes.headers.get('access-control-allow-origin'), '*');
-  check('the snapshot carries stats, workers, feed and the payout formula', [swarm.open, swarm.workers.length, swarm.feed.length > 0, /units/.test(swarm.rules.payout.formula)], [true, 7, true, true]);
+  check('the snapshot carries stats, workers, feed and the payout formula', [swarm.open, swarm.workers.length, swarm.feed.length > 0, /tier rate/.test(swarm.rules.payout.formula)], [true, 7, true, true]);
 
   // ── Daily record and announcements ──────────────────────────────────────
   const today = new Date().toISOString().slice(0, 10);
@@ -341,6 +341,9 @@ async function main() {
   const pay = (wallet: string) => ep.payouts.find((p: any) => p.wallet === wallet);
   check('the worker with a wrong answer is paid nothing', [pay(w3.agent.publicKey.toBase58()).lamports, pay(w3.agent.publicKey.toBase58()).status], ['0', 'skipped']);
   check('honest workers have a pending payout', [pay(w1Wallet).status, BigInt(pay(w1Wallet).lamports) > 0n], ['pending', true]);
+  check('with no tier rates set, every payout is at the base rate', ep.payouts.every((p: any) => p.ratePct === 100 && p.tier === 'unranked'), true);
+  const standingPay = (await get(`/api/work/workers/${w1Wallet}/standing`)).body.pay;
+  check('standing shows the worker its tier and rate', [standingPay.tier, standingPay.ratePct], ['unranked', 100]);
   const sum = ep.payouts.reduce((a: bigint, p: any) => a + BigInt(p.lamports), 0n);
   check('payouts never exceed the worker pool', sum <= 400000000n && sum > 399999000n, true);
   const expected = computeShares(400000000n, new Map(ep.payouts.map((p: any) => [p.wallet, Math.max(0, p.good - 10 * p.wrong)])), 1000000n);

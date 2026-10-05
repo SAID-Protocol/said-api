@@ -220,6 +220,7 @@ async function status(): Promise<void> {
     if (st.status === 200) {
       const b: string[] = st.body.blocked ?? [];
       console.log(`getting work: ${b.length ? `no (${b.join(', ')})` : `yes (${st.body.queue.eligibleForYou} jobs open to you)`}`);
+      if (st.body.pay) console.log(`pay rate:   ${st.body.pay.ratePct}% of base (reputation tier: ${st.body.pay.tier})`);
       if (st.body.standing.paused) console.log(`paused until: ${st.body.standing.pausedUntil}`);
       for (const f of (st.body.standing.recentFailures ?? []).slice(0, 3)) console.log(`failed:     ${f.at} ${f.reason} (job ${f.jobId})`);
     }

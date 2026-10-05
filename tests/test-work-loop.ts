@@ -13,7 +13,7 @@ import {
   type WalletHistorySpec,
 } from '../src/work/wallet-history.js';
 import { isFresh, signMessage, slotClaimMessage, submitMessage, verifyMessage } from '../src/work/auth.js';
-import { breakerState, loadWorkConfig, panelAgrees, type FinishedAssignment } from '../src/work/engine.js';
+import { breakerState, loadWorkConfig, panelAgrees, parseTierRates, rateFor, type FinishedAssignment } from '../src/work/engine.js';
 import { canonicalActivity, hashActivity, summarizeActivity, type TxView } from '../src/work/wallet-activity-job.js';
 import { jobKind } from '../src/work/kinds.js';
 import { computeShares, unitsFor } from '../src/work/payouts.js';
@@ -144,6 +144,15 @@ check('shares round down and never exceed the pool', computeShares(10n, new Map(
 check('a share under the minimum is not payable', computeShares(1_500_000n, new Map([['a', 2], ['b', 1]]), 1_000_000n).map((x) => x.payable), [true, false]);
 check('no work means nothing is paid', computeShares(1_000n, new Map(), 0n), []);
 check('one wrong answer cancels ten accepted', [unitsFor(25, 1), unitsFor(8, 1), unitsFor(8, 0)], [15, 0, 8]);
+// Reputation-tier pay rates
+check('with no rates set, every tier is paid the base rate', [loadWorkConfig({}).tierRates, rateFor(loadWorkConfig({}), 'platinum')], [{}, 100]);
+const rated = loadWorkConfig({ WORK_TIER_RATES: 'silver:110, gold:125,platinum:150' });
+check('rates are read per tier', [rateFor(rated, 'gold'), rateFor(rated, 'platinum'), rateFor(rated, 'bronze'), rateFor(rated, 'unranked')], [125, 150, 100, 100]);
+check('a rate outside 25-300, an unknown tier or a non-number is ignored', parseTierRates('gold:900,diamond:150,silver:lots,bronze:0,flagged:25'), { flagged: 25 });
+const sameWork = new Map([['newcomer', 40 * rateFor(rated, 'unranked')], ['veteran', 40 * rateFor(rated, 'platinum')]]);
+check('equal work at a higher tier earns a larger share', computeShares(1_000_000_000n, sameWork, 0n).map((x) => [x.wallet, x.lamports.toString()]), [['veteran', '600000000'], ['newcomer', '400000000']]);
+check('a wrong answer still costs the same at any tier', unitsFor(5, 1) * rateFor(rated, 'platinum'), 0);
+
 const cfgSplit = loadWorkConfig({ WORK_SPLIT_WORKERS_BPS: '7000', WORK_SPLIT_LOCK_BPS: '5000' });
 check('the split can never exceed the whole', cfgSplit.workersBps + cfgSplit.lockBps <= 10000, true);
 

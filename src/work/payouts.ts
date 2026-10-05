@@ -9,7 +9,8 @@
  */
 
 import type { PrismaClient } from '@prisma/client';
-import { WorkError, type WorkConfig } from './engine.js';
+import { getV8ReputationBatch } from '../reputation-v0.8/read.js';
+import { WorkError, rateFor, type WorkConfig } from './engine.js';
 
 // One answer our own check contradicted cancels this many accepted ones.
 export const WRONG_PENALTY = 10;
@@ -82,7 +83,11 @@ export async function createEpoch(prisma: PrismaClient, cfg: WorkConfig, input: 
 
   const workerPool = (rewards * BigInt(cfg.workersBps)) / 10000n;
   const lock = (rewards * BigInt(cfg.lockBps)) / 10000n;
-  const units = new Map([...counts].map(([w, c]) => [w, unitsFor(c.good, c.wrong)] as const));
+  // Each worker's tier is read now and kept on its payout row, so a later
+  // change of tier never rewrites a period that has been recorded.
+  const tiers = Object.keys(cfg.tierRates).length ? await tiersFor(prisma, [...counts.keys()]) : new Map<string, string>();
+  const tierOf = (w: string) => tiers.get(w) ?? 'unranked';
+  const units = new Map([...counts].map(([w, c]) => [w, unitsFor(c.good, c.wrong) * rateFor(cfg, tierOf(w))] as const));
   const shares = computeShares(workerPool, units, BigInt(cfg.minPayoutLamports));
 
   return prisma.workEpoch.create({
@@ -95,13 +100,15 @@ export async function createEpoch(prisma: PrismaClient, cfg: WorkConfig, input: 
       lockBps: cfg.lockBps,
       workerPoolLamports: workerPool,
       lockLamports: lock,
-      acceptedUnits: shares.reduce((a, s) => a + s.units, 0),
+      acceptedUnits: BigInt(shares.reduce((a, s) => a + s.units, 0)),
       payouts: {
         create: shares.map((s) => ({
           workerWallet: s.wallet,
           goodCount: counts.get(s.wallet)!.good,
           wrongCount: counts.get(s.wallet)!.wrong,
-          units: s.units,
+          tier: tierOf(s.wallet),
+          ratePct: rateFor(cfg, tierOf(s.wallet)),
+          units: BigInt(s.units),
           lamports: s.lamports,
           status: s.payable ? 'pending' : 'skipped',
         })),
@@ -109,6 +116,13 @@ export async function createEpoch(prisma: PrismaClient, cfg: WorkConfig, input: 
     },
     include: { payouts: true },
   });
+}
+
+async function tiersFor(prisma: PrismaClient, wallets: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const batch = await getV8ReputationBatch(prisma, wallets);
+  for (const w of wallets) out.set(w, batch.get(w)?.tier ?? 'unranked');
+  return out;
 }
 
 export async function recordLockTx(prisma: PrismaClient, label: string, tx: unknown) {
@@ -145,6 +159,8 @@ export async function getPayouts(prisma: PrismaClient, limit: number) {
       name: names.get(p.workerWallet) ?? null,
       good: p.goodCount,
       wrong: p.wrongCount,
+      tier: p.tier,
+      ratePct: p.ratePct,
       lamports: p.lamports.toString(),
       status: p.status,
       tx: p.txSignature,

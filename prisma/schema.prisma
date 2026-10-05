@@ -1012,7 +1012,7 @@ model WorkEpoch {
   lockLamports       BigInt // rewards × lockBps, used to buy and lock the token
   lockTx             String? // the buy-and-lock transaction, once made
 
-  acceptedUnits Int // total worker units the pool was split across
+  acceptedUnits BigInt // total worker units the pool was split across
   createdAt     DateTime @default(now())
 
   payouts WorkPayout[]
@@ -1029,7 +1029,11 @@ model WorkPayout {
   workerWallet String
   goodCount    Int // answers the panel or our check agreed with
   wrongCount   Int // answers our check contradicted
-  units        Int // what the share was computed from
+  // Reputation tier at the time the period was recorded, and the pay rate it
+  // carried (100 = the base rate).
+  tier    String @default("unranked")
+  ratePct Int    @default(100)
+  units   BigInt // (good − penalties) × ratePct: what the share was computed from
   lamports     BigInt
 
   // pending → sending → paid; skipped = below the minimum worth sending

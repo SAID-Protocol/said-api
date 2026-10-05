@@ -156,7 +156,9 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
             payout: {
               workersBps: cfg.workersBps,
               lockBps: cfg.lockBps,
-              formula: 'worker pool x your units / all units; units = accepted answers - wrong answers x ' + WRONG_PENALTY,
+              formula: '(accepted answers - wrong answers x ' + WRONG_PENALTY + ') x your tier rate, as a share of all workers\' totals, times the worker pool',
+              // Percent of the base rate per reputation tier; a tier not listed is paid at 100.
+              tierRates: cfg.tierRates,
               minPayoutLamports: cfg.minPayoutLamports,
             },
           },
