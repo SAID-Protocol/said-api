@@ -21,6 +21,7 @@
 import { createHash } from 'crypto';
 import { Connection, PublicKey } from '@solana/web3.js';
 import type { PrismaClient } from '@prisma/client';
+import { isPubkey } from './auth.js';
 import {
   fetchWindowSignatures,
   summarize,
@@ -193,16 +194,6 @@ const ACTIVITY_KEYS: Array<keyof WalletActivityResult> = [
   'uniqueCounterparties',
   'launchedMints',
 ];
-
-function isPubkey(s: unknown): s is string {
-  if (typeof s !== 'string') return false;
-  try {
-    new PublicKey(s);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 /** Validate an untrusted answer and rebuild it with exactly the known keys. */
 export function canonicalActivity(input: unknown, spec: WalletHistorySpec): WalletActivityResult | null {

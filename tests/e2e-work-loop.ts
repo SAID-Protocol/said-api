@@ -44,7 +44,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function post(path: string, body: unknown, ip?: string) {
   const res = await fetch(`${API}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(ip ? { 'x-real-ip': ip } : {}) },
+    headers: { 'Content-Type': 'application/json', ...(ip ? { 'x-forwarded-for': `1.2.3.4, ${ip}` } : {}) },
     body: JSON.stringify(body),
   });
   return { status: res.status, body: (await res.json().catch(() => ({}))) as any };
@@ -356,10 +356,13 @@ async function main() {
   const cfg = loadWorkConfig({ WORK_EVIDENCE_WEIGHT: '0.5', WORK_EVIDENCE_MIN_ACCEPTED: '1' });
   const offRun = await settleDailyEvidence(prisma, loadWorkConfig({}), new Date());
   check('with no weight set, nothing is written', [offRun.enabled, offRun.positive, offRun.negative], [false, 0, 0]);
-  const first = await settleDailyEvidence(prisma, cfg, new Date());
+  const early = await settleDailyEvidence(prisma, cfg, new Date());
+  check('a day is not settled until six hours after it ends', [early.positive, early.negative, early.skipped], [0, 0, -1]);
+  const later = new Date(Date.now() + 31 * 3600e3); // tomorrow, well past the margin
+  const first = await settleDailyEvidence(prisma, cfg, new Date(), later);
   check('one positive row per honest worker', first.positive >= 2, true);
   check('one negative row for the worker with a wrong answer', first.negative, 1);
-  const again = await settleDailyEvidence(prisma, cfg, new Date());
+  const again = await settleDailyEvidence(prisma, cfg, new Date(), later);
   check('running it again writes nothing new', [again.positive, again.negative], [0, 0]);
   const rows = await prisma.feedback.findMany({ where: { sourceKey: { startsWith: 'src:said-work:' } }, select: { toWallet: true, score: true, weight: true } });
   check('the wrong-answer worker gets the negative score', rows.find((r) => r.toWallet === w3.agent.publicKey.toBase58())?.score, 20);

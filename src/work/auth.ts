@@ -12,6 +12,21 @@
 
 import nacl from 'tweetnacl';
 import bs58 from 'bs58';
+import { PublicKey } from '@solana/web3.js';
+
+/** A base58 Solana public key. */
+export function isPubkey(s: unknown): s is string {
+  if (typeof s !== 'string') return false;
+  try {
+    new PublicKey(s);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** A base58 Solana transaction signature. */
+export const TX_SIGNATURE_RE = /^[1-9A-HJ-NP-Za-km-z]{64,90}$/;
 
 export const SIGNATURE_WINDOW_MS = 5 * 60 * 1000;
 

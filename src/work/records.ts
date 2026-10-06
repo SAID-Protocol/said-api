@@ -9,6 +9,7 @@
 
 import { createHash } from 'crypto';
 import type { PrismaClient } from '@prisma/client';
+import { TX_SIGNATURE_RE } from './auth.js';
 import { WorkError } from './engine.js';
 
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -69,15 +70,19 @@ function dayBounds(day: string): { start: Date; end: Date } {
   return { start, end: new Date(start.getTime() + 86400 * 1000) };
 }
 
-/** The day's accepted jobs, in a fixed order (by job id). */
+/**
+ * The day's accepted jobs, in a fixed order (by job id). A job overturned
+ * after the day closed stays in the list, with its status, so the frozen
+ * root still matches and every other job's proof still verifies.
+ */
 async function dayLeaves(prisma: PrismaClient, day: string) {
   const { start, end } = dayBounds(day);
   const jobs = await prisma.workJob.findMany({
-    where: { status: 'accepted', settledAt: { gte: start, lt: end }, resultHash: { not: null } },
+    where: { status: { in: ['accepted', 'overturned'] }, settledAt: { gte: start, lt: end }, resultHash: { not: null } },
     orderBy: { id: 'asc' },
-    select: { id: true, resultHash: true, subjectWallet: true, kind: true },
+    select: { id: true, resultHash: true, subjectWallet: true, kind: true, status: true },
   });
-  return jobs.map((j) => ({ jobId: j.id, kind: j.kind, subject: j.subjectWallet, resultHash: j.resultHash as string, leaf: leafHash(j.id, j.resultHash as string) }));
+  return jobs.map((j) => ({ jobId: j.id, kind: j.kind, subject: j.subjectWallet, status: j.status, resultHash: j.resultHash as string, leaf: leafHash(j.id, j.resultHash as string) }));
 }
 
 /** The record for one UTC day. A day that has ended is frozen on first read. */
@@ -96,7 +101,7 @@ export async function getDayRecord(prisma: PrismaClient, day: string, now: Date 
     root: frozen?.root ?? merkleRoot(leaves.map((l) => l.leaf)),
     count: frozen?.count ?? leaves.length,
     anchorTx: frozen?.anchorTx ?? null,
-    leaves: leaves.map(({ jobId, kind, subject, resultHash }) => ({ jobId, kind, subject, resultHash })),
+    leaves: leaves.map(({ jobId, kind, subject, status, resultHash }) => ({ jobId, kind, subject, status, resultHash })),
   };
 }
 
@@ -110,7 +115,7 @@ export async function getJobProof(prisma: PrismaClient, jobId: string) {
   const record = await getDayRecord(prisma, day);
   const leaves = record.leaves.map((l) => leafHash(l.jobId, l.resultHash));
   const index = record.leaves.findIndex((l) => l.jobId === jobId);
-  if (index < 0) throw new WorkError(404, 'This job is not in its day record (it was overturned before the day closed)');
+  if (index < 0) throw new WorkError(404, 'This job is not in its day record');
   return {
     jobId,
     status: job.status,
@@ -125,7 +130,7 @@ export async function getJobProof(prisma: PrismaClient, jobId: string) {
 }
 
 export async function recordAnchorTx(prisma: PrismaClient, day: string, tx: unknown) {
-  if (typeof tx !== 'string' || !/^[1-9A-HJ-NP-Za-km-z]{64,90}$/.test(tx)) throw new WorkError(400, 'tx must be a Solana transaction signature');
+  if (typeof tx !== 'string' || !TX_SIGNATURE_RE.test(tx)) throw new WorkError(400, 'tx must be a Solana transaction signature');
   dayBounds(day);
   const row = await prisma.workDayRoot.findUnique({ where: { day } });
   if (!row) throw new WorkError(404, 'That day has no frozen record yet');

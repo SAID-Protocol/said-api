@@ -75,12 +75,13 @@ async function readJson(c: Context): Promise<Record<string, unknown>> {
 
 /**
  * A salted hash of the caller's network address, or null when it cannot be
- * read. Takes the address the nearest proxy recorded (the last entry), since
- * anything earlier in the header is supplied by the caller.
+ * read. Only the LAST x-forwarded-for entry is used: the proxy in front of
+ * the API appends the address it saw, and anything earlier in the header,
+ * like any x-real-ip header, can be written by the caller.
  */
 function addressHash(c: Context): string | null {
   const forwarded = c.req.header('x-forwarded-for')?.split(',').map((p) => p.trim()).filter(Boolean);
-  const ip = c.req.header('x-real-ip') || (forwarded && forwarded[forwarded.length - 1]);
+  const ip = forwarded && forwarded[forwarded.length - 1];
   if (!ip) return null;
   const salt = process.env.WORK_IP_SALT || process.env.ADMIN_SECRET || 'said-work';
   return createHash('sha256').update(`${salt}:${ip}`).digest('hex');
@@ -100,7 +101,10 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
       if (!k) throw new Error(`unknown job kind ${kind}`);
       return k.run(connection, spec);
     },
-    onAccepted: async (job) => {
+    // Activity answers reach the live stats only after our own run agrees
+    // with the panel, so every accepted activity job is re-run when this is on.
+    confirmKinds: cfg.applyActivity ? new Set([WALLET_ACTIVITY_KIND]) : new Set(),
+    onConfirmed: async (job) => {
       if (cfg.applyActivity && job.kind === WALLET_ACTIVITY_KIND) {
         await applyActivityResult(prisma, job.result as WalletActivityResult, cfg.windowDays);
       }

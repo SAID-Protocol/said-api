@@ -10,7 +10,11 @@
 
 import type { PrismaClient } from '@prisma/client';
 import { getV8ReputationBatch } from '../reputation-v0.8/read.js';
-import { WorkError, rateFor, type WorkConfig } from './engine.js';
+import { TX_SIGNATURE_RE } from './auth.js';
+import { WorkError, rateFor, verdictCounts, type WorkConfig } from './engine.js';
+
+// pg_advisory_xact_lock key: one reward period is recorded at a time.
+const LOCK_EPOCHS = 74110003;
 
 // One answer our own check contradicted cancels this many accepted ones.
 export const WRONG_PENALTY = 10;
@@ -64,22 +68,7 @@ export async function createEpoch(prisma: PrismaClient, cfg: WorkConfig, input: 
   }
   const rewards = BigInt(input.rewardsLamports);
 
-  const overlap = await prisma.workEpoch.findFirst({ where: { startsAt: { lt: endsAt }, endsAt: { gt: startsAt } }, select: { label: true } });
-  if (overlap) throw new WorkError(409, `this period overlaps ${overlap.label}; work would be paid twice`);
-  if (await prisma.workEpoch.findUnique({ where: { label } })) throw new WorkError(409, `period ${label} already exists`);
-
-  const rows = await prisma.workAssignment.groupBy({
-    by: ['workerWallet', 'verdict'],
-    where: { status: 'submitted', submittedAt: { gte: startsAt, lt: endsAt }, verdict: { in: ['agreed', 'correct', 'wrong'] } },
-    _count: { _all: true },
-  });
-  const counts = new Map<string, { good: number; wrong: number }>();
-  for (const r of rows) {
-    const c = counts.get(r.workerWallet) ?? { good: 0, wrong: 0 };
-    if (r.verdict === 'wrong') c.wrong += r._count._all;
-    else c.good += r._count._all;
-    counts.set(r.workerWallet, c);
-  }
+  const counts = await verdictCounts(prisma, startsAt, endsAt);
 
   const workerPool = (rewards * BigInt(cfg.workersBps)) / 10000n;
   const lock = (rewards * BigInt(cfg.lockBps)) / 10000n;
@@ -90,7 +79,14 @@ export async function createEpoch(prisma: PrismaClient, cfg: WorkConfig, input: 
   const units = new Map([...counts].map(([w, c]) => [w, unitsFor(c.good, c.wrong) * rateFor(cfg, tierOf(w))] as const));
   const shares = computeShares(workerPool, units, BigInt(cfg.minPayoutLamports));
 
-  return prisma.workEpoch.create({
+  return prisma.$transaction(async (tx) => {
+    // The overlap check and the insert must not interleave with another
+    // operator's: two overlapping periods would pay the same work twice.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${LOCK_EPOCHS})`;
+    const overlap = await tx.workEpoch.findFirst({ where: { startsAt: { lt: endsAt }, endsAt: { gt: startsAt } }, select: { label: true } });
+    if (overlap) throw new WorkError(409, `this period overlaps ${overlap.label}; work would be paid twice`);
+    if (await tx.workEpoch.findUnique({ where: { label } })) throw new WorkError(409, `period ${label} already exists`);
+    return tx.workEpoch.create({
     data: {
       label,
       startsAt,
@@ -115,6 +111,7 @@ export async function createEpoch(prisma: PrismaClient, cfg: WorkConfig, input: 
       },
     },
     include: { payouts: true },
+    });
   });
 }
 
@@ -126,7 +123,7 @@ async function tiersFor(prisma: PrismaClient, wallets: string[]): Promise<Map<st
 }
 
 export async function recordLockTx(prisma: PrismaClient, label: string, tx: unknown) {
-  if (typeof tx !== 'string' || !/^[1-9A-HJ-NP-Za-km-z]{64,90}$/.test(tx)) throw new WorkError(400, 'tx must be a Solana transaction signature');
+  if (typeof tx !== 'string' || !TX_SIGNATURE_RE.test(tx)) throw new WorkError(400, 'tx must be a Solana transaction signature');
   const epoch = await prisma.workEpoch.findUnique({ where: { label } });
   if (!epoch) throw new WorkError(404, 'No such period');
   return prisma.workEpoch.update({ where: { label }, data: { lockTx: tx } });

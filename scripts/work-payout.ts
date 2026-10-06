@@ -20,6 +20,7 @@
 import { PrismaClient } from '@prisma/client';
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
 import bs58 from 'bs58';
+import { isPubkey } from '../src/work/auth.js';
 
 const BATCH = 10; // transfers per transaction
 const FEE_BUFFER_LAMPORTS = 10_000n; // per transaction, generous
@@ -32,15 +33,6 @@ const sol = (lamports: bigint) => (Number(lamports) / LAMPORTS_PER_SOL).toFixed(
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
   return i >= 0 ? process.argv[i + 1] : undefined;
-}
-
-function isPubkey(s: string): boolean {
-  try {
-    new PublicKey(s);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /** Settle rows a previous run left in `sending`. Returns how many are still unresolved. */

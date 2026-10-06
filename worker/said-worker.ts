@@ -308,11 +308,10 @@ async function run(): Promise<void> {
       }
       const kind = jobKind(a.kind);
       if (!kind || !kind.isValidSpec(a.spec)) {
-        // A job kind this build does not know: let the lease expire.
-        log(`skipping job ${a.jobId}: unknown kind ${a.kind}; this worker may be out of date`);
-        if (once) return;
-        await sleep(IDLE_MS);
-        continue;
+        // A job kind this build does not know. Claiming again would only
+        // pile up leases that expire against the record, so stop here.
+        await rm(PID_FILE, { force: true });
+        throw new Error(`job ${a.jobId} is of kind "${a.kind}", which this worker does not know: download the worker again and restart`);
       }
 
       const result = await kind.run(conn, a.spec);

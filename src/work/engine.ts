@@ -17,8 +17,7 @@
  */
 
 import { Prisma, type PrismaClient } from '@prisma/client';
-import { PublicKey } from '@solana/web3.js';
-import { isFresh, jobClaimMessage, slotClaimMessage, submitMessage, verifyMessage } from './auth.js';
+import { isFresh, isPubkey, jobClaimMessage, slotClaimMessage, submitMessage, verifyMessage } from './auth.js';
 import { getV8Reputation } from '../reputation-v0.8/read.js';
 import { jobKind, type JobResult } from './kinds.js';
 import { WALLET_HISTORY_KIND, isValidSpec, type WalletHistorySpec } from './wallet-history.js';
@@ -144,8 +143,13 @@ export type ReferenceRunner = (kind: string, spec: WalletHistorySpec) => Promise
 
 export interface SettleHooks {
   reference: ReferenceRunner | null;
-  /** Called once when a panel agrees, with the agreed answer. */
-  onAccepted?: (job: { id: string; kind: string; result: JobResult }) => Promise<void>;
+  /**
+   * Called once per accepted job whose answer our own run has confirmed, with
+   * that answer. Only jobs of these kinds are always re-run; others are
+   * sampled and never passed here.
+   */
+  onConfirmed?: (job: { id: string; kind: string; result: JobResult }) => Promise<void>;
+  confirmKinds?: Set<string>;
 }
 
 // Same system wallet the partner outcome door writes from (index.ts).
@@ -162,16 +166,6 @@ const ONLINE_WINDOW_MS = 10 * 60 * 1000;
 // pg_advisory_xact_lock keys: serialise slot claims and job cutting.
 const LOCK_SLOTS = 74110001;
 const LOCK_JOBS = 74110002;
-
-function isPubkey(s: unknown): s is string {
-  if (typeof s !== 'string') return false;
-  try {
-    new PublicKey(s);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 // ─── Slots ──────────────────────────────────────────────────────────────────
 
@@ -430,6 +424,11 @@ export async function getStanding(prisma: PrismaClient, cfg: WorkConfig, wallet:
 
 // Open jobs are bounded so a board nobody can clear does not grow forever.
 const MAX_OPEN_BATCHES = 20;
+// A worker that finds nothing it may take asks for a fresh batch. When the
+// last such ask cut nothing, the next is not tried for a minute, so idle
+// workers polling do not each run the cut query every 30 seconds.
+const FORCE_RETRY_MS = 60 * 1000;
+let lastEmptyForceAt = 0;
 
 /**
  * Cut a batch of jobs for the verified wallets checked longest ago. Runs when
@@ -444,6 +443,7 @@ export async function ensureOpenJobs(
   force = false,
 ): Promise<number> {
   const lowWater = force ? cfg.jobBatch * MAX_OPEN_BATCHES : Math.ceil(cfg.jobBatch / 2);
+  if (force && now.getTime() - lastEmptyForceAt < FORCE_RETRY_MS) return 0;
   const open = await prisma.workJob.count({ where: { status: 'open' } });
   if (open >= lowWater) return 0;
 
@@ -469,7 +469,10 @@ export async function ensureOpenJobs(
     `;
     // Some Agent rows hold placeholder strings instead of real wallets.
     const wallets = due.map((d) => d.wallet).filter(isPubkey);
-    if (wallets.length === 0) return 0;
+    if (wallets.length === 0) {
+      if (force) lastEmptyForceAt = now.getTime();
+      return 0;
+    }
 
     const toTime = Math.floor((now.getTime() / 1000 - WINDOW_SETTLE_SECONDS) / 60) * 60;
     const fromTime = toTime - cfg.windowDays * 86400;
@@ -649,7 +652,7 @@ async function settleIfComplete(
   hooks: SettleHooks,
   now: Date,
 ): Promise<string> {
-  const { reference, onAccepted } = hooks;
+  const { reference, confirmKinds } = hooks;
   let agreed: { kind: string; result: JobResult } | null = null;
   const status = await prisma.$transaction(async (tx) => {
     const locked = await tx.$queryRaw<{ status: string; panelSize: number; kind: string }[]>`
@@ -687,16 +690,11 @@ async function settleIfComplete(
   });
 
   const accepted = agreed as { kind: string; result: JobResult } | null;
-  if (accepted && onAccepted) {
-    onAccepted({ id: jobId, ...accepted }).catch((err) =>
-      console.error(`[work] could not apply accepted job ${jobId}:`, err instanceof Error ? err.message : err),
-    );
-  }
-
-  const check = status === 'disagreed' || (status === 'accepted' && Math.random() < cfg.spotCheckRate);
+  const always = accepted !== null && confirmKinds?.has(accepted.kind) === true;
+  const check = status === 'disagreed' || (status === 'accepted' && (always || Math.random() < cfg.spotCheckRate));
   if (reference && check) {
     // Our own run takes RPC time; the worker's response does not wait for it.
-    applyReference(prisma, jobId, reference).catch((err) =>
+    applyReference(prisma, jobId, reference, hooks.onConfirmed).catch((err) =>
       console.error(`[work] reference check failed for job ${jobId}:`, err instanceof Error ? err.message : err),
     );
   }
@@ -704,12 +702,19 @@ async function settleIfComplete(
 }
 
 /** Re-run a settled job ourselves and mark each panel answer against it. */
-export async function applyReference(prisma: PrismaClient, jobId: string, reference: ReferenceRunner): Promise<void> {
+export async function applyReference(
+  prisma: PrismaClient,
+  jobId: string,
+  reference: ReferenceRunner,
+  onConfirmed?: SettleHooks['onConfirmed'],
+): Promise<void> {
   const job = await prisma.workJob.findUnique({ where: { id: jobId } });
   const kind = job ? jobKind(job.kind) : null;
   if (!job || !kind || job.referenceHash || !kind.isValidSpec(job.spec)) return;
   if (job.status !== 'accepted' && job.status !== 'disagreed') return;
-  const referenceHash = kind.hash(await reference(job.kind, job.spec));
+  const ours = await reference(job.kind, job.spec);
+  const referenceHash = kind.hash(ours);
+  let confirmed = false;
 
   await prisma.$transaction(async (tx) => {
     const claimed = await tx.workJob.updateMany({
@@ -741,8 +746,17 @@ export async function applyReference(prisma: PrismaClient, jobId: string, refere
         where: { wallet: { in: submitted.map((s) => s.workerWallet) } },
         data: { acceptedCount: { decrement: 1 } },
       });
+    } else if (job.status === 'accepted') {
+      confirmed = true;
     }
   });
+
+  if (confirmed && onConfirmed) {
+    // The panel's answer and ours are the same bytes; pass ours.
+    await onConfirmed({ id: jobId, kind: job.kind, result: ours }).catch((err) =>
+      console.error(`[work] could not apply confirmed job ${jobId}:`, err instanceof Error ? err.message : err),
+    );
+  }
 }
 
 // ─── Reputation ─────────────────────────────────────────────────────────────
@@ -750,6 +764,28 @@ export async function applyReference(prisma: PrismaClient, jobId: string, refere
 function utcDay(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
+
+/** Per worker, how many answers in [start, end) were good (agreed or correct) and how many wrong. */
+export async function verdictCounts(prisma: PrismaClient, start: Date, end: Date): Promise<Map<string, { good: number; wrong: number }>> {
+  const rows = await prisma.workAssignment.groupBy({
+    by: ['workerWallet', 'verdict'],
+    where: { status: 'submitted', submittedAt: { gte: start, lt: end }, verdict: { in: ['agreed', 'correct', 'wrong'] } },
+    _count: { _all: true },
+  });
+  const out = new Map<string, { good: number; wrong: number }>();
+  for (const r of rows) {
+    const c = out.get(r.workerWallet) ?? { good: 0, wrong: 0 };
+    if (r.verdict === 'wrong') c.wrong += r._count._all;
+    else c.good += r._count._all;
+    out.set(r.workerWallet, c);
+  }
+  return out;
+}
+
+// Verdicts keep arriving for a while after a day ends: panels complete and
+// our own re-runs land. A day's reputation row is written once, so it waits
+// this long past midnight before it is.
+export const EVIDENCE_SETTLE_MARGIN_MS = 6 * 60 * 60 * 1000;
 
 /**
  * Write one reputation row per worker for one UTC day, through the same
@@ -761,6 +797,7 @@ export async function settleDailyEvidence(
   prisma: PrismaClient,
   cfg: WorkConfig,
   day: Date,
+  now: Date = new Date(),
 ): Promise<{ enabled: boolean; day: string; positive: number; negative: number; skipped: number }> {
   const label = utcDay(day);
   const out = { enabled: cfg.evidenceWeight !== null, day: label, positive: 0, negative: 0, skipped: 0 };
@@ -768,19 +805,9 @@ export async function settleDailyEvidence(
 
   const start = new Date(`${label}T00:00:00.000Z`);
   const end = new Date(start.getTime() + 86400 * 1000);
-  const rows = await prisma.workAssignment.groupBy({
-    by: ['workerWallet', 'verdict'],
-    where: { status: 'submitted', submittedAt: { gte: start, lt: end }, verdict: { not: null } },
-    _count: { _all: true },
-  });
-
-  const perWorker = new Map<string, { good: number; wrong: number }>();
-  for (const r of rows) {
-    const w = perWorker.get(r.workerWallet) ?? { good: 0, wrong: 0 };
-    if (r.verdict === 'agreed' || r.verdict === 'correct') w.good += r._count._all;
-    if (r.verdict === 'wrong') w.wrong += r._count._all;
-    perWorker.set(r.workerWallet, w);
-  }
+  // -1 says the day is not ready to settle yet.
+  if (now.getTime() < end.getTime() + EVIDENCE_SETTLE_MARGIN_MS) return { ...out, skipped: -1 };
+  const perWorker = await verdictCounts(prisma, start, end);
 
   for (const [wallet, counts] of perWorker) {
     const negative = counts.wrong > 0;
@@ -825,7 +852,7 @@ export async function getStats(prisma: PrismaClient, cfg: WorkConfig, now: Date 
     prisma.workJob.count({ where: { status: 'accepted', settledAt: { gte: dayAgo } } }),
     prisma.workJob.count({ where: { status: 'disagreed', settledAt: { gte: dayAgo } } }),
     prisma.workJob.count({ where: { status: 'overturned' } }),
-    prisma.workJob.findMany({ where: { status: 'accepted' }, distinct: ['subjectWallet'], select: { subjectWallet: true } }),
+    prisma.$queryRaw<{ n: bigint }[]>`SELECT count(DISTINCT "subjectWallet") AS n FROM "WorkJob" WHERE status = 'accepted'`,
   ]);
   return {
     open: cfg.open,
@@ -833,7 +860,7 @@ export async function getStats(prisma: PrismaClient, cfg: WorkConfig, now: Date 
     workersOnline,
     panelSize: cfg.panelSize,
     jobs: { open, accepted, accepted24h, disagreed24h, overturned },
-    walletsChecked: checked.length,
+    walletsChecked: Number(checked[0]?.n ?? 0),
     reputationWrites: cfg.evidenceWeight !== null,
     rewardSplit: { workersBps: cfg.workersBps, lockBps: cfg.lockBps },
     computedAt: now.toISOString(),
