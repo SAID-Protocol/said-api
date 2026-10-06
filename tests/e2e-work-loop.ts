@@ -156,18 +156,18 @@ async function main() {
   const startedAt = new Date();
 
   // ── Slots ────────────────────────────────────────────────────────────────
-  check('unregistered wallet cannot claim a slot', (await post('/api/work/slots/claim', claimSlotBody(stranger))).status, 404);
-  check('unverified agent cannot claim a slot', (await post('/api/work/slots/claim', claimSlotBody(unverified))).status, 403);
-  check('a signature from the wrong key is refused', (await post('/api/work/slots/claim', claimSlotBody(w1, { signer: w2.agent }))).status, 401);
-  check('a stale timestamp is refused', (await post('/api/work/slots/claim', claimSlotBody(w1, { timestamp: Date.now() - 10 * 60 * 1000 }))).status, 400);
-  check('a verified agent claims a slot', (await post('/api/work/slots/claim', claimSlotBody(w1))).status, 201);
-  check('claiming again re-binds, not duplicates', (await post('/api/work/slots/claim', claimSlotBody(w1))).status, 200);
-  for (const w of [w2, w3, w4, w5]) check(`${w.name} claims a slot`, (await post('/api/work/slots/claim', claimSlotBody(w))).status, 201);
-  check('a third slot under one owner is allowed', (await post('/api/work/slots/claim', claimSlotBody(x1))).status, 201);
-  const fourth = await post('/api/work/slots/claim', claimSlotBody(x2));
+  check('unregistered wallet cannot claim a slot', (await post('/api/work/slots/claim', claimSlotBody(stranger), stranger.ip)).status, 404);
+  check('unverified agent cannot claim a slot', (await post('/api/work/slots/claim', claimSlotBody(unverified), unverified.ip)).status, 403);
+  check('a signature from the wrong key is refused', (await post('/api/work/slots/claim', claimSlotBody(w1, { signer: w2.agent }), w1.ip)).status, 401);
+  check('a stale timestamp is refused', (await post('/api/work/slots/claim', claimSlotBody(w1, { timestamp: Date.now() - 10 * 60 * 1000 }), w1.ip)).status, 400);
+  check('a verified agent claims a slot', (await post('/api/work/slots/claim', claimSlotBody(w1), w1.ip)).status, 201);
+  check('claiming again re-binds, not duplicates', (await post('/api/work/slots/claim', claimSlotBody(w1), w1.ip)).status, 200);
+  for (const w of [w2, w3, w4, w5]) check(`${w.name} claims a slot`, (await post('/api/work/slots/claim', claimSlotBody(w), w.ip)).status, 201);
+  check('a third slot under one owner is allowed', (await post('/api/work/slots/claim', claimSlotBody(x1), x1.ip)).status, 201);
+  const fourth = await post('/api/work/slots/claim', claimSlotBody(x2), x2.ip);
   check('a fourth slot under one owner is refused', [fourth.status, /at most 3/.test(fourth.body.error ?? '')], [409, true]);
-  check('the filler claims the last slot', (await post('/api/work/slots/claim', claimSlotBody(filler))).status, 201);
-  const overCap = await post('/api/work/slots/claim', claimSlotBody(over));
+  check('the filler claims the last slot', (await post('/api/work/slots/claim', claimSlotBody(filler), filler.ip)).status, 201);
+  const overCap = await post('/api/work/slots/claim', claimSlotBody(over), over.ip);
   check('the slot cap holds', [overCap.status, /slots are taken/.test(overCap.body.error ?? '')], [409, true]);
   check('a worker key without a slot cannot take jobs', (await claimJob(over)).status, 401);
   check('slot lookup', (await get(`/api/work/slots/${w1.agent.publicKey.toBase58()}`)).body.workerKey, w1.worker.publicKey.toBase58());

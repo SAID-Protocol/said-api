@@ -759,6 +759,32 @@ export async function applyReference(
   }
 }
 
+/**
+ * Re-run accepted jobs of the kinds that must be confirmed whose first
+ * re-run never completed (an RPC error, a restart). Oldest first, a few at a
+ * time, so a backlog never floods our RPC.
+ */
+export async function retryUnconfirmed(prisma: PrismaClient, hooks: SettleHooks, limit = 20, now: Date = new Date()): Promise<number> {
+  const kinds = [...(hooks.confirmKinds ?? [])];
+  if (!hooks.reference || kinds.length === 0) return 0;
+  const jobs = await prisma.workJob.findMany({
+    where: { status: 'accepted', kind: { in: kinds }, referenceHash: null, settledAt: { lt: new Date(now.getTime() - 60 * 1000) } },
+    orderBy: { settledAt: 'asc' },
+    take: limit,
+    select: { id: true },
+  });
+  let done = 0;
+  for (const j of jobs) {
+    try {
+      await applyReference(prisma, j.id, hooks.reference, hooks.onConfirmed);
+      done++;
+    } catch (err) {
+      console.error(`[work] re-run of job ${j.id} failed again:`, err instanceof Error ? err.message : err);
+    }
+  }
+  return done;
+}
+
 // ─── Reputation ─────────────────────────────────────────────────────────────
 
 function utcDay(d: Date): string {

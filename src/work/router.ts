@@ -44,6 +44,7 @@ import {
   getStats,
   getWorkers,
   loadWorkConfig,
+  retryUnconfirmed,
   settleDailyEvidence,
   submitResult,
   type SettleHooks,
@@ -58,6 +59,7 @@ import { PUBLIC_API_URL, loadSkill, loadWorkerBundle } from './distribution.js';
 
 const EVIDENCE_INTERVAL_MS = 60 * 60 * 1000;
 const SWARM_TTL_MS = 10 * 1000;
+const RETRY_INTERVAL_MS = 5 * 60 * 1000;
 
 function clampLimit(raw: string | undefined, fallback: number, max: number): number {
   const n = Number(raw);
@@ -302,6 +304,14 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
       return fail(c, err);
     }
   });
+
+  // Confirming re-runs that failed (an RPC hiccup, a restart) are tried again.
+  if (hooks.confirmKinds?.size) {
+    setInterval(
+      () => retryUnconfirmed(prisma, hooks).catch((err) => console.error('[work] retry of unconfirmed jobs failed:', err instanceof Error ? err.message : err)),
+      RETRY_INTERVAL_MS,
+    );
+  }
 
   // Close yesterday's record even if nobody asks for it.
   const freeze = () => freezeYesterday(prisma).catch((err) => console.error('[work] could not freeze the daily record:', err instanceof Error ? err.message : err));
