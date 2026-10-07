@@ -1402,6 +1402,15 @@ app.get('/api/register', (c) => {
 });
 
 // ============ SPONSORED REGISTRATION ============
+/**
+ * What the sponsor sends a partner-registered agent: exactly the identity
+ * account's rent (2,387,600 lamports for 342 bytes) plus the 0.01 SOL
+ * verification fee, with a small buffer. The sponsor is the fee payer, so the
+ * agent needs nothing else. The old 0.015 left ~0.0026 SOL in every agent
+ * wallet, ~0.26 SOL a day at 100 registrations (2026-10-07).
+ * SAID Hosting agents (people's own agents) keep the 0.015 float below.
+ */
+const PARTNER_FUND_LAMPORTS = 12_500_000; // 0.0125 SOL
 // Free registration - we pay the rent (first 100 agents)
 
 // Rate limiting: track registrations per IP
@@ -1971,7 +1980,7 @@ app.post('/api/platforms/spawnr/register', async (c) => {
     
     // === Build funding transfer: sponsor → agent wallet ===
     // Agent needs SOL for: PDA rent (~0.003 SOL) + verification fee (0.01 SOL) + tx fees
-    const FUND_AMOUNT = 0.015 * LAMPORTS_PER_SOL; // 0.015 SOL buffer
+    const FUND_AMOUNT = PARTNER_FUND_LAMPORTS; // rent + verification fee + buffer; see PARTNER_FUND_LAMPORTS
     
     const fundIx = SystemProgram.transfer({
       fromPubkey: sponsorKeypair.publicKey,
@@ -2145,7 +2154,7 @@ app.post('/api/platforms/spawnr/confirm', async (c) => {
       },
       platform: {
         name: 'spawnr.io',
-        costCovered: '~0.015 SOL (rent + verification + fees)',
+        costCovered: '~0.0125 SOL (rent + verification fee)',
         sponsoredBy: 'SAID Protocol',
       }
     });
@@ -2401,7 +2410,7 @@ app.post('/api/platforms/clawpump/register', async (c) => {
     
     // === Build funding transfer: sponsor → agent wallet ===
     // Agent needs SOL for: PDA rent (~0.003 SOL) + verification fee (0.01 SOL) + tx fees
-    const FUND_AMOUNT = 0.015 * LAMPORTS_PER_SOL; // 0.015 SOL buffer
+    const FUND_AMOUNT = PARTNER_FUND_LAMPORTS; // rent + verification fee + buffer; see PARTNER_FUND_LAMPORTS
     
     const fundIx = SystemProgram.transfer({
       fromPubkey: sponsorKeypair.publicKey,
@@ -2576,7 +2585,7 @@ app.post('/api/platforms/clawpump/confirm', async (c) => {
       },
       platform: {
         name: 'claw.pump',
-        costCovered: '~0.015 SOL (rent + verification + fees)',
+        costCovered: '~0.0125 SOL (rent + verification fee)',
         sponsoredBy: 'SAID Protocol',
       }
     });
@@ -2986,7 +2995,7 @@ app.post('/api/platforms/xona-orbit/confirm', async (c) => {
       },
       platform: {
         name: 'xona-orbit',
-        costCovered: '~0.015 SOL (rent + verification + fees)',
+        costCovered: '~0.0125 SOL (rent + verification fee)',
         paidBy: 'Xona-Orbit',
       }
     });
@@ -3394,7 +3403,7 @@ app.post('/api/platforms/kausa/confirm', async (c) => {
       },
       platform: {
         name: 'kausa',
-        costCovered: '~0.015 SOL (rent + verification + fees)',
+        costCovered: '~0.0125 SOL (rent + verification fee)',
         paidBy: 'Kausa',
       }
     });
@@ -3908,7 +3917,7 @@ app.post('/api/platforms/said-hosting/confirm', async (c) => {
       },
       platform: {
         name: 'said.hosting',
-        costCovered: '~0.015 SOL (rent + verification + fees)',
+        costCovered: '~0.0125 SOL (rent + verification fee)',
         sponsoredBy: 'SAID Protocol',
       }
     });
@@ -4494,7 +4503,7 @@ app.post('/api/platforms/seekerclaw/provision', async (c) => {
       SAID_PROGRAM_ID
     );
 
-    const FUND_AMOUNT = 0.015 * LAMPORTS_PER_SOL;
+    const FUND_AMOUNT = PARTNER_FUND_LAMPORTS; // rent + verification fee + buffer; see PARTNER_FUND_LAMPORTS
 
     const fundIx = SystemProgram.transfer({
       fromPubkey: sponsorKeypair.publicKey,
@@ -5198,7 +5207,7 @@ app.post('/api/platforms/fairscale/provision', async (c) => {
       SAID_PROGRAM_ID
     );
 
-    const FUND_AMOUNT = 0.015 * LAMPORTS_PER_SOL;
+    const FUND_AMOUNT = PARTNER_FUND_LAMPORTS; // rent + verification fee + buffer; see PARTNER_FUND_LAMPORTS
 
     const fundIx = SystemProgram.transfer({
       fromPubkey: sponsorKeypair.publicKey,
