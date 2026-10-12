@@ -52,7 +52,7 @@ export interface WorkConfig {
   evidenceWeight: number | null;
   evidenceMinAccepted: number;
   /** Write accepted wallet-activity answers into the API's activity stats. */
-  applyActivity: boolean;
+  applyActivity: boolean; // may be switched off at startup when no dedicated RPC is set
   /** Share of each period's rewards, in basis points. The remainder is unallocated. */
   workersBps: number;
   lockBps: number;

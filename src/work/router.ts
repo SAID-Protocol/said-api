@@ -30,7 +30,7 @@ import { createHash } from 'crypto';
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { PrismaClient } from '@prisma/client';
-import type { Connection } from '@solana/web3.js';
+import { Connection } from '@solana/web3.js';
 import {
   WorkError,
   claimJob,
@@ -60,6 +60,31 @@ import { PUBLIC_API_URL, loadSkill, loadWorkerBundle } from './distribution.js';
 const EVIDENCE_INTERVAL_MS = 60 * 60 * 1000;
 const SWARM_TTL_MS = 10 * 1000;
 const RETRY_INTERVAL_MS = 5 * 60 * 1000;
+// Our own re-runs go through one at a time, spaced out, and are dropped when
+// too many are waiting. A dropped sampled check costs nothing; a dropped
+// confirming run is picked up again by the retry loop.
+const REFERENCE_SPACING_MS = 1000;
+const REFERENCE_MAX_WAITING = 50;
+
+/** Runs `fn` calls one at a time with a gap between starts; refuses when the queue is full. */
+function serialQueue(spacingMs: number, maxWaiting: number) {
+  let tail: Promise<unknown> = Promise.resolve();
+  let waiting = 0;
+  return <T>(fn: () => Promise<T>): Promise<T> => {
+    if (waiting >= maxWaiting) return Promise.reject(new Error('re-run queue full; skipped'));
+    waiting++;
+    const run = tail.then(async () => {
+      waiting--;
+      try {
+        return await fn();
+      } finally {
+        await new Promise((r) => setTimeout(r, spacingMs));
+      }
+    });
+    tail = run.catch(() => undefined);
+    return run;
+  };
+}
 
 function clampLimit(raw: string | undefined, fallback: number, max: number): number {
   const n = Number(raw);
@@ -97,11 +122,21 @@ function fail(c: Context, err: unknown) {
 export function createWorkRouter(prisma: PrismaClient, connection: Connection): Hono {
   const router = new Hono();
   const cfg = loadWorkConfig(process.env);
+  // The work loop never shares the RPC the rest of the API depends on.
+  // Without its own endpoint, writing activity stats stays off and our
+  // re-runs are throttled hard on the shared one.
+  const ownRpc = process.env.WORK_RPC_URL;
+  const workConn = ownRpc ? new Connection(ownRpc, 'finalized') : connection;
+  if (cfg.applyActivity && !ownRpc) {
+    console.error('[work] WORK_APPLY_ACTIVITY needs WORK_RPC_URL, a dedicated RPC; activity writes stay off');
+    cfg.applyActivity = false;
+  }
+  const queue = ownRpc ? serialQueue(250, 500) : serialQueue(REFERENCE_SPACING_MS, REFERENCE_MAX_WAITING);
   const hooks: SettleHooks = {
     reference: (kind, spec) => {
       const k = jobKind(kind);
       if (!k) throw new Error(`unknown job kind ${kind}`);
-      return k.run(connection, spec);
+      return queue(() => k.run(workConn, spec));
     },
     // Activity answers reach the live stats only after our own run agrees
     // with the panel, so every accepted activity job is re-run when this is on.
@@ -202,7 +237,7 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
     try {
       const { slot, created } = await claimSlot(prisma, cfg, await readJson(c), addressHash(c));
       // Not awaited: the lookup walks the wallet's history on our RPC.
-      void refreshFunder(prisma, connection, slot.wallet);
+      void queue(() => refreshFunder(prisma, workConn, slot.wallet)).catch(() => undefined);
       return c.json({ wallet: slot.wallet, workerKey: slot.workerKey, claimedAt: slot.claimedAt.toISOString(), created }, created ? 201 : 200);
     } catch (err) {
       return fail(c, err);
@@ -215,7 +250,7 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
       const out = await claimJob(prisma, cfg, body, new Date(), addressHash(c));
       if (typeof body.workerKey === 'string') {
         const slot = await prisma.workSlot.findUnique({ where: { workerKey: body.workerKey }, select: { wallet: true } });
-        if (slot) void refreshFunder(prisma, connection, slot.wallet);
+        if (slot) void queue(() => refreshFunder(prisma, workConn, slot.wallet)).catch(() => undefined);
       }
       return c.json(out);
     } catch (err) {
