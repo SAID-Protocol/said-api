@@ -959,3 +959,165 @@ model Dispute {
   @@index([status, expiresAt])
 }
 
+// Mirrored from main: this branch shares the production database, and a
+// db push from a schema without these tables would drop them.
+// ============================================================
+// Work loop — verified agents do checkable work for the protocol
+// ============================================================
+// A slot is a verified agent's right to work. Jobs go to a panel of
+// unrelated workers whose answers must match exactly; an accepted job is
+// stored here and summarised into the worker's reputation once a day.
+// See src/work/.
+
+model WorkSlot {
+  id String @id @default(cuid())
+  // Order of joining: worker #1, #2, … Never reused.
+  number Int @unique @default(autoincrement())
+
+  wallet String @unique // the verified Agent.wallet that owns the slot
+  // Ed25519 key the worker process signs with. The agent wallet signs once
+  // to bind it, so the wallet key never has to sit on the worker machine.
+  workerKey String @unique
+  status    String @default("active") // active, revoked
+
+  acceptedCount  Int @default(0) // jobs where the whole panel agreed
+  disagreedCount Int @default(0) // jobs where the panel did not agree
+  wrongCount     Int @default(0) // answers our own check contradicted
+
+  claimedAt  DateTime  @default(now())
+  lastSeenAt DateTime?
+
+  // Signals that two slots are run by one operator. Slots sharing either are
+  // never put on the same panel or asked to check each other.
+  ipHash          String? // salted hash of the address the worker last claimed from
+  funder          String? // wallet that paid for this agent wallet's first transaction
+  funderCheckedAt DateTime?
+
+  @@index([status, lastSeenAt])
+  @@index([ipHash])
+  @@index([funder])
+}
+
+model WorkJob {
+  id String @id @default(cuid())
+
+  kind          String // 'wallet_history_v1'
+  subjectWallet String
+  spec          Json // pinned inputs; identical for every panel member
+  panelSize     Int
+
+  // open → accepted | disagreed | expired (panel never filled)
+  // accepted → overturned (contradicted by our check)
+  status     String  @default("open")
+  resultHash String?
+  result     Json?
+
+  // Our own re-run of the job, when one was made.
+  referenceHash String?
+  referenceAt   DateTime?
+
+  createdAt DateTime  @default(now())
+  settledAt DateTime?
+
+  assignments WorkAssignment[]
+
+  @@index([status, createdAt])
+  @@index([subjectWallet, createdAt])
+  @@index([settledAt])
+}
+
+model WorkAssignment {
+  id String @id @default(cuid())
+
+  jobId String
+  job   WorkJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  workerWallet String
+  status       String   @default("leased") // leased, submitted, expired
+  leaseExpiresAt DateTime
+
+  resultHash String?
+  result     Json?
+  // agreed (panel matched) | split (panel did not match) | correct / wrong (vs our check)
+  verdict String?
+
+  createdAt   DateTime  @default(now())
+  submittedAt DateTime?
+
+  @@unique([jobId, workerWallet])
+  @@index([workerWallet, status])
+  @@index([workerWallet, submittedAt])
+  @@index([workerWallet, createdAt])
+  @@index([submittedAt])
+  @@index([status, leaseExpiresAt])
+}
+
+// One reward period. The rewards figure is entered by an operator; the
+// worker pool is split across workers by accepted work in the period.
+model WorkEpoch {
+  id    String @id @default(cuid())
+  label String @unique // e.g. "2026-W41"
+
+  startsAt DateTime
+  endsAt   DateTime
+
+  rewardsLamports    BigInt // total protocol rewards attributed to the period
+  workersBps         Int
+  lockBps            Int
+  workerPoolLamports BigInt // rewards × workersBps
+  lockLamports       BigInt // rewards × lockBps, used to buy and lock the token
+  lockTx             String? // the buy-and-lock transaction, once made
+
+  acceptedUnits BigInt // total worker units the pool was split across
+  createdAt     DateTime @default(now())
+
+  payouts WorkPayout[]
+
+  @@index([endsAt])
+}
+
+model WorkPayout {
+  id String @id @default(cuid())
+
+  epochId String
+  epoch   WorkEpoch @relation(fields: [epochId], references: [id], onDelete: Cascade)
+
+  workerWallet String
+  goodCount    Int // answers the panel or our check agreed with
+  wrongCount   Int // answers our check contradicted
+  // Reputation tier at the time the period was recorded, and the pay rate it
+  // carried (100 = the base rate).
+  tier    String @default("unranked")
+  ratePct Int    @default(100)
+  units   BigInt // (good − penalties) × ratePct: what the share was computed from
+  lamports     BigInt
+
+  // pending → sending → paid; skipped = below the minimum worth sending
+  status      String    @default("pending")
+  txSignature String?
+  paidAt      DateTime?
+
+  @@unique([epochId, workerWallet])
+  @@index([workerWallet, status])
+  @@index([status])
+}
+
+// Operator announcements that workers and the feed page read.
+model WorkUpdate {
+  id        String   @id @default(cuid())
+  title     String
+  body      String
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+// One Merkle root per UTC day over that day's accepted jobs, frozen once the
+// day has ended, so anyone holding a job's result can prove it was recorded.
+model WorkDayRoot {
+  day      String   @id // YYYY-MM-DD (UTC)
+  root     String
+  count    Int
+  anchorTx String? // on-chain transaction carrying the root, once made
+  frozenAt DateTime @default(now())
+}
