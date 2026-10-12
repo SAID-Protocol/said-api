@@ -18,7 +18,7 @@
  * WORK_PAYOUT_SECRET is a base58 secret key or a JSON byte array.
  */
 import { PrismaClient } from '@prisma/client';
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SendTransactionError, SystemProgram, Transaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { isPubkey } from '../src/work/auth.js';
 
@@ -118,8 +118,15 @@ async function main() {
     try {
       await conn.sendRawTransaction(tx.serialize());
     } catch (err) {
-      // Rejected before broadcast (failed simulation): nothing was sent.
-      await prisma.workPayout.updateMany({ where: { id: { in: ids } }, data: { status: 'pending', txSignature: null, paidAt: null } });
+      // Only a simulation rejection proves nothing was sent. A timeout, a
+      // 5xx or a dropped connection can come after the RPC forwarded the
+      // transfer, so those rows stay 'sending' and the next run settles them
+      // from the chain instead of paying again.
+      if (err instanceof SendTransactionError) {
+        await prisma.workPayout.updateMany({ where: { id: { in: ids } }, data: { status: 'pending', txSignature: null, paidAt: null } });
+      } else {
+        console.error(`sending ${signature} may or may not have reached the network; run again in a few minutes to settle it from the chain`);
+      }
       throw err;
     }
     const result = await conn.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed');

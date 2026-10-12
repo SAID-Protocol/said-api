@@ -11,16 +11,25 @@
 import type { PrismaClient } from '@prisma/client';
 import { getV8ReputationBatch } from '../reputation-v0.8/read.js';
 import { TX_SIGNATURE_RE } from './auth.js';
-import { WorkError, rateFor, verdictCounts, type WorkConfig } from './engine.js';
+import { WorkError, rateFor, verdictCounts, wrongPenalty, type WorkConfig } from './engine.js';
 
 // pg_advisory_xact_lock key: one reward period is recorded at a time.
 const LOCK_EPOCHS = 74110003;
 
-// One answer our own check contradicted cancels this many accepted ones.
+// One answer our own check contradicted cancels this many accepted ones at
+// the default check rate; the live figure comes from wrongPenalty().
 export const WRONG_PENALTY = 10;
 
-export function unitsFor(good: number, wrong: number): number {
-  return Math.max(0, good - wrong * WRONG_PENALTY);
+export function unitsFor(good: number, wrong: number, penalty: number = WRONG_PENALTY): number {
+  return Math.max(0, good - wrong * penalty);
+}
+
+// Verdicts keep landing after a period ends (panels filling, our re-runs), and
+// a recorded period cannot change. So a period can be recorded only this long
+// after it ended. WORK_EPOCH_MARGIN_HOURS overrides it.
+function epochMarginMs(): number {
+  const h = Number(process.env.WORK_EPOCH_MARGIN_HOURS);
+  return (Number.isFinite(h) && h >= 0 && h <= 72 ? h : 6) * 3600 * 1000;
 }
 
 export interface Share {
@@ -62,7 +71,9 @@ export async function createEpoch(prisma: PrismaClient, cfg: WorkConfig, input: 
   const endsAt = parseDate(input.endsAt);
   if (typeof label !== 'string' || !/^[A-Za-z0-9._-]{1,40}$/.test(label)) throw new WorkError(400, 'label must be 1-40 letters, digits, dot, dash or underscore');
   if (!startsAt || !endsAt || startsAt >= endsAt) throw new WorkError(400, 'startsAt and endsAt must be ISO timestamps, start before end');
-  if (endsAt > now) throw new WorkError(400, 'the period must have ended: work can still be checked and overturned until it does');
+  if (endsAt.getTime() > now.getTime() - epochMarginMs()) {
+    throw new WorkError(400, `the period must have ended at least ${epochMarginMs() / 3600000} hours ago: answers are still being checked until then`);
+  }
   if (typeof input.rewardsLamports !== 'string' || !/^(0|[1-9]\d{0,17})$/.test(input.rewardsLamports)) {
     throw new WorkError(400, 'rewardsLamports must be a whole number of lamports, as a string');
   }
@@ -76,7 +87,7 @@ export async function createEpoch(prisma: PrismaClient, cfg: WorkConfig, input: 
   // change of tier never rewrites a period that has been recorded.
   const tiers = Object.keys(cfg.tierRates).length ? await tiersFor(prisma, [...counts.keys()]) : new Map<string, string>();
   const tierOf = (w: string) => tiers.get(w) ?? 'unranked';
-  const units = new Map([...counts].map(([w, c]) => [w, unitsFor(c.good, c.wrong) * rateFor(cfg, tierOf(w))] as const));
+  const units = new Map([...counts].map(([w, c]) => [w, unitsFor(c.good, c.wrong, wrongPenalty(cfg.spotCheckRate)) * rateFor(cfg, tierOf(w))] as const));
   const shares = computeShares(workerPool, units, BigInt(cfg.minPayoutLamports));
 
   return prisma.$transaction(async (tx) => {

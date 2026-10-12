@@ -77,6 +77,21 @@ function num(raw: string | undefined, fallback: number, min: number, max: number
   return raw !== undefined && raw !== '' && Number.isFinite(n) && n >= min && n <= max ? n : fallback;
 }
 
+/** As num(), for settings that count things: a fractional value is rounded down. */
+function int(raw: string | undefined, fallback: number, min: number, max: number): number {
+  return Math.max(min, Math.floor(num(raw, fallback, min, max)));
+}
+
+/**
+ * What one wrong answer cancels. A panel that makes its answers up is caught
+ * only when we happen to re-run the job, so the penalty must outweigh what
+ * the uncaught fakes earn: at a check rate p it must exceed (1 - p) / p.
+ */
+export function wrongPenalty(spotCheckRate: number): number {
+  const p = Math.min(1, Math.max(0.01, spotCheckRate));
+  return Math.max(10, Math.ceil((1 - p) / p) + 1);
+}
+
 // A rate can lower pay as well as raise it, within these bounds, so that no
 // tier is ever paid nothing and none can swallow the pool.
 const MIN_RATE_PCT = 25;
@@ -110,31 +125,31 @@ export function rateFor(cfg: Pick<WorkConfig, 'tierRates'>, tier: string): numbe
 
 export function loadWorkConfig(env: NodeJS.ProcessEnv): WorkConfig {
   const weight = Number(env.WORK_EVIDENCE_WEIGHT);
-  const workersBps = num(env.WORK_SPLIT_WORKERS_BPS, 4000, 0, 10000);
+  const workersBps = int(env.WORK_SPLIT_WORKERS_BPS, 4000, 0, 10000);
   return {
     open: env.WORK_OPEN === 'true',
     jobKind: jobKind(env.WORK_JOB_KIND ?? '') ? (env.WORK_JOB_KIND as string) : WALLET_HISTORY_KIND,
-    slotCap: num(env.WORK_SLOT_CAP, 500, 1, 100000),
-    panelSize: num(env.WORK_PANEL_SIZE, 3, 2, 15),
-    leaseSeconds: num(env.WORK_LEASE_SECONDS, 300, 30, 3600),
-    maxLeasesPerWorker: num(env.WORK_MAX_LEASES, 3, 1, 20),
-    maxJobsPerHour: num(env.WORK_MAX_JOBS_PER_HOUR, 600, 1, 100000),
-    windowDays: num(env.WORK_WINDOW_DAYS, 30, 1, 365),
-    maxSignatures: num(env.WORK_MAX_SIGNATURES, 1000, 1, 10000),
-    jobBatch: num(env.WORK_JOB_BATCH, 50, 1, 1000),
+    slotCap: int(env.WORK_SLOT_CAP, 500, 1, 100000),
+    panelSize: int(env.WORK_PANEL_SIZE, 3, 2, 15),
+    leaseSeconds: int(env.WORK_LEASE_SECONDS, 300, 30, 3600),
+    maxLeasesPerWorker: int(env.WORK_MAX_LEASES, 3, 1, 20),
+    maxJobsPerHour: int(env.WORK_MAX_JOBS_PER_HOUR, 600, 1, 100000),
+    windowDays: int(env.WORK_WINDOW_DAYS, 30, 1, 365),
+    maxSignatures: int(env.WORK_MAX_SIGNATURES, 1000, 1, 10000),
+    jobBatch: int(env.WORK_JOB_BATCH, 50, 1, 1000),
     jobTtlHours: num(env.WORK_JOB_TTL_HOURS, 6, 0.1, 24 * 30),
-    recheckHours: num(env.WORK_RECHECK_HOURS, 24, 0, 24 * 90),
+    recheckHours: int(env.WORK_RECHECK_HOURS, 24, 0, 24 * 90),
     spotCheckRate: num(env.WORK_SPOT_CHECK_RATE, 0.05, 0, 1),
     evidenceWeight: env.WORK_EVIDENCE_WEIGHT && Number.isFinite(weight) && weight > 0 && weight <= 3 ? weight : null,
-    evidenceMinAccepted: num(env.WORK_EVIDENCE_MIN_ACCEPTED, 10, 1, 100000),
+    evidenceMinAccepted: int(env.WORK_EVIDENCE_MIN_ACCEPTED, 10, 1, 100000),
     applyActivity: env.WORK_APPLY_ACTIVITY === 'true',
     tierRates: parseTierRates(env.WORK_TIER_RATES ?? DEFAULT_TIER_RATES),
-    maxSlotsPerOwner: num(env.WORK_MAX_SLOTS_PER_OWNER, 3, 1, 1000),
+    maxSlotsPerOwner: int(env.WORK_MAX_SLOTS_PER_OWNER, 3, 1, 1000),
     ipSeparation: env.WORK_IP_SEPARATION !== 'false',
     commonFunders: new Set((env.WORK_COMMON_FUNDERS ?? '').split(',').map((w) => w.trim()).filter(Boolean)),
     workersBps,
-    lockBps: Math.min(num(env.WORK_SPLIT_LOCK_BPS, 4000, 0, 10000), 10000 - workersBps),
-    minPayoutLamports: num(env.WORK_MIN_PAYOUT_LAMPORTS, 1_000_000, 0, 1e12),
+    lockBps: Math.min(int(env.WORK_SPLIT_LOCK_BPS, 4000, 0, 10000), 10000 - workersBps),
+    minPayoutLamports: int(env.WORK_MIN_PAYOUT_LAMPORTS, 1_000_000, 0, 1e12),
   };
 }
 
@@ -429,6 +444,10 @@ const MAX_OPEN_BATCHES = 20;
 // workers polling do not each run the cut query every 30 seconds.
 const FORCE_RETRY_MS = 60 * 1000;
 let lastEmptyForceAt = 0;
+// A plain (non-forced) cut is tried at most this often across all claims, so
+// claims arriving while the board is low do not each run the cut query.
+const CUT_SPACING_MS = 10 * 1000;
+let lastCutAttemptAt = 0;
 
 /**
  * Cut a batch of jobs for the verified wallets checked longest ago. Runs when
@@ -444,8 +463,10 @@ export async function ensureOpenJobs(
 ): Promise<number> {
   const lowWater = force ? cfg.jobBatch * MAX_OPEN_BATCHES : Math.ceil(cfg.jobBatch / 2);
   if (force && now.getTime() - lastEmptyForceAt < FORCE_RETRY_MS) return 0;
+  if (!force && now.getTime() - lastCutAttemptAt < CUT_SPACING_MS) return 0;
   const open = await prisma.workJob.count({ where: { status: 'open' } });
   if (open >= lowWater) return 0;
+  if (!force) lastCutAttemptAt = now.getTime();
 
   return prisma.$transaction(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(${LOCK_JOBS})`;
@@ -553,7 +574,7 @@ export async function claimJob(
         AND j."subjectWallet" <> ALL(${related.wallets})
         AND NOT EXISTS (
           SELECT 1 FROM "WorkAssignment" a
-          WHERE a."jobId" = j.id AND a."workerWallet" = ${slot.wallet}
+          WHERE a."jobId" = j.id AND a."workerWallet" = ${slot.wallet} AND a.status <> 'expired'
         )
         AND (
           SELECT count(*) FROM "WorkAssignment" a
@@ -573,13 +594,47 @@ export async function claimJob(
       FOR UPDATE OF j SKIP LOCKED
     `;
     if (picked.length === 0) return null;
-    return tx.workAssignment.create({
-      data: { jobId: picked[0].id, workerWallet: slot.wallet, leaseExpiresAt },
-      include: { job: { select: { kind: true, spec: true } } },
-    });
+    const jobId = picked[0].id;
+
+    // The pick above read a snapshot. Now that this job is locked, and every
+    // other claim on it waits for us, check again what is committed: a claim
+    // that took a seat meanwhile must not overfill the panel or seat a
+    // related worker beside its sibling.
+    const fits = await tx.$queryRaw<{ ok: boolean }[]>`
+      SELECT (
+        (SELECT count(*) FROM "WorkAssignment" a WHERE a."jobId" = ${jobId} AND a.status <> 'expired')
+          < (SELECT "panelSize" FROM "WorkJob" WHERE id = ${jobId})
+        AND NOT EXISTS (
+          SELECT 1 FROM "WorkAssignment" a
+          JOIN "Agent" g ON g.wallet = a."workerWallet"
+          WHERE a."jobId" = ${jobId} AND a.status <> 'expired'
+            AND (g.owner = ${related.owner} OR a."workerWallet" = ANY(${related.wallets}))
+        )
+      ) AS ok
+    `;
+    if (!fits[0]?.ok) return null;
+
+    // One claim per worker at a time, so parallel claims cannot pass the
+    // open-lease limit together.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'work-worker:' + slot.wallet}))`;
+    const leased = await tx.workAssignment.count({ where: { workerWallet: slot.wallet, status: 'leased' } });
+    if (leased >= cfg.maxLeasesPerWorker) return null;
+
+    // A seat this worker held and let expire is taken up again, not added.
+    const expired = await tx.workAssignment.findUnique({ where: { jobId_workerWallet: { jobId, workerWallet: slot.wallet } } });
+    const include = { job: { select: { kind: true, spec: true } } } as const;
+    if (expired) {
+      return tx.workAssignment.update({
+        where: { id: expired.id },
+        data: { status: 'leased', leaseExpiresAt, createdAt: now, resultHash: null, result: Prisma.DbNull, verdict: null, submittedAt: null },
+        include,
+      });
+    }
+    return tx.workAssignment.create({ data: { jobId, workerWallet: slot.wallet, leaseExpiresAt }, include });
   });
 
-  let assignment = await pickJob();
+  // A second try covers a pick that lost its seat to a concurrent claim.
+  let assignment = (await pickJob()) ?? (await pickJob());
   if (!assignment && (await ensureOpenJobs(prisma, cfg, now, true)) > 0) assignment = await pickJob();
   if (!assignment) return { assignment: null, retryAfterSeconds: 30 };
   return {
@@ -760,19 +815,25 @@ export async function applyReference(
 }
 
 /**
- * Re-run accepted jobs of the kinds that must be confirmed whose first
- * re-run never completed (an RPC error, a restart). Oldest first, a few at a
- * time, so a backlog never floods our RPC.
+ * Re-run jobs whose first re-run never completed (an RPC error, a restart, a
+ * full queue): every disagreed job, and accepted jobs of the kinds that must
+ * be confirmed. Only jobs from the last two days, picked at random, a few at
+ * a time: a job that always fails cannot block the rest, and a backlog never
+ * floods the RPC.
  */
 export async function retryUnconfirmed(prisma: PrismaClient, hooks: SettleHooks, limit = 20, now: Date = new Date()): Promise<number> {
+  if (!hooks.reference) return 0;
   const kinds = [...(hooks.confirmKinds ?? [])];
-  if (!hooks.reference || kinds.length === 0) return 0;
-  const jobs = await prisma.workJob.findMany({
-    where: { status: 'accepted', kind: { in: kinds }, referenceHash: null, settledAt: { lt: new Date(now.getTime() - 60 * 1000) } },
-    orderBy: { settledAt: 'asc' },
-    take: limit,
-    select: { id: true },
-  });
+  const since = new Date(now.getTime() - 2 * 86400 * 1000);
+  const before = new Date(now.getTime() - 60 * 1000);
+  const jobs = await prisma.$queryRaw<{ id: string }[]>`
+    SELECT id FROM "WorkJob"
+    WHERE "referenceHash" IS NULL
+      AND "settledAt" >= ${since} AND "settledAt" < ${before}
+      AND (status = 'disagreed' OR (status = 'accepted' AND kind = ANY(${kinds})))
+    ORDER BY random()
+    LIMIT ${limit}
+  `;
   let done = 0;
   for (const j of jobs) {
     try {

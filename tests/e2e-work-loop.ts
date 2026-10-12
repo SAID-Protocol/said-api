@@ -4,7 +4,7 @@
  * real HTTP routes with real signatures and real mainnet wallet history.
  *
  * Boot the server with:
- *   WORK_OPEN=true ADMIN_SECRET=vk WORK_SLOT_CAP=7 WORK_JOB_BATCH=3 WORK_SPOT_CHECK_RATE=1 WORK_RECHECK_HOURS=0
+ *   WORK_EPOCH_MARGIN_HOURS=0 WORK_OPEN=true ADMIN_SECRET=vk WORK_SLOT_CAP=7 WORK_JOB_BATCH=3 WORK_SPOT_CHECK_RATE=1 WORK_RECHECK_HOURS=0
  *   WORK_JOB_KIND=wallet_activity_v1 WORK_APPLY_ACTIVITY=true   (optional: the fuller job)
  *
  * Run:
@@ -323,7 +323,14 @@ async function main() {
   check('an announcement needs the admin secret', (await adminPost('/api/work/admin/updates', { title: 'x', body: 'y' }, 'nope')).status, 404);
   check('an announcement is posted', (await adminPost('/api/work/admin/updates', { title: 'First payout sent', body: 'Period e2e paid three workers.' })).status, 201);
   check('announcements are public, newest first', (await get('/api/work/updates')).body.updates[0].title, 'First payout sent');
-  check('an anchor transaction can be attached to a closed day', (await adminPost(`/api/work/admin/records/${yesterday}/anchor`, { tx: '3'.repeat(88) })).body.anchorTx, '3'.repeat(88));
+  check('an empty past day is not frozen, so it cannot be anchored', (await adminPost(`/api/work/admin/records/${yesterday}/anchor`, { tx: '3'.repeat(88) })).status, 404);
+
+  // Claims fired at the same moment must not overfill a panel.
+  for (let round = 0; round < 4; round++) {
+    await Promise.all([w1, w2, w3, w5, filler].map((w) => claimJob(w)));
+  }
+  const seats = await prisma.workAssignment.groupBy({ by: ['jobId'], where: { status: { not: 'expired' } }, _count: { _all: true } });
+  check('parallel claims never seat more than three on a panel', seats.every((g) => g._count._all <= 3), true);
 
   // ── Reward period and payouts ───────────────────────────────────────────
   const period = { label: 'e2e-period', startsAt: startedAt.toISOString(), endsAt: new Date().toISOString(), rewardsLamports: '1000000000' };

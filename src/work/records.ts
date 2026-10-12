@@ -85,24 +85,47 @@ async function dayLeaves(prisma: PrismaClient, day: string) {
   return jobs.map((j) => ({ jobId: j.id, kind: j.kind, subject: j.subjectWallet, status: j.status, resultHash: j.resultHash as string, leaf: leafHash(j.id, j.resultHash as string) }));
 }
 
-/** The record for one UTC day. A day that has ended is frozen on first read. */
-export async function getDayRecord(prisma: PrismaClient, day: string, now: Date = new Date()) {
+// A closed day's record never changes (leaf status aside), so it is kept in
+// memory after the first read: proofs for that day do not reload and rehash
+// the whole day each time.
+type DayRecord = Awaited<ReturnType<typeof buildDayRecord>>;
+const closedDays = new Map<string, { record: DayRecord; leaves: string[]; at: number }>();
+const CLOSED_DAY_TTL_MS = 10 * 60 * 1000;
+
+async function buildDayRecord(prisma: PrismaClient, day: string, now: Date) {
   const { end } = dayBounds(day);
   const leaves = await dayLeaves(prisma, day);
   const ended = end <= now;
   let frozen = await prisma.workDayRoot.findUnique({ where: { day } });
-  if (!frozen && ended) {
+  // Only a day with work is frozen: reading an empty past day writes nothing.
+  if (!frozen && ended && leaves.length > 0) {
     const root = merkleRoot(leaves.map((l) => l.leaf));
     frozen = await prisma.workDayRoot.upsert({ where: { day }, update: {}, create: { day, root, count: leaves.length } });
   }
   return {
     day,
-    final: Boolean(frozen),
+    final: Boolean(frozen) || (ended && leaves.length === 0),
     root: frozen?.root ?? merkleRoot(leaves.map((l) => l.leaf)),
     count: frozen?.count ?? leaves.length,
     anchorTx: frozen?.anchorTx ?? null,
     leaves: leaves.map(({ jobId, kind, subject, status, resultHash }) => ({ jobId, kind, subject, status, resultHash })),
   };
+}
+
+/** The record for one UTC day. A day that has ended is frozen on first read. */
+export async function getDayRecord(prisma: PrismaClient, day: string, now: Date = new Date()) {
+  const hit = closedDays.get(day);
+  if (hit && now.getTime() - hit.at < CLOSED_DAY_TTL_MS) return hit.record;
+  const record = await buildDayRecord(prisma, day, now);
+  if (record.final) {
+    if (closedDays.size > 30) closedDays.clear();
+    closedDays.set(day, { record, leaves: record.leaves.map((l) => leafHash(l.jobId, l.resultHash)), at: now.getTime() });
+  }
+  return record;
+}
+
+function leafHashesFor(day: string, record: DayRecord): string[] {
+  return closedDays.get(day)?.leaves ?? record.leaves.map((l) => leafHash(l.jobId, l.resultHash));
 }
 
 /** Proof that one accepted job is in its day's record. */
@@ -113,7 +136,7 @@ export async function getJobProof(prisma: PrismaClient, jobId: string) {
   }
   const day = job.settledAt.toISOString().slice(0, 10);
   const record = await getDayRecord(prisma, day);
-  const leaves = record.leaves.map((l) => leafHash(l.jobId, l.resultHash));
+  const leaves = leafHashesFor(day, record);
   const index = record.leaves.findIndex((l) => l.jobId === jobId);
   if (index < 0) throw new WorkError(404, 'This job is not in its day record');
   return {
@@ -134,6 +157,7 @@ export async function recordAnchorTx(prisma: PrismaClient, day: string, tx: unkn
   dayBounds(day);
   const row = await prisma.workDayRoot.findUnique({ where: { day } });
   if (!row) throw new WorkError(404, 'That day has no frozen record yet');
+  closedDays.delete(day);
   return prisma.workDayRoot.update({ where: { day }, data: { anchorTx: tx } });
 }
 

@@ -162,7 +162,7 @@ const RATE_WINDOW = 60_000; // 1 minute
 
 // Static, cacheable pages are never rate limited: a shared office or carrier
 // IP must not lose the checker page itself because of other traffic.
-const RATE_LIMIT_EXEMPT = new Set(['/check', '/check-card.png', '/work', '/work/skill.md', '/work/said-worker.cjs', '/favicon.ico', '/health']);
+const RATE_LIMIT_EXEMPT = new Set(['/check', '/check-card.png', '/work', '/work/skill.md', '/favicon.ico', '/health']);
 // The public asset passport is cached and cheap, and a shared link fans out
 // from a single IP (link-preview fetchers, NAT), so it has its own budget.
 const ASSET_RATE_LIMIT = 300;
@@ -181,13 +181,18 @@ app.use('/*', async (c, next) => {
   
   const now = Date.now();
   const isAsset = path.startsWith('/api/asset/');
-  const isWork = path.startsWith('/api/work/');
+  const isWork = path.startsWith('/api/work/') || path === '/work/said-worker.cjs';
   const map = isAsset ? assetRateLimitMap : isWork ? workRateLimitMap : rateLimitMap;
   const limit = isAsset ? ASSET_RATE_LIMIT : isWork ? WORK_RATE_LIMIT : RATE_LIMIT;
-  const entry = map.get(ip);
+  // The work loop's larger budget is keyed on the address the proxy appended
+  // (the last x-forwarded-for entry); the first entry is written by the caller
+  // and would let one client spread itself over unlimited buckets.
+  const lastHop = c.req.header('x-forwarded-for')?.split(',').map((p) => p.trim()).filter(Boolean).pop();
+  const key = isWork ? (lastHop || ip) : ip;
+  const entry = map.get(key);
   
   if (!entry || now > entry.resetAt) {
-    map.set(ip, { count: 1, resetAt: now + RATE_WINDOW });
+    map.set(key, { count: 1, resetAt: now + RATE_WINDOW });
   } else {
     entry.count++;
     if (entry.count > limit) {
@@ -8206,8 +8211,10 @@ app.post('/admin/delete-feedback', async (c) => {
 });
 
 app.get('/admin/delete-agent/:id', async (c) => {
-  const secret = c.req.query('secret');
-  if (secret !== 'temp-link-2026') return c.json({ error: 'Unauthorized' }, 401);
+  // Was guarded by a fixed query-string secret written in this public repo,
+  // so anyone could delete any agent. Now the same header auth as every
+  // other admin route.
+  if (!checkAdminAuth(c)) return c.notFound();
   const { id } = c.req.param();
   await prisma.agent.delete({ where: { id } });
   return c.json({ ok: true, deleted: id });
@@ -9257,15 +9264,13 @@ app.route('/api/work', createWorkRouter(prisma, connection));
 console.log('✅ Work loop mounted (GET /api/work/stats, /feed, /workers; POST /slots/claim, /jobs/claim, /assignments/:id/submit)');
 
 // The public live feed page for the work loop.
+let workPage: Promise<string | null> | null = null;
 app.get('/work', async (c) => {
-  try {
-    const path = await import('path');
-    const html = await fs.readFile(path.join(process.cwd(), 'public', 'work.html'), 'utf8');
-    c.header('Cache-Control', 'public, max-age=300');
-    return c.html(html);
-  } catch {
-    return c.text('', 404);
-  }
+  workPage ??= import('path').then((path) => fs.readFile(path.join(process.cwd(), 'public', 'work.html'), 'utf8')).catch(() => null);
+  const html = await workPage;
+  if (!html) return c.text('', 404);
+  c.header('Cache-Control', 'public, max-age=300');
+  return c.html(html);
 });
 
 // What an agent needs to join the work loop: the skill it reads and the
@@ -9283,7 +9288,8 @@ app.get('/work/said-worker.cjs', async (c) => {
   c.header('Content-Type', 'application/javascript; charset=utf-8');
   c.header('Cache-Control', 'public, max-age=300');
   c.header('X-Content-SHA256', worker.sha256);
-  return c.body(new Uint8Array(worker.body));
+  // A view onto the cached bytes, not a copy of 1.5 MB per request.
+  return c.body(new Uint8Array(worker.body.buffer as ArrayBuffer, worker.body.byteOffset, worker.body.byteLength));
 });
 
 // Mount Trust Crisis endpoint (ERC-8004 comparison + economic trust verdict)

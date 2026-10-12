@@ -13,7 +13,7 @@ import {
   type WalletHistorySpec,
 } from '../src/work/wallet-history.js';
 import { isFresh, signMessage, slotClaimMessage, submitMessage, verifyMessage } from '../src/work/auth.js';
-import { breakerState, loadWorkConfig, panelAgrees, parseTierRates, rateFor, type FinishedAssignment } from '../src/work/engine.js';
+import { breakerState, loadWorkConfig, wrongPenalty, panelAgrees, parseTierRates, rateFor, type FinishedAssignment } from '../src/work/engine.js';
 import { canonicalActivity, hashActivity, summarizeActivity, type TxView } from '../src/work/wallet-activity-job.js';
 import { jobKind } from '../src/work/kinds.js';
 import { computeShares, unitsFor } from '../src/work/payouts.js';
@@ -172,6 +172,11 @@ check('default hourly cap', loadWorkConfig({}).maxJobsPerHour, 600);
 check('one owner holds at most three slots by default', loadWorkConfig({}).maxSlotsPerOwner, 3);
 check('address separation is on unless switched off', [loadWorkConfig({}).ipSeparation, loadWorkConfig({ WORK_IP_SEPARATION: 'false' }).ipSeparation], [true, false]);
 check('common funders are read as a list', [...loadWorkConfig({ WORK_COMMON_FUNDERS: ' a , b,, ' }).commonFunders], ['a', 'b']);
+
+// Penalty and integer settings
+check('the penalty outweighs uncaught fakes at the check rate', [wrongPenalty(0.05), wrongPenalty(0.5), wrongPenalty(1), wrongPenalty(0)], [20, 10, 10, 100]);
+check('at 5% checks, a made-up answer loses money on average', 0.95 * 1 - 0.05 * wrongPenalty(0.05) < 0, true);
+check('counting settings round down', [loadWorkConfig({ WORK_PANEL_SIZE: '3.7' }).panelSize, loadWorkConfig({ WORK_SLOT_CAP: '10.9' }).slotCap], [3, 10]);
 
 // Daily record
 const lv = ['a', 'b', 'c', 'd', 'e'].map((j) => leafHash(j, 'h' + j));

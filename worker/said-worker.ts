@@ -30,7 +30,7 @@
  *   SAID_WORKER_HOME where the worker key lives. Default ~/.said-worker
  */
 
-import { spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { createHash } from 'crypto';
 import { openSync } from 'fs';
 import { chmod, mkdir, readFile, rm, writeFile } from 'fs/promises';
@@ -146,6 +146,14 @@ async function runningPid(): Promise<number | null> {
     const pid = Number(await readFile(PID_FILE, 'utf8'));
     if (!Number.isInteger(pid) || pid <= 0) return null;
     process.kill(pid, 0); // throws when no such process
+    // A pid file left by a crash can name a process that has since been
+    // reused by something else; only a said-worker counts.
+    try {
+      const cmd = execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' });
+      if (!/said-worker/.test(cmd)) return null;
+    } catch {
+      return null;
+    }
     return pid;
   } catch {
     return null;
@@ -311,7 +319,7 @@ async function run(): Promise<void> {
         // A job kind this build does not know. Claiming again would only
         // pile up leases that expire against the record, so stop here.
         await rm(PID_FILE, { force: true });
-        throw new Error(`job ${a.jobId} is of kind "${a.kind}", which this worker does not know: download the worker again and restart`);
+        throw new Error(`not allowed to work: job ${a.jobId} is of kind "${a.kind}", which this worker does not know; download the worker again and restart`);
       }
 
       const result = await kind.run(conn, a.spec);

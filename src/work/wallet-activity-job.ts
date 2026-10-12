@@ -134,7 +134,10 @@ async function fetchTransactions(conn: Connection, signatures: string[]): Promis
     return await conn.getParsedTransactions(signatures, opts);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (!/batch|not supported|not allowed|403|413|paid plan|specific RPC call/i.test(msg)) throw err;
+    // A rate limit is not a refusal of batches: retrying it as a hundred
+    // single reads would only make it worse.
+    if (/429|too many|rate limit|request limit/i.test(msg)) throw err;
+    if (!/batch|not supported|not allowed|403|413|paid plan/i.test(msg)) throw err;
   }
   const out: ParsedTx[] = new Array(signatures.length).fill(null);
   for (let i = 0; i < signatures.length; i += SINGLE_CONCURRENCY) {
@@ -229,7 +232,17 @@ export function hashActivity(result: WalletActivityResult): string {
  * the scanner (which refreshes the stalest rows first) leaves this wallet
  * alone until the answer ages. Called only when the operator opted in.
  */
+// An answer whose window ended longer ago than this is too old to stand in
+// for a fresh scan, and is not written.
+const MAX_APPLY_AGE_MS = 6 * 3600 * 1000;
+
 export async function applyActivityResult(prisma: PrismaClient, result: WalletActivityResult, windowDays: number): Promise<void> {
+  const windowEnd = new Date(result.toTime * 1000);
+  if (Date.now() - windowEnd.getTime() > MAX_APPLY_AGE_MS) return;
+  // Never replace a scan that covers later activity than this answer does.
+  const existing = await prisma.agentActivityStats.findUnique({ where: { wallet: result.wallet }, select: { computedAt: true } });
+  if (existing && existing.computedAt > windowEnd) return;
+  windowDays = Math.round((result.toTime - result.fromTime) / 86400);
   const date = (t: number | null) => (t === null ? null : new Date(t * 1000));
   const data = {
     windowDays,
@@ -239,7 +252,7 @@ export async function applyActivityResult(prisma: PrismaClient, result: WalletAc
     activeDays: result.successActiveDays,
     oldestSeen: date(result.firstSuccessTime),
     latestSeen: date(result.lastSuccessTime),
-    computedAt: new Date(),
+    computedAt: windowEnd,
     source: 'work-panel',
   };
   await prisma.agentActivityStats.upsert({ where: { wallet: result.wallet }, update: data, create: { wallet: result.wallet, ...data } });

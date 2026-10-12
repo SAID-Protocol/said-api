@@ -44,6 +44,7 @@ import {
   getStats,
   getWorkers,
   loadWorkConfig,
+  wrongPenalty,
   retryUnconfirmed,
   settleDailyEvidence,
   submitResult,
@@ -51,7 +52,8 @@ import {
 } from './engine.js';
 import { refreshFunder } from './funder.js';
 import { JOB_KINDS, jobKind } from './kinds.js';
-import { WRONG_PENALTY, createEpoch, getPayouts, recordLockTx } from './payouts.js';
+import { WALLET_HISTORY_KIND } from './wallet-history.js';
+import { createEpoch, getPayouts, recordLockTx } from './payouts.js';
 import { freezeYesterday, getDayRecord, getJobProof, getUpdates, postUpdate, recordAnchorTx } from './records.js';
 import { WALLET_ACTIVITY_KIND, applyActivityResult, type WalletActivityResult } from './wallet-activity-job.js';
 import { SIGNATURE_WINDOW_MS } from './auth.js';
@@ -125,11 +127,25 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
   // The work loop never shares the RPC the rest of the API depends on.
   // Without its own endpoint, writing activity stats stays off and our
   // re-runs are throttled hard on the shared one.
-  const ownRpc = process.env.WORK_RPC_URL;
-  const workConn = ownRpc ? new Connection(ownRpc, 'finalized') : connection;
-  if (cfg.applyActivity && !ownRpc) {
-    console.error('[work] WORK_APPLY_ACTIVITY needs WORK_RPC_URL, a dedicated RPC; activity writes stay off');
+  let ownRpc: Connection | null = null;
+  const rpcUrl = process.env.WORK_RPC_URL?.trim();
+  if (rpcUrl) {
+    try {
+      ownRpc = new Connection(rpcUrl, 'finalized');
+    } catch (err) {
+      // A mistyped optional setting must never stop the whole API booting.
+      console.error('[work] WORK_RPC_URL is not a usable http(s) URL; the work loop uses the throttled shared RPC:', err instanceof Error ? err.message : err);
+    }
+  }
+  const workConn = ownRpc ?? connection;
+  if (!ownRpc) {
+    // The fuller job reads every transaction; on the shared RPC that is the
+    // burst that failed a ClawPump confirm. Without a dedicated RPC the loop
+    // stays on the light job and writes nothing.
+    if (cfg.applyActivity) console.error('[work] WORK_APPLY_ACTIVITY needs WORK_RPC_URL, a dedicated RPC; activity writes stay off');
+    if (cfg.jobKind !== WALLET_HISTORY_KIND) console.error(`[work] WORK_JOB_KIND=${cfg.jobKind} needs WORK_RPC_URL; cutting ${WALLET_HISTORY_KIND} jobs`);
     cfg.applyActivity = false;
+    cfg.jobKind = WALLET_HISTORY_KIND;
   }
   const queue = ownRpc ? serialQueue(250, 500) : serialQueue(REFERENCE_SPACING_MS, REFERENCE_MAX_WAITING);
   const hooks: SettleHooks = {
@@ -152,7 +168,27 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
     return Boolean(secret) && c.req.header('x-admin-secret') === secret;
   };
 
-  router.get('/stats', async (c) => c.json(await getStats(prisma, cfg)));
+  // Public reads that fan out to several queries are cached briefly, so a busy
+  // page or a polling bot costs one set of queries every few seconds.
+  const cache = new Map<string, { at: number; body: unknown }>();
+  const cached = async (key: string, ttlMs: number, load: () => Promise<unknown>) => {
+    const hit = cache.get(key);
+    if (hit && Date.now() - hit.at < ttlMs) return hit.body;
+    const body = await load();
+    cache.set(key, { at: Date.now(), body });
+    if (cache.size > 500) cache.clear();
+    return body;
+  };
+  // Look a slot's funder up only when it is unknown and not tried lately, so
+  // ordinary claims never put work on the re-run queue.
+  const maybeRefreshFunder = async (wallet: string) => {
+    const s = await prisma.workSlot.findUnique({ where: { wallet }, select: { funder: true, funderCheckedAt: true } });
+    if (!s || s.funder) return;
+    if (s.funderCheckedAt && Date.now() - s.funderCheckedAt.getTime() < 6 * 3600 * 1000) return;
+    void queue(() => refreshFunder(prisma, workConn, wallet)).catch(() => undefined);
+  };
+
+  router.get('/stats', async (c) => c.json(await cached('stats', 5000, () => getStats(prisma, cfg))));
 
   router.get('/feed', async (c) => c.json({ jobs: await getFeed(prisma, clampLimit(c.req.query('limit'), 50, 200)) }));
 
@@ -197,7 +233,7 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
             payout: {
               workersBps: cfg.workersBps,
               lockBps: cfg.lockBps,
-              formula: '(accepted answers - wrong answers x ' + WRONG_PENALTY + ') x your tier rate, as a share of all workers\' totals, times the worker pool',
+              formula: '(accepted answers - wrong answers x ' + wrongPenalty(cfg.spotCheckRate) + ') x your tier rate, as a share of all workers\' totals, times the worker pool',
               // Percent of the base rate per reputation tier; a tier not listed is paid at 100.
               tierRates: cfg.tierRates,
               minPayoutLamports: cfg.minPayoutLamports,
@@ -237,7 +273,7 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
     try {
       const { slot, created } = await claimSlot(prisma, cfg, await readJson(c), addressHash(c));
       // Not awaited: the lookup walks the wallet's history on our RPC.
-      void queue(() => refreshFunder(prisma, workConn, slot.wallet)).catch(() => undefined);
+      await maybeRefreshFunder(slot.wallet);
       return c.json({ wallet: slot.wallet, workerKey: slot.workerKey, claimedAt: slot.claimedAt.toISOString(), created }, created ? 201 : 200);
     } catch (err) {
       return fail(c, err);
@@ -250,7 +286,7 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
       const out = await claimJob(prisma, cfg, body, new Date(), addressHash(c));
       if (typeof body.workerKey === 'string') {
         const slot = await prisma.workSlot.findUnique({ where: { workerKey: body.workerKey }, select: { wallet: true } });
-        if (slot) void queue(() => refreshFunder(prisma, workConn, slot.wallet)).catch(() => undefined);
+        if (slot) await maybeRefreshFunder(slot.wallet);
       }
       return c.json(out);
     } catch (err) {
@@ -341,7 +377,7 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
   });
 
   // Confirming re-runs that failed (an RPC hiccup, a restart) are tried again.
-  if (hooks.confirmKinds?.size) {
+  {
     setInterval(
       () => retryUnconfirmed(prisma, hooks).catch((err) => console.error('[work] retry of unconfirmed jobs failed:', err instanceof Error ? err.message : err)),
       RETRY_INTERVAL_MS,

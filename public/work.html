@@ -229,12 +229,11 @@
   }
   async function refresh() {
     try {
-      const [s, f, w, p, n] = await Promise.all(
-        ['/api/work/stats', '/api/work/feed?limit=30', '/api/work/workers?limit=25', '/api/work/payouts?limit=6', '/api/work/updates?limit=1'].map((u) =>
-          fetch(u).then((r) => { if (!r.ok) throw new Error(String(r.status)); return r.json(); }),
-        ),
-      );
-      renderStats(s); renderFeed(f.jobs); renderWorkers(w.workers); renderPayouts(p.epochs, s.rewardSplit); renderNotice(n.updates);
+      // One cached call for the whole page.
+      const r = await fetch('/api/work/swarm');
+      if (!r.ok) throw new Error(String(r.status));
+      const sw = await r.json();
+      renderStats(sw); renderFeed(sw.feed); renderWorkers(sw.workers.slice(0, 25)); renderPayouts(sw.payouts, sw.rewardSplit); renderNotice(sw.updates);
       $('dot').className = 'dot on'; $('live-text').textContent = 'live';
     } catch {
       $('dot').className = 'dot'; $('live-text').textContent = 'reconnecting';

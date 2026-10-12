@@ -993,6 +993,8 @@ model WorkAssignment {
   @@unique([jobId, workerWallet])
   @@index([workerWallet, status])
   @@index([workerWallet, submittedAt])
+  @@index([workerWallet, createdAt])
+  @@index([submittedAt])
   @@index([status, leaseExpiresAt])
 }
 
