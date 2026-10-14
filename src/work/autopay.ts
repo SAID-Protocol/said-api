@@ -2,9 +2,10 @@
  * Work loop — automatic reward periods and payouts.
  *
  * Once a day, for each UTC day that has ended and settled:
- *   1. record a reward period for that day. Its earnings are the
- *      verification fees the protocol took that day: verifications recorded
- *      in the registry × the verification fee.
+ *   1. record a reward period for that day. Its earnings are the SOL the
+ *      payout wallet received that day from the creator wallet
+ *      (WORK_EARNINGS_SOURCE): the share of $SAID creator rewards sent to
+ *      the work loop. Transfers from anywhere else are not counted.
  *   2. pay the workers' shares in SOL from the payout wallet, oldest first.
  *
  * The server holds the payout wallet's key for this, so the wallet is meant
@@ -37,7 +38,7 @@ const AUTO_START_DEFAULT = '2026-10-14';
 export interface AutoPayConfig {
   enabled: boolean;
   payer: Keypair | null;
-  feeLamports: bigint;
+  source: PublicKey | null;
   maxPoolLamports: bigint;
   marginMs: number;
   startDay: string;
@@ -53,15 +54,22 @@ export function loadAutoPayConfig(env: NodeJS.ProcessEnv): AutoPayConfig {
       console.error('[work] WORK_PAYOUT_SECRET is not a valid Solana secret key; automatic payouts are off');
     }
   }
-  const fee = Number(env.WORK_VERIFY_FEE_LAMPORTS);
+  let source: PublicKey | null = null;
+  if (env.WORK_EARNINGS_SOURCE) {
+    try {
+      source = new PublicKey(env.WORK_EARNINGS_SOURCE.trim());
+    } catch {
+      console.error('[work] WORK_EARNINGS_SOURCE is not a valid address; automatic payouts are off');
+    }
+  }
   const max = Number(env.WORK_AUTO_MAX_LAMPORTS);
   const margin = Number(env.WORK_EPOCH_MARGIN_HOURS);
   const start =
     env.WORK_AUTO_START_DAY && /^\d{4}-\d{2}-\d{2}$/.test(env.WORK_AUTO_START_DAY) ? env.WORK_AUTO_START_DAY : AUTO_START_DEFAULT;
   return {
-    enabled: env.WORK_AUTO_PAY === 'true' && payer !== null,
+    enabled: env.WORK_AUTO_PAY === 'true' && payer !== null && source !== null,
     payer,
-    feeLamports: BigInt(Number.isInteger(fee) && fee > 0 ? fee : 10_000_000),
+    source,
     maxPoolLamports: BigInt(Number.isInteger(max) && max > 0 ? max : 500_000_000),
     marginMs: (Number.isFinite(margin) && margin >= 0 && margin <= 72 ? margin : 6) * 3600 * 1000,
     startDay: start,
@@ -71,13 +79,46 @@ export function loadAutoPayConfig(env: NodeJS.ProcessEnv): AutoPayConfig {
 const dayStart = (day: string) => new Date(`${day}T00:00:00.000Z`);
 const dayOf = (d: Date) => d.toISOString().slice(0, 10);
 
+/**
+ * SOL the payout wallet received from the earnings source in [start, end):
+ * the sum of the payout wallet's balance gains in transactions signed by the
+ * source. Read from the chain, so it is exactly what arrived.
+ */
+export async function receivedFrom(conn: Connection, payout: PublicKey, source: PublicKey, start: Date, end: Date): Promise<bigint> {
+  const from = Math.floor(start.getTime() / 1000);
+  const to = Math.floor(end.getTime() / 1000);
+  let before: string | undefined;
+  let total = 0n;
+  for (let page = 0; page < 20; page++) {
+    const sigs = await conn.getSignaturesForAddress(payout, { limit: 1000, before }, 'finalized');
+    if (sigs.length === 0) break;
+    for (const s of sigs) {
+      if (s.err || typeof s.blockTime !== 'number' || s.blockTime >= to || s.blockTime < from) continue;
+      const tx = await conn.getParsedTransaction(s.signature, { maxSupportedTransactionVersion: 0, commitment: 'finalized' });
+      if (!tx?.meta) continue;
+      const keys = tx.transaction.message.accountKeys.map((k) => k.pubkey.toBase58());
+      const signedBySource = tx.transaction.message.accountKeys.some((k) => k.signer && k.pubkey.equals(source));
+      const i = keys.indexOf(payout.toBase58());
+      if (!signedBySource || i < 0) continue;
+      const gain = BigInt(tx.meta.postBalances[i]) - BigInt(tx.meta.preBalances[i]);
+      if (gain > 0n) total += gain;
+    }
+    const oldest = sigs[sigs.length - 1];
+    if (sigs.length < 1000 || (typeof oldest.blockTime === 'number' && oldest.blockTime < from)) break;
+    before = oldest.signature;
+  }
+  return total;
+}
+
 /** Record a period for every settled day not yet covered, from the start day on. */
 export async function recordDuePeriods(
   prisma: PrismaClient,
+  conn: Connection,
   cfg: WorkConfig,
   auto: AutoPayConfig,
   now: Date = new Date(),
 ): Promise<string[]> {
+  if (!auto.payer || !auto.source) return [];
   const recorded: string[] = [];
   // Start after the last recorded period, so manual and automatic ones never overlap.
   const last = await prisma.workEpoch.findFirst({ orderBy: { endsAt: 'desc' }, select: { endsAt: true } });
@@ -86,7 +127,7 @@ export async function recordDuePeriods(
   for (let i = 0; i < 14; i++) {
     const end = new Date(day.getTime() + DAY_MS);
     if (end.getTime() > now.getTime() - auto.marginMs) break;
-    const verifications = await prisma.agent.count({ where: { verifiedAt: { gte: day, lt: end } } });
+    const received = await receivedFrom(conn, auto.payer.publicKey, auto.source, day, end);
     const label = `auto-${dayOf(day)}`;
     await createEpoch(
       prisma,
@@ -95,11 +136,11 @@ export async function recordDuePeriods(
         label,
         startsAt: day.toISOString(),
         endsAt: end.toISOString(),
-        rewardsLamports: (auto.feeLamports * BigInt(verifications)).toString(),
+        rewardsLamports: received.toString(),
       },
       now,
     );
-    console.log(`[work] recorded ${label}: ${verifications} verifications`);
+    console.log(`[work] recorded ${label}: ${Number(received) / LAMPORTS_PER_SOL} SOL received from the creator wallet`);
     recorded.push(label);
     day = end;
   }
@@ -199,7 +240,7 @@ export async function payDue(prisma: PrismaClient, conn: Connection, auto: AutoP
 export async function autoPayTick(prisma: PrismaClient, conn: Connection, cfg: WorkConfig, auto: AutoPayConfig): Promise<void> {
   if (!auto.enabled) return;
   try {
-    await recordDuePeriods(prisma, cfg, auto);
+    await recordDuePeriods(prisma, conn, cfg, auto);
     await payDue(prisma, conn, auto);
   } catch (err) {
     console.error('[work] automatic payout pass failed:', err instanceof Error ? err.message : err);

@@ -123,7 +123,7 @@
     <li>Each job asks for one wallet's transaction history over a fixed period.</li>
     <li>An agent is never given its own wallet, or one linked to it, to check.</li>
     <li>If every answer on the panel matches, the check is accepted. If not, nothing is recorded and SAID re-runs it.</li>
-    <li>Each period, a fixed share of protocol rewards is paid to workers in SOL, in proportion to accepted work.</li>
+    <li>A share of $SAID creator rewards is paid to workers in SOL each day, in proportion to accepted work.</li>
     <li>Each day's accepted work is folded into one fingerprint anyone can check: <a id="record-link" href="/api/work/records/">today's record</a>.</li>
     <li>Agents join from a skill: <a href="/work/skill.md">/work/skill.md</a></li>
   </ul>
@@ -182,7 +182,9 @@
     return a;
   }
   function renderPayouts(epochs, split) {
-    $('split').textContent = 'Of each period\'s protocol rewards, ' + pct(split.workersBps) + ' is paid to workers and ' + pct(split.lockBps) + ' buys and locks $SAID.';
+    $('split').textContent = split.lockBps > 0
+      ? 'Of each period\'s earnings, ' + pct(split.workersBps) + ' is paid to workers and ' + pct(split.lockBps) + ' buys and locks $SAID.'
+      : 'A share of $SAID creator rewards is set aside for the work loop and paid to workers each day, split by accepted work.';
     const box = $('payouts');
     box.replaceChildren();
     if (!epochs.length) return box.append(el('div', 'empty', 'No reward period has been recorded yet.'));
@@ -191,7 +193,8 @@
       const left = el('div', 'main');
       left.append(el('div', 'subj', e.label));
       const paidTo = e.payouts.filter((p) => p.status === 'paid').length;
-      const meta = el('div', 'meta', sol(e.rewardsLamports) + ' rewards · ' + sol(e.paidLamports) + ' paid to ' + paidTo + ' of ' + e.payouts.length + ' workers · ' + sol(e.lockLamports) + ' to buy and lock');
+      const meta = el('div', 'meta', sol(e.rewardsLamports) + ' received · ' + sol(e.paidLamports) + ' paid to ' + paidTo + ' of ' + e.payouts.length + ' workers');
+      if (BigInt(e.lockLamports) > 0n) meta.append(' · ' + sol(e.lockLamports) + ' to buy and lock');
       if (e.lockTx) meta.append(' · ', txLink(e.lockTx, 'lock tx'));
       const firstPaid = e.payouts.find((p) => p.tx);
       if (firstPaid) meta.append(' · ', txLink(firstPaid.tx, 'payout tx'));
