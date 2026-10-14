@@ -50,6 +50,7 @@ import {
   submitResult,
   type SettleHooks,
 } from './engine.js';
+import { autoPayTick, loadAutoPayConfig } from './autopay.js';
 import { refreshFunder } from './funder.js';
 import { JOB_KINDS, jobKind } from './kinds.js';
 import { WALLET_HISTORY_KIND } from './wallet-history.js';
@@ -62,6 +63,7 @@ import { PUBLIC_API_URL, loadSkill, loadWorkerBundle } from './distribution.js';
 const EVIDENCE_INTERVAL_MS = 60 * 60 * 1000;
 const SWARM_TTL_MS = 10 * 1000;
 const RETRY_INTERVAL_MS = 5 * 60 * 1000;
+const AUTO_PAY_INTERVAL_MS = 30 * 60 * 1000;
 // Our own re-runs go through one at a time, spaced out, and are dropped when
 // too many are waiting. A dropped sampled check costs nothing; a dropped
 // confirming run is picked up again by the retry loop.
@@ -412,6 +414,15 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
   }
 
   // Close yesterday's record even if nobody asks for it.
+  // Automatic periods and payouts, off unless WORK_AUTO_PAY=true with a key.
+  const auto = loadAutoPayConfig(process.env);
+  if (auto.enabled) {
+    console.log(`[work] automatic payouts on from ${auto.payer!.publicKey.toBase58()}`);
+    const pay = () => void autoPayTick(prisma, workConn, cfg, auto);
+    setTimeout(pay, 60 * 1000);
+    setInterval(pay, AUTO_PAY_INTERVAL_MS);
+  }
+
   const freeze = () => freezeYesterday(prisma).catch((err) => console.error('[work] could not freeze the daily record:', err instanceof Error ? err.message : err));
   freeze();
   setInterval(freeze, EVIDENCE_INTERVAL_MS);
