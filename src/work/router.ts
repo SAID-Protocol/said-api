@@ -53,7 +53,7 @@ import {
 import { refreshFunder } from './funder.js';
 import { JOB_KINDS, jobKind } from './kinds.js';
 import { WALLET_HISTORY_KIND } from './wallet-history.js';
-import { createEpoch, getPayouts, recordLockTx } from './payouts.js';
+import { createEpoch, getPayouts, markSending, payoutRows, recordLockTx, settleSending } from './payouts.js';
 import { freezeYesterday, getDayRecord, getJobProof, getUpdates, postUpdate, recordAnchorTx } from './records.js';
 import { WALLET_ACTIVITY_KIND, applyActivityResult, type WalletActivityResult } from './wallet-activity-job.js';
 import { SIGNATURE_WINDOW_MS } from './auth.js';
@@ -318,6 +318,33 @@ export function createWorkRouter(prisma: PrismaClient, connection: Connection): 
         },
         201,
       );
+    } catch (err) {
+      return fail(c, err);
+    }
+  });
+
+  router.get('/admin/epochs/:label/payouts', async (c) => {
+    if (!isAdmin(c)) return c.json({ error: 'Not found' }, 404);
+    try {
+      return c.json(await payoutRows(prisma, c.req.param('label')));
+    } catch (err) {
+      return fail(c, err);
+    }
+  });
+
+  router.post('/admin/epochs/:label/sending', async (c) => {
+    if (!isAdmin(c)) return c.json({ error: 'Not found' }, 404);
+    try {
+      return c.json(await markSending(prisma, c.req.param('label'), await readJson(c)));
+    } catch (err) {
+      return fail(c, err);
+    }
+  });
+
+  router.post('/admin/epochs/:label/settle', async (c) => {
+    if (!isAdmin(c)) return c.json({ error: 'Not found' }, 404);
+    try {
+      return c.json(await settleSending(prisma, c.req.param('label'), await readJson(c)));
     } catch (err) {
       return fail(c, err);
     }

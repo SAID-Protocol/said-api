@@ -133,6 +133,70 @@ async function tiersFor(prisma: PrismaClient, wallets: string[]): Promise<Map<st
   return out;
 }
 
+// ─── Sending (driven by scripts/work-payout.ts over the admin API) ──────────
+//
+// The sender holds the payout key and never touches the database; the API
+// never holds the key. Each batch moves pending → sending (with its signature,
+// before broadcast) → paid, or back to pending only when the sender proves
+// nothing was sent.
+
+export async function payoutRows(prisma: PrismaClient, label: string) {
+  const epoch = await prisma.workEpoch.findUnique({ where: { label }, include: { payouts: { orderBy: { lamports: 'desc' } } } });
+  if (!epoch) throw new WorkError(404, 'No such period');
+  return {
+    label: epoch.label,
+    workerPoolLamports: epoch.workerPoolLamports.toString(),
+    payouts: epoch.payouts.map((p) => ({
+      id: p.id,
+      wallet: p.workerWallet,
+      lamports: p.lamports.toString(),
+      good: p.goodCount,
+      wrong: p.wrongCount,
+      status: p.status,
+      txSignature: p.txSignature,
+      sentAt: p.paidAt?.toISOString() ?? null,
+    })),
+  };
+}
+
+function idList(v: unknown): string[] {
+  if (!Array.isArray(v) || v.length === 0 || v.length > 50 || !v.every((x) => typeof x === 'string' && x.length <= 40)) {
+    throw new WorkError(400, 'ids must be 1-50 payout ids');
+  }
+  return v as string[];
+}
+
+/** pending → sending, recording the signature before the transaction is broadcast. All or nothing. */
+export async function markSending(prisma: PrismaClient, label: string, body: { ids?: unknown; signature?: unknown }) {
+  const ids = idList(body.ids);
+  if (typeof body.signature !== 'string' || !TX_SIGNATURE_RE.test(body.signature)) throw new WorkError(400, 'signature must be a Solana transaction signature');
+  const signature = body.signature;
+  return prisma.$transaction(async (tx) => {
+    const epoch = await tx.workEpoch.findUnique({ where: { label }, select: { id: true } });
+    if (!epoch) throw new WorkError(404, 'No such period');
+    const updated = await tx.workPayout.updateMany({
+      where: { id: { in: ids }, epochId: epoch.id, status: 'pending' },
+      data: { status: 'sending', txSignature: signature, paidAt: new Date() },
+    });
+    if (updated.count !== ids.length) throw new WorkError(409, 'Some of these payouts are no longer pending; nothing was changed');
+    return { sending: updated.count };
+  });
+}
+
+/** Settle a batch that was marked sending: paid, or back to pending when nothing was sent. */
+export async function settleSending(prisma: PrismaClient, label: string, body: { signature?: unknown; outcome?: unknown }) {
+  if (typeof body.signature !== 'string' || !TX_SIGNATURE_RE.test(body.signature)) throw new WorkError(400, 'signature must be a Solana transaction signature');
+  if (body.outcome !== 'paid' && body.outcome !== 'not_sent') throw new WorkError(400, 'outcome must be paid or not_sent');
+  const epoch = await prisma.workEpoch.findUnique({ where: { label }, select: { id: true } });
+  if (!epoch) throw new WorkError(404, 'No such period');
+  const where = { epochId: epoch.id, status: 'sending', txSignature: body.signature };
+  const r =
+    body.outcome === 'paid'
+      ? await prisma.workPayout.updateMany({ where, data: { status: 'paid', paidAt: new Date() } })
+      : await prisma.workPayout.updateMany({ where, data: { status: 'pending', txSignature: null, paidAt: null } });
+  return { settled: r.count, outcome: body.outcome };
+}
+
 export async function recordLockTx(prisma: PrismaClient, label: string, tx: unknown) {
   if (typeof tx !== 'string' || !TX_SIGNATURE_RE.test(tx)) throw new WorkError(400, 'tx must be a Solana transaction signature');
   const epoch = await prisma.workEpoch.findUnique({ where: { label } });

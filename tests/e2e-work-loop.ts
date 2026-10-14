@@ -242,7 +242,9 @@ async function main() {
   check('the wrong answer is counted against the worker', w3slot?.wrongCount, 1);
 
   // ── Separation rules ────────────────────────────────────────────────────
-  for (let i = 0; i < 4; i++) {
+  // Job cutting is throttled to once every 10 seconds, so give the board time to refill.
+  for (let i = 0; i < 8; i++) {
+    if (i > 0) await sleep(3000);
     for (const w of [w4, w5]) {
       const claim = await claimJob(w);
       const a = claim.body.assignment;
