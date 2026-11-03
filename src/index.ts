@@ -33,7 +33,7 @@ import a2aRoutes from './a2a-endpoints.js';
 import crossChainRoutes from './cross-chain-endpoints.js';
 import { createWalletRoutes } from './wallet-endpoints.js';
 import { setupWebSocket } from './ws-handler.js';
-import { createX402Middleware, getFreeTierInfo, CHAINS, FREE_MESSAGES_PER_DAY, MESSAGE_PRICE, bodyCache } from './x402-config.js';
+import { createX402Middleware, getFreeTierInfo, CHAINS, FREE_MESSAGES_PER_DAY, MESSAGE_PRICE, SCREEN_PRICE, bodyCache } from './x402-config.js';
 import {
   startWalletActivityWorkers,
   getActivityStatsForWallet,
@@ -9131,9 +9131,9 @@ app.use('*', createX402Middleware());
 console.log(`✅ x402 payment gate active on POST /xchain/message ($0.01 USDC via Coinbase x402 SDK)`);
 console.log(`✅ Free tier: ${FREE_MESSAGES_PER_DAY} messages/day per agent`);
 console.log(`✅ Supported payment chains: ${Object.keys(CHAINS).join(', ')}`);
-console.log(`✅ x402 trust screen active on GET /api/screen ($0.001 USDC)`);
+console.log(`✅ x402 trust screen active on GET /api/screen (${SCREEN_PRICE} USDC)`);
 
-// GET /api/screen — paid x402 counterparty trust screen ($0.001 USDC).
+// GET /api/screen — paid x402 counterparty trust screen (price: SCREEN_PRICE in x402-config).
 // "Should my agent pay this counterparty?" → allow/review/caution verdict +
 // SAID's computed per-axis reputation. Registered after the x402 middleware
 // above so the payment gate runs first.

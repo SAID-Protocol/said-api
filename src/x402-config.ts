@@ -20,11 +20,9 @@ export const SAID_EVM_TREASURY = process.env.SAID_EVM_TREASURY || '';
 export const MESSAGE_PRICE = '$0.01';
 const MESSAGE_PRICE_USDC = '0.01';
 
-// Price per trust screen (GET /api/screen). Priced at the x402 floor: the point
-// of this endpoint is discovery/exposure on x402scan & the Bazaar, not revenue —
-// it just has to be a real (priced) x402 resource to be catalogued. Tune here.
-export const SCREEN_PRICE = '$0.001';
-const SCREEN_PRICE_USDC = '0.001';
+// Price per trust screen (GET /api/screen). Matches the per-message price. Tune here.
+export const SCREEN_PRICE = '$0.01';
+const SCREEN_PRICE_USDC = '0.01';
 
 // CAIP-2 network identifiers
 const CHAINS = {
