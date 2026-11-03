@@ -47,6 +47,7 @@ import { createAgentMetadataRouter } from './agent-metadata.js';
 import { createAssetPassportRouter } from './asset-passport/router.js';
 import { getRegistry as warmAssetRegistry } from './asset-passport/issuers.js';
 import { createWorkRouter } from './work/router.js';
+import { createMcpRouter } from './mcp/router.js';
 import { loadSkill, loadWorkerBundle } from './work/distribution.js';
 
 /**
@@ -9258,6 +9259,10 @@ console.log('✅ Asset passport mounted (GET /api/asset/:mint, /search, /imperso
 warmAssetRegistry()
   .then((reg) => console.log(`✅ Asset registry warm: ${reg.counts.total} assets, ${reg.counts.withReserve} with reserves${reg.errors.length ? ` (source errors: ${reg.errors.join('; ')})` : ''}`))
   .catch((err) => console.error('⚠️  Asset registry failed to warm; it will retry on first request:', err instanceof Error ? err.message : err));
+
+// The public MCP server: the trust checks, callable from inside any MCP client.
+app.route('/mcp', createMcpRouter(prisma));
+console.log('✅ MCP server mounted (POST /mcp; GET /mcp/info)');
 
 // Mount the work loop (verified agents do checkable work in panels; public feed)
 app.route('/api/work', createWorkRouter(prisma, connection));
