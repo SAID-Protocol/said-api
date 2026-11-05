@@ -172,6 +172,11 @@ const assetRateLimitMap = new Map<string, { count: number; resetAt: number }>();
 // the work loop has its own budget too.
 const WORK_RATE_LIMIT = 600;
 const workRateLimitMap = new Map<string, { count: number; resetAt: number }>();
+// An MCP client sends initialize, tools/list and tools/call for one check,
+// and directory scanners enumerate every tool in a burst, so /mcp gets its
+// own budget instead of three-for-one against the general one.
+const MCP_RATE_LIMIT = 240;
+const mcpRateLimitMap = new Map<string, { count: number; resetAt: number }>();
 
 app.use('/*', async (c, next) => {
   const path = c.req.path;
@@ -183,8 +188,9 @@ app.use('/*', async (c, next) => {
   const now = Date.now();
   const isAsset = path.startsWith('/api/asset/');
   const isWork = path.startsWith('/api/work/') || path === '/work/said-worker.cjs';
-  const map = isAsset ? assetRateLimitMap : isWork ? workRateLimitMap : rateLimitMap;
-  const limit = isAsset ? ASSET_RATE_LIMIT : isWork ? WORK_RATE_LIMIT : RATE_LIMIT;
+  const isMcp = path === '/mcp' || path.startsWith('/mcp/');
+  const map = isAsset ? assetRateLimitMap : isWork ? workRateLimitMap : isMcp ? mcpRateLimitMap : rateLimitMap;
+  const limit = isAsset ? ASSET_RATE_LIMIT : isWork ? WORK_RATE_LIMIT : isMcp ? MCP_RATE_LIMIT : RATE_LIMIT;
   // The work loop's larger budget is keyed on the address the proxy appended
   // (the last x-forwarded-for entry); the first entry is written by the caller
   // and would let one client spread itself over unlimited buckets.
@@ -197,7 +203,7 @@ app.use('/*', async (c, next) => {
   } else {
     entry.count++;
     if (entry.count > limit) {
-      console.warn(`[rate-limit] IP ${ip} exceeded ${limit} req/min on ${isAsset ? '/api/asset' : isWork ? '/api/work' : 'api'}`);
+      console.warn(`[rate-limit] IP ${ip} exceeded ${limit} req/min on ${isAsset ? '/api/asset' : isWork ? '/api/work' : isMcp ? '/mcp' : 'api'}`);
       return c.json({ error: 'Too many requests. Please slow down.' }, 429);
     }
   }
